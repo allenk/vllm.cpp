@@ -1402,7 +1402,19 @@ add_library(vllm STATIC
   # Self-registering.
   src/vt/cpu/cpu_dsa_indexer.cpp
   src/vt/cpu/cpu_paged_attn.cpp
-  src/vt/cpu/cpu_sample.cpp)
+  src/vt/cpu/cpu_sample.cpp
+  # The Triton-CPU acceleration provider. It registers on kCPU ABOVE the
+  # vt-native provider and declines back to it for every op it does not serve,
+  # so a build that does not enable it is byte-identical to one without this
+  # file. Engaged at run time by VLLM_CPP_TRITON_CPU, and A/B-able without a
+  # rebuild through VT_OP_PROVIDER_DISABLE=triton-cpu.
+  #
+  # Named triton-cpu rather than triton on purpose: VLLM_CPP_TRITON already
+  # means the CUDA Triton-AOT cubins, and the two are unrelated paths.
+  #
+  # Another self-registering translation unit, so it relies on the same
+  # --whole-archive treatment as the block above.
+  src/vt/triton_cpu/triton_cpu_provider.cpp)
 add_library(vllm::vllm ALIAS vllm)
 
 # QUANT-GGUF-CIQ-GEMM G6: the Arm i8mm (mmla) quant-GEMM tier needs the ISA
