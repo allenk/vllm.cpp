@@ -2398,6 +2398,10 @@ void PagedAttentionKernel(Queue& q, Tensor& out, const Tensor& query, const Tens
     // workspace freed the old buffer while batches could still reference it
     // (VK-PREFILL-005). Turning this on by default is only safe because that is
     // fixed.
+    // The device's subgroup width, read ONCE for this dispatch: both attention
+    // kernels size per-lane and per-split state from it, and it is a device fact
+    // (32 on NVIDIA, 8 on lavapipe, 64 on AMD) rather than a constant.
+    const uint32_t sgsz = VulkanContext::Get().subgroup_size();
     const uint32_t kAttnSplit = [&] {
       if (kAttnSplitEnv != 0u) return kAttnSplitEnv;
       if (units == 0u) return 1u;
@@ -2437,9 +2441,15 @@ void PagedAttentionKernel(Queue& q, Tensor& out, const Tensor& query, const Tens
       sp_p.bt_off = s_bt;
       sp_p.sl_off = s_sl;
       sp_p.qsl_off = s_qsl;
-      const uint32_t sspec[4] = {DtypeCode(query.dtype), DtypeCode(k_cache.dtype),
+      const uint32_t sspec4[4] = {DtypeCode(query.dtype), DtypeCode(k_cache.dtype),
                                  DtypeCode(v_cache.dtype), kAttnSplit};
-      Go("vt_paged_attn_split", sb, sp_p, units * kAttnSplit, sspec, 4);
+      // Same two device-derived bounds as the single-pass kernel; see its dispatch.
+      const uint32_t s_slots =
+          sgsz > 0u ? (static_cast<uint32_t>(d) + sgsz - 1u) / sgsz : 8u;
+      const uint32_t s_splits = sgsz > 0u ? (1024u / sgsz) : 32u;
+      const uint32_t sspec[6] = {sspec4[0], sspec4[1], sspec4[2], sspec4[3],
+                                 s_slots,   s_splits};
+      Go("vt_paged_attn_split", sb, sp_p, units * kAttnSplit, sspec, 6);
 
       Binder mb;
       mb.AddRaw(ws);
@@ -2554,7 +2564,19 @@ void PagedAttentionKernel(Queue& q, Tensor& out, const Tensor& query, const Tens
                            (args.window_size.has_value() ? 10 : 0) +
                            (args.logits_soft_cap > 0.0f ? 1 : 0),
                        units);
-    Go("vt_paged_attn", bind, p, units, spec, 4);
+    // SLOTS PER LANE, computed from THIS device rather than assumed. The shader
+    // gives each lane a stride-gl_SubgroupSize slice of the head dimension, so it
+    // needs ceil(d / subgroup_size) accumulator registers. A 32-wide subgroup at
+    // head_dim 256 needs 8, which is what the shader used to hardcode; an 8-wide
+    // one needs 32 and used to overflow the array silently.
+    const uint32_t acc_slots =
+        sgsz > 0u ? (static_cast<uint32_t>(d) + sgsz - 1u) / sgsz : 8u;
+    // Split groups per workgroup, from the device rather than assumed. On a
+    // 32-wide subgroup this is 32, which is what the shader used to hardcode, so
+    // its shared-memory footprint there is unchanged by the portability fix.
+    const uint32_t splits = sgsz > 0u ? (1024u / sgsz) : 32u;
+    const uint32_t spec6[6] = {spec[0], spec[1], spec[2], spec[3], acc_slots, splits};
+    Go("vt_paged_attn", bind, p, units, spec6, 6);
 }
 
 // cpu_cache.cpp:33-72 ReshapeAndCacheKernel. Pure BYTE MOVEMENT -- the CPU

@@ -107,7 +107,7 @@
 // IS gl_LocalInvocationID.x, so it never leaves [0, local_size_x), and the
 // number of subgroups never exceeds local_size_x either.
 #define VT_PA_LOCAL_SIZE 1024u
-#define VT_PA_SPLIT_MAX VT_PA_LOCAL_SIZE
+#define VT_PA_SPLIT_MAX VT_PA_SPLITS
 
 layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
 
@@ -128,6 +128,25 @@ layout(constant_id = 0) const uint VT_PA_Q_DT = VT_DT_F32;
 layout(constant_id = 1) const uint VT_PA_K_DT = VT_DT_F32;
 layout(constant_id = 2) const uint VT_PA_V_DT = VT_DT_F32;
 layout(constant_id = 3) const uint VT_PA_OUT_DT = VT_DT_F32;
+// SLOTS PER LANE = ceil(head_dim / gl_SubgroupSize), and it is a SPECIALIZATION
+// constant because only the host knows gl_SubgroupSize.
+//
+// This used to be a literal 8, which is ceil(256 / 32): correct for a head
+// dimension of 256 on a 32-wide subgroup, and silently the same hardcoded 32
+// that the shared arrays carried. An 8-wide subgroup (lavapipe) needs 32 slots
+// at that head dimension and wrote past the array; a 64-wide one (AMD) wastes
+// most of it. SPIR-V lets a specialization constant size an array, so the host
+// computes it at pipeline creation from the device's own subgroup size and this
+// shader stops guessing.
+layout(constant_id = 4) const uint VT_PA_ACC_SLOTS = 8u;
+// SPLIT GROUPS = local_size_x / gl_SubgroupSize, again from the host because
+// only it knows the subgroup size. Sizing the per-split scratch by the WORKGROUP
+// instead would be correct but wasteful: it would hold 1024 slots where a 32-wide
+// subgroup uses 32, growing shared memory from 4.25 KB to 12 KB per workgroup for
+// no gain on the device that reports 32. Specializing keeps the resource
+// footprint on such a device BYTE-IDENTICAL to what it was before this fix, so
+// the correctness repair cannot cost occupancy where nothing was broken.
+layout(constant_id = 5) const uint VT_PA_SPLITS = 32u;
 
 layout(push_constant) uniform Params {
   uint total_q;
@@ -151,7 +170,8 @@ layout(push_constant) uniform Params {
 // Per-lane accumulator over the lane's slice of the head dimension. Eight slots
 // covers d <= 8 * VT_TG = 1024, far above any head dim in the model matrix; the
 // host asserts it rather than trusting it.
-#define VT_PA_ACC_MAX 8
+// Kept as the DEFAULT only; the live bound is the VT_PA_ACC_SLOTS spec constant.
+#define VT_PA_ACC_MAX VT_PA_ACC_SLOTS
 
 // Scratch for the END-OF-CALL merge only. The per-key fold no longer touches
 // shared memory at all.

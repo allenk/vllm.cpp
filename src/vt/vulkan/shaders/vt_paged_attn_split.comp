@@ -51,6 +51,13 @@ layout(constant_id = 0) const uint VT_PA_Q_DT = VT_DT_F32;
 layout(constant_id = 1) const uint VT_PA_K_DT = VT_DT_F32;
 layout(constant_id = 2) const uint VT_PA_V_DT = VT_DT_F32;
 layout(constant_id = 3) const uint VT_PAS_WG = 8u;   // workgroups per (token, head)
+// SAME TWO BOUNDS AS vt_paged_attn.comp, and the same reason: gl_SubgroupSize is
+// 32 on NVIDIA and 8 on lavapipe, so gl_NumSubgroups and ceil(head_dim / size)
+// are device facts, not constants. Both come from the host; on a 32-wide device
+// they specialize back to the 32 and 8 this file used to hardcode, leaving its
+// resource footprint unchanged.
+layout(constant_id = 4) const uint VT_PAS_ACC_SLOTS = 8u;
+layout(constant_id = 5) const uint VT_PAS_SPLITS = 32u;
 
 layout(push_constant) uniform Params {
   uint total_q;
@@ -71,11 +78,11 @@ layout(push_constant) uniform Params {
   float softcap;
 } p;
 
-#define VT_PA_ACC_MAX 8
+#define VT_PA_ACC_MAX VT_PAS_ACC_SLOTS
 
-shared float vt_pa_red[32u * 32u];
-shared float vt_pa_m[32u];
-shared float vt_pa_l[32u];
+shared float vt_pa_red[1024u];  // sp * gl_SubgroupSize + lane == gl_LocalInvocationID.x
+shared float vt_pa_m[VT_PAS_SPLITS];
+shared float vt_pa_l[VT_PAS_SPLITS];
 
 void main() {
   const uint gid = gl_WorkGroupID.x;
@@ -181,12 +188,12 @@ void main() {
   uint slot = 0u;
   for (uint e = lin; e < p.d; e += sgsz, ++slot) {
     barrier();
-    vt_pa_red[sp * 32u + lin] = acc[slot];
+    vt_pa_red[sp * sgsz + lin] = acc[slot];
     barrier();
     if (sp == 0u) {
       float tot = 0.0;
       for (uint i = 0u; i < nsub; ++i) {
-        if (vt_pa_l[i] > 0.0) tot += vt_pa_red[i * 32u + lin] * exp(vt_pa_m[i] - gm);
+        if (vt_pa_l[i] > 0.0) tot += vt_pa_red[i * sgsz + lin] * exp(vt_pa_m[i] - gm);
       }
       // UNNORMALISED, deliberately: pass 2 needs the raw accumulator to rescale
       // it against the global maximum before it can divide.
