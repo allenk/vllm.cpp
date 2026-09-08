@@ -2260,6 +2260,8 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   //    device-written buffer and the sync only guards the input staging.
   const bool mirror = async_device_mirror();
   if (async_forward_in_flight_ && !mirror) {
+    { static const bool kSyncLog = std::getenv("VT_SYNC_LOG") != nullptr;
+      if (kSyncLog) { std::fprintf(stderr, "[vt sync] runner-896\n"); std::fflush(stderr); } }
     vt::GetBackend(queue_.device.type).Synchronize(queue_);
     async_forward_in_flight_ = false;
   }
@@ -2301,6 +2303,8 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     // recorded structural ops (this step's condense) survive to the next step
     // that runs a combine — see the last_sampled_ops note below.
     if (async_forward_in_flight_) {
+      { static const bool kSyncLog = std::getenv("VT_SYNC_LOG") != nullptr;
+        if (kSyncLog) { std::fprintf(stderr, "[vt sync] runner-919\n"); std::fflush(stderr); } }
       vt::GetBackend(queue_.device.type).Synchronize(queue_);
       async_forward_in_flight_ = false;
     }
@@ -3137,6 +3141,8 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
         std::fprintf(stderr, "[VT_ASYNC_EXECUTOR] drain skipped x%lld\n", kSkips);
     }
     if (!skip_drain && async_forward_in_flight_) {
+      { static const bool kSyncLog = std::getenv("VT_SYNC_LOG") != nullptr;
+        if (kSyncLog) { std::fprintf(stderr, "[vt sync] runner-1256-post-forward\n"); std::fflush(stderr); } }
       vt::GetBackend(queue_.device.type).Synchronize(queue_);
       async_forward_in_flight_ = false;
     }
@@ -3234,6 +3240,8 @@ vt::Tensor GPUModelRunner::assemble_sample_logits(
       vt::Backend& b = vt::GetBackend(queue_.device.type);
       b.Copy(queue_, sampled_logits.data(), fl.device_tensor.data,
              sampled_logits.size() * sizeof(float));
+      { static const bool kSyncLog = std::getenv("VT_SYNC_LOG") != nullptr;
+        if (kSyncLog) { std::fprintf(stderr, "[vt sync] runner-1353-logits-dl\n"); std::fflush(stderr); } }
       b.Synchronize(queue_);
       logits = sample_logits_staging_.Stage(
           queue_.device, queue_, sampled_logits.data(), vt::DType::kF32,

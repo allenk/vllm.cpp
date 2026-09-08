@@ -3,6 +3,9 @@
 // deviations and deferrals.
 #include "vllm/v1/engine/core.h"
 
+#include <vector>
+#include <chrono>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -41,6 +44,108 @@ void EngineCore::abort_requests(const std::vector<std::string>& request_ids) {
   }
 }
 
+namespace {
+
+// PER-STEP PHASE TIMING (VT_ENGINE_STEP_STATS=1, default off, zero cost when
+// off -- one predicted branch on a function-local static).
+//
+// WHY. The c=16 concurrency cell is the worst point on our whole curve against
+// llama.cpp and the point where our OWN curve goes backwards, and a session of
+// GEMM work established where it is NOT: the regression survives at both
+// max_num_batched_tokens 128 and 256, so it is neither the matmul tactic nor a
+// batching-denominator artifact. That leaves the serving layer, which so far has
+// had NOT ONE number attached to it. This is the first instrument.
+//
+// WHAT IT MEASURES, stated precisely because the phases are not what they look
+// like. The Vulkan backend batches dispatches and returns before the GPU has
+// finished, so `execute` is the time to BUILD AND SUBMIT the step, not the time
+// the device spends on it. That is exactly the point: if the serving layer is
+// the problem, the cost appears in schedule/update, or in an execute that is
+// large while the dispatch histogram says the GPU was busy for far less. Read
+// this beside VT_VULKAN_DISPATCH_STATS, never on its own.
+//
+// Reported with p50 and p99 as well as a mean, because a scheduler pathology
+// that bites on SOME steps -- a preemption, a queue refill, a chunk boundary --
+// is invisible in a mean and obvious in a tail.
+struct StepPhaseStats {
+  std::vector<double> schedule_us, execute_us, update_us;
+  bool enabled = false;
+
+  StepPhaseStats() {
+    const char* v = std::getenv("VT_ENGINE_STEP_STATS");
+    enabled = v != nullptr && v[0] != 0 && v[0] != '0';
+    if (enabled) {
+      schedule_us.reserve(4096);
+      execute_us.reserve(4096);
+      update_us.reserve(4096);
+    }
+  }
+
+  static void Report(const char* name, std::vector<double>& v) {
+    if (v.empty()) return;
+    std::vector<double> t = v;
+    std::sort(t.begin(), t.end());
+    double sum = 0.0;
+    for (double x : t) sum += x;
+    const size_t p50 = t.size() / 2;
+    const size_t p99 = t.size() > 100 ? (t.size() * 99) / 100 : t.size() - 1;
+    std::fprintf(stderr,
+                 "[vt engine] %-9s n=%-6zu mean=%8.1f us  p50=%8.1f  p99=%8.1f  total=%8.1f ms\n",
+                 name, t.size(), sum / static_cast<double>(t.size()), t[p50],
+                 t[p99], sum / 1000.0);
+  }
+
+  ~StepPhaseStats() {
+    if (!enabled) return;
+    std::fprintf(stderr, "[vt engine] --- per-step phase timing ---\n");
+    std::fprintf(stderr,
+                 "[vt engine] execute is BUILD+SUBMIT, not GPU time -- read beside VT_VULKAN_DISPATCH_STATS\n");
+    Report("schedule", schedule_us);
+    Report("execute", execute_us);
+    Report("update", update_us);
+    // ★ DECILES, and they exist because the mean lied.
+    //
+    // execute read mean=302ms p50=139ms p99=2235ms. Dividing the TOTAL by the
+    // step count and calling the quotient a per-step cost -- which is what was
+    // done, twice -- is only valid on a distribution the mean describes, and this
+    // one is not. 196 steps at the median would total 27 s; the run totalled 59.
+    // So more than half the time lives in a handful of steps, and an average
+    // spread over all of them names the wrong mechanism.
+    //
+    // Deciles separate the two populations without assuming which is which: a
+    // decode step and a prefill step differ by more than an order of magnitude
+    // here, and any fix aimed at the wrong one is aimed at nothing.
+    if (!execute_us.empty()) {
+      std::vector<double> t = execute_us;
+      std::sort(t.begin(), t.end());
+      std::fprintf(stderr, "[vt engine] execute deciles (ms):");
+      for (int i = 0; i <= 10; ++i) {
+        const size_t k = std::min(t.size() - 1, (t.size() * static_cast<size_t>(i)) / 10);
+        std::fprintf(stderr, " %.1f", t[k] / 1000.0);
+      }
+      std::fprintf(stderr, "\n");
+      double top = 0.0, all = 0.0;
+      const size_t n90 = (t.size() * 9) / 10;
+      for (size_t i = 0; i < t.size(); ++i) { all += t[i]; if (i >= n90) top += t[i]; }
+      std::fprintf(stderr,
+                   "[vt engine] ★ slowest 10%% of steps hold %.1f%% of execute time\n",
+                   all > 0 ? 100.0 * top / all : 0.0);
+    }
+  }
+};
+
+StepPhaseStats& Steps() {
+  static StepPhaseStats s;
+  return s;
+}
+
+using StepClock = std::chrono::steady_clock;
+inline double UsSince(StepClock::time_point t0) {
+  return std::chrono::duration<double, std::micro>(StepClock::now() - t0).count();
+}
+
+}  // namespace
+
 std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step() {
   // core.py:488 if not self.scheduler.has_requests(): return {}, False
   // Our Scheduler has no has_requests(); inline the interface.py default
@@ -51,9 +156,14 @@ std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step() {
     return {{}, false};
   }
 
+
   // core.py:490 scheduler_output = self.scheduler.schedule(...)
   // (the _should_throttle_prefills() arg is deferred — DP prefill balancing).
+  StepPhaseStats& steps = Steps();
+  const auto t_sched = StepClock::now();
   SchedulerOutput scheduler_output = scheduler_.schedule();
+  if (steps.enabled) steps.schedule_us.push_back(UsSince(t_sched));
+  const auto t_exec = StepClock::now();
 
   // core.py:491-499 execute the forward, then sample. The MRV2 runner's
   // execute_model returns None ("forward done"), so we always call sample_tokens.
@@ -83,6 +193,8 @@ std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step() {
   // so a 0-output step (e.g. a finished-req flush) yields an empty map. We drop
   // the finished_requests-only entries (that DP-signalling field is deferred),
   // so the entry is present iff there are token outputs.
+  if (steps.enabled) steps.execute_us.push_back(UsSince(t_exec));
+  const auto t_upd = StepClock::now();
   EngineCoreOutputs engine_core_outputs =
       scheduler_.update_from_output(scheduler_output, *model_output);
   // Attach this step's scheduler snapshot + the engine_core_timestamp the
@@ -99,6 +211,8 @@ std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step() {
 
   // core.py:509-517 post_step: feed the drafter's out-of-band proposal back to
   // the scheduler for the next step. Inert unless a speculator is configured.
+  if (steps.enabled) steps.update_us.push_back(UsSince(t_upd));
+
   const bool model_executed = scheduler_output.total_num_scheduled_tokens > 0;
   post_step(model_executed);
 

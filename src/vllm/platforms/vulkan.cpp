@@ -14,6 +14,9 @@
 // UnifiedMemory), so the engine-side platform tree stays free of Vulkan headers.
 #include "vllm/platforms/interface.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include <vector>
 
 #include "vt/backend.h"
@@ -111,7 +114,25 @@ class VulkanPlatform final : public Platform {
 // kCPU} and must be able to fall through to CPU.
 struct Registrar {
   Registrar() noexcept {
-    if (!vt::vulkan::VulkanDeviceAvailable()) return;
+    // SAY WHETHER THIS RAN. Whether the registrar executed is not observable
+    // from outside, and when it does not the engine simply serves from the CPU
+    // with no message at all. Static-initialisation order across translation
+    // units is unspecified -- the very reason this registrar probes the device
+    // rather than trusting another TU -- so adding any self-registering file can
+    // move it. Under VT_VULKAN_PROBE_LOG both outcomes are stated; without it
+    // the behaviour is unchanged.
+    const bool log = std::getenv("VT_VULKAN_PROBE_LOG") != nullptr;
+    if (!vt::vulkan::VulkanDeviceAvailable()) {
+      if (log) {
+        std::fprintf(stderr, "[vt vulkan] platform NOT registered: device unavailable\n");
+        std::fflush(stderr);
+      }
+      return;
+    }
+    if (log) {
+      std::fprintf(stderr, "[vt vulkan] platform REGISTERED for kVULKAN\n");
+      std::fflush(stderr);
+    }
     static VulkanPlatform platform;
     RegisterPlatform(DeviceType::kVULKAN, &platform);
   }
