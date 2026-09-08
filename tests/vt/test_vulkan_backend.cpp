@@ -60,7 +60,10 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  CHECK(n == 28);  // +2: BACKEND-VULKAN-EXL3 (#2530)
+  // 28 + 8: the coopmat2 GEMM pair, the matrix-form prefill attention, the
+  // split/merge decode attention pair, the register-state GDN prefill, the
+  // causal conv1d forward, and the two-operand SwiGLU.
+  CHECK(n == 36);
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
@@ -89,7 +92,18 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
                            // (kExl3Gemm) is served by BOTH modules -- the had is
                            // steps 1 and 3 of the same fused chain -- so a
                            // module-per-op reading of this list is wrong here.
-                           "vt_exl3_had", "vt_exl3_gemm"}) {
+                           "vt_exl3_had", "vt_exl3_gemm",
+                           // The cooperative-matrix-2 GEMM pair. Both are
+                           // selected by kMatmul/kMatmulBT behind a device
+                           // capability query, so neither owns an OpId.
+                           "vt_matmul_coopmat_wg", "vt_matmul_coopmat_tiled",
+                           // Attention: the matrix-form prefill path and the
+                           // split/merge decode pair. Three modules, one OpId.
+                           "vt_paged_attn_cm2", "vt_paged_attn_split",
+                           "vt_paged_attn_merge",
+                           // The recurrences and the two-operand SwiGLU.
+                           "vt_gdn_prefill_reg", "vt_causal_conv1d_fwd",
+                           "vt_moe_silu_mul"}) {
     bool found = false;
     for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
       if (std::strcmp(vt::vulkan::kSpirvModules[mi].name, want) == 0) found = true;
@@ -563,7 +577,11 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
                       // Vulkan. kCastF16 is not an EXL3 op -- the EXL3 linear
                       // demands an f16 activation while models carry bf16/f32 --
                       // and its two siblings were registered here from W0.
-                      vt::OpId::kCastF16, vt::OpId::kExl3Gemm}) {
+                      vt::OpId::kCastF16, vt::OpId::kExl3Gemm,
+                      // The prefill conv, and the SwiGLU whose gate and up
+                      // arrive as two tensors rather than one merged pair --
+                      // the shape a GGUF checkpoint produces.
+                      vt::OpId::kCausalConv1dFwd, vt::OpId::kMoeSiluMul}) {
     CHECK(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
   // No NATIVE Vulkan kernel yet for the rotary TABLE BUILD (kRopeCosSinCache and
@@ -571,12 +589,11 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
   // portable tier, mirroring vLLM's own split), quant, MoE, or the sampler beyond
   // greedy argmax.
   //
-  // kCausalConv1dFwd (the prefill conv) is out for a narrower reason -- its state
-  // write-back needs a different dispatch shape than the decode update, see
-  // src/vt/vulkan/vulkan_ops.cpp.
+  // kCausalConv1dFwd USED to be listed here for a narrower reason -- its state
+  // write-back needs a different dispatch shape than the decode update -- and it
+  // now has vt_causal_conv1d_fwd.comp, so it moved to the registered list above.
   for (vt::OpId op : {vt::OpId::kRopeNeox, vt::OpId::kRopeCosSinCache,
-                      vt::OpId::kApplyTemperature, vt::OpId::kMoeRouterTopK,
-                      vt::OpId::kCausalConv1dFwd}) {
+                      vt::OpId::kApplyTemperature, vt::OpId::kMoeRouterTopK}) {
     CHECK_FALSE(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
   // ...but they no longer THROW, and this assertion used to say they did.

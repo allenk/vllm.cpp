@@ -93,7 +93,21 @@
 // The split count is therefore gl_NumSubgroups, a runtime value; the shared
 // arrays are sized for VT_PA_SPLIT_MAX and only the first gl_NumSubgroups slots
 // are used.
-#define VT_PA_SPLIT_MAX 32u
+// SIZED BY THE WORKGROUP, NOT BY A GUESS AT THE SUBGROUP SIZE.
+//
+// This was VT_PA_SPLIT_MAX = 32u, which silently encoded "gl_SubgroupSize is
+// 32". It is on NVIDIA. It is 8 on Mesa's lavapipe and 64 on AMD, and
+// gl_NumSubgroups is local_size_x / gl_SubgroupSize, so on lavapipe sp reaches
+// 127 and `vt_pa_m[sp]` wrote 96 floats past a 32-element shared array. That is
+// a shared-memory overflow that no NVIDIA device can produce, and it crashed
+// inside the driver's JIT-compiled shader rather than anywhere a host debugger
+// would look.
+//
+// The bound that is always right is the workgroup: sp * gl_SubgroupSize + lane
+// IS gl_LocalInvocationID.x, so it never leaves [0, local_size_x), and the
+// number of subgroups never exceeds local_size_x either.
+#define VT_PA_LOCAL_SIZE 1024u
+#define VT_PA_SPLIT_MAX VT_PA_LOCAL_SIZE
 
 layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
 
@@ -141,7 +155,7 @@ layout(push_constant) uniform Params {
 
 // Scratch for the END-OF-CALL merge only. The per-key fold no longer touches
 // shared memory at all.
-shared float vt_pa_red[VT_PA_SPLIT_MAX * 32u];
+shared float vt_pa_red[VT_PA_LOCAL_SIZE];
 shared float vt_pa_m[VT_PA_SPLIT_MAX];
 shared float vt_pa_l[VT_PA_SPLIT_MAX];
 
@@ -259,12 +273,12 @@ void main() {
   uint slot = 0u;
   for (uint e = lin; e < p.d; e += sgsz, ++slot) {
     barrier();
-    vt_pa_red[sp * 32u + lin] = acc[slot];
+    vt_pa_red[sp * sgsz + lin] = acc[slot];
     barrier();
     if (sp == 0u) {
       float tot = 0.0;
       for (uint i = 0u; i < nsplit; ++i) {
-        if (vt_pa_l[i] > 0.0) tot += vt_pa_red[i * 32u + lin] * exp(vt_pa_m[i] - gm);
+        if (vt_pa_l[i] > 0.0) tot += vt_pa_red[i * sgsz + lin] * exp(vt_pa_m[i] - gm);
       }
       VT_STORE(D32, D16, VT_PA_OUT_DT, p.out_off, qbase + e, tot * inv);
     }
