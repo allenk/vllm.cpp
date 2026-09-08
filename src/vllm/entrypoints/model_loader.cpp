@@ -124,8 +124,19 @@ AutoDeviceResolution ResolveAutoDevice(std::string_view architecture) {
       out.queue = q;
       out.device = dev;
     }
-  } catch (const std::exception&) {
+  } catch (const std::exception& e) {
     // No usable accelerator; CPU, which is what this arm has always returned.
+    //
+    // SAY SO WHEN ASKED. This catch is the last silent step in a chain that can
+    // end with the engine serving a 27B model from the CPU while every log line
+    // looks normal: the platform probes fine, it registers fine, and then the
+    // queue creation throws here and the message is dropped. A fallback that
+    // cannot be told apart from success is a measurement trap, and this one cost
+    // a debugging session before the GPU counters gave it away.
+    if (std::getenv("VT_VULKAN_PROBE_LOG") != nullptr) {
+      std::fprintf(stderr, "[vt] accelerator queue FAILED, falling back to CPU: %s\n", e.what());
+      std::fflush(stderr);
+    }
   }
   return out;
 }

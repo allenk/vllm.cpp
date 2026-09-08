@@ -205,7 +205,14 @@ endfunction()
 
 function(_triton_aot_resolved_target OUTVAR)
   _triton_aot_arch_name(_arch)
-  _triton_aot_resolved_target_for_arch(${OUTVAR} "${_arch}")
+  # SCOPING FIX. The helper's `set(${OUTVAR} ... PARENT_SCOPE)` lands in THIS
+  # function's scope, not the caller's, so without the propagation below the
+  # caller reads an empty string -- and CMake drops the empty list element, which
+  # reaches Triton as a bare `--target` and fails with
+  # "argument --target/-t: expected one argument". Only the REGEN path calls this,
+  # which is why a vendored-artifact build never sees it.
+  _triton_aot_resolved_target_for_arch(_vt_resolved_target "${_arch}")
+  set(${OUTVAR} "${_vt_resolved_target}" PARENT_SCOPE)
 endfunction()
 
 # add_triton_kernel(RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE GRID

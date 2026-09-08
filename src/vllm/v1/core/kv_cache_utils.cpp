@@ -951,7 +951,18 @@ int64_t host_available_memory_bytes() {
   //
   // Returns 0 when unreadable; callers treat 0 as "unknown" and do not refuse,
   // because an unknown budget must not become a false refusal.
+  // PORTABILITY (local fix, reportable upstream). The "e" in "re" is glibc's
+  // O_CLOEXEC extension. MSVC's CRT does not merely ignore it: __acrt_stdio_parse_mode
+  // rejects the mode string, which invokes the invalid-parameter handler, which
+  // ends in __fastfail(FAST_FAIL_INVALID_ARG) and kills the process with no
+  // message and exit code 0xC0000409. So the "returns 0 when unreadable" contract
+  // this function documents is honoured on Linux and is fatal on Windows, where
+  // /proc/meminfo does not exist and fopen was only ever expected to return null.
+#if defined(_WIN32)
+  std::FILE* f = std::fopen("/proc/meminfo", "r");
+#else
   std::FILE* f = std::fopen("/proc/meminfo", "re");
+#endif
   if (f == nullptr) return 0;
   char line[256];
   int64_t kb = 0;

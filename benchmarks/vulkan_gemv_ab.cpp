@@ -88,6 +88,29 @@ constexpr Shape kShapes[] = {
     {6144, 5120, "attn/gdn out"},
     {5120, 8192, "gdn in (qk)"},
     {5120, 6144, "gdn in (v)"},
+
+    // LOCAL ADDITION (not upstream). The decode GEMV shapes of Qwen3-0.6B, the
+    // model actually present on this box, read from the safetensors header
+    // rather than derived: hidden 1024, intermediate 3072, head_dim 128, 16 q
+    // heads, 8 kv heads, 28 layers, vocab 151936, BF16 throughout.
+    //
+    // WHY BOTH TABLES. vulkan-dispatch-floor measured a flat ~0.075 ms per
+    // dispatch on this GPU from 256 elements out to 1e6, so anything under a
+    // few million elements reports submit cost, not kernel quality. Every 0.6B
+    // per-layer weight lands at 1-3M elements and is therefore INSIDE that
+    // floor; the 27B shapes above are 10-178M and are not. The one 0.6B shape
+    // that clears the floor is lm_head at 155.6M, which also happens to be
+    // 311 MB and so cannot sit in L2 the way the smaller repeated shapes do.
+    // It is the only shape here that is simultaneously from a model we can run,
+    // above the dispatch floor, and immune to the cache artefact.
+    {1024, 2048, "0.6B attn q"},
+    {1024, 1024, "0.6B attn k"},
+    {1024, 1024, "0.6B attn v"},
+    {2048, 1024, "0.6B attn out"},
+    {1024, 3072, "0.6B mlp gate"},
+    {1024, 3072, "0.6B mlp up"},
+    {3072, 1024, "0.6B mlp down"},
+    {1024, 151936, "0.6B lm_head"},
 };
 
 }  // namespace

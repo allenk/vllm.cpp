@@ -2,8 +2,15 @@
 # Kept separate so the exact matrix and symbol namespace can be tested with
 # `cmake -P` without enabling a compiler or CUDA.
 
+# sm_120a added here: the list is HARD-CODED, so generating a tree with
+# VLLM_CPP_TRITON_REGEN is not enough -- the runtime dispatch table is built from
+# this list, and a tree missing from it makes TritonAotAvailableOnCurrentDevice()
+# return false on that device. Measured: an RTX PRO 6000 Blackwell reports
+# compute_cap 12.0 (sm_120), which was in NO shipped tree, so the Triton fast path
+# could never fire on it -- and the failure is silent, indistinguishable from
+# "Triton is not faster" unless the bail-out reason is instrumented.
 set(VT_TRITON_AOT_AVAILABLE_ARCHES
-  sm_80 sm_86 sm_89 sm_90a sm_100a sm_121a)
+  sm_80 sm_86 sm_89 sm_90a sm_100a sm_120a sm_121a)
 
 function(vt_triton_aot_available_arches OUT_VAR)
   set(${OUT_VAR} "${VT_TRITON_AOT_AVAILABLE_ARCHES}" PARENT_SCOPE)
@@ -295,6 +302,12 @@ function(vt_triton_aot_namespace_sources ARCH BASE OUTPUT_DIR OUT_VAR)
     file(APPEND "${_header}" "#define ${_token} ${_namespaced}\n")
   endforeach()
   set_property(SOURCE ${_sources} APPEND PROPERTY
-    COMPILE_OPTIONS "-include${_header}")
+    # PORTABILITY. `-include<file>` is the GCC/Clang force-include spelling; MSVC
+    # spells it `/FI<file>` and SILENTLY IGNORES the GCC form. On Windows that made
+    # the per-arch renaming a no-op: every tree's objects kept the UNPREFIXED
+    # symbols while cuda_gdn.cu referenced vt_aot_<arch>_load_*, so VLLM_CPP_TRITON=ON
+    # failed to link with 11 unresolved externals. Confirmed with dumpbin: sm_90a and
+    # sm_121a objects were byte-for-byte identical in their exported names.
+    COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/FI${_header},-include${_header}>")
   set(${OUT_VAR} "${_sources}" PARENT_SCOPE)
 endfunction()

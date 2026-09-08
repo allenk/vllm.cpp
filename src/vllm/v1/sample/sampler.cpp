@@ -52,6 +52,8 @@ class DeviceBuffer {
   vt::Tensor& tensor() { return tensor_; }
   void download(void* dst) {
     if (bytes_ != 0) backend_->Copy(q_, dst, owned_, bytes_);
+    { static const bool kSyncLog = std::getenv("VT_SYNC_LOG") != nullptr;
+      if (kSyncLog) { std::fprintf(stderr, "[vt sync] sampler-55-download\n"); std::fflush(stderr); } }
     backend_->Synchronize(q_);
   }
 
@@ -272,6 +274,8 @@ std::vector<int64_t> Sampler::greedy_argmax_host(vt::Queue& q,
     b.Copy(q, greedy_scratch_->pinned_host, greedy_scratch_->device_ids,
            static_cast<size_t>(n) * sizeof(int64_t));
   }
+  { static const bool kSyncLog = std::getenv("VT_SYNC_LOG") != nullptr;
+    if (kSyncLog) { std::fprintf(stderr, "[vt sync] sampler-275-sampled-id\n"); std::fflush(stderr); } }
   b.Synchronize(q);
   return std::vector<int64_t>(greedy_scratch_->pinned_host,
                               greedy_scratch_->pinned_host + n);
@@ -292,6 +296,8 @@ std::vector<int64_t> Sampler::sample(vt::Queue& q, vt::Tensor& logits,
       vt::Backend& b = vt::GetBackend(logits.device.type);
       b.Copy(q, processed_out->data(), logits.data,
              processed_out->size() * sizeof(float));
+      { static const bool kSyncLog = std::getenv("VT_SYNC_LOG") != nullptr;
+        if (kSyncLog) { std::fprintf(stderr, "[vt sync] sampler-295-processed\n"); std::fflush(stderr); } }
       b.Synchronize(q);
     } else {
       // processed_logprobs: compute_logprobs of it (:269-270).
