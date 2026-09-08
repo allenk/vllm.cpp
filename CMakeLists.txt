@@ -51,6 +51,18 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # affected (nvcc flags are separate; GPU parity tests compare GPU-vs-GPU).
 if(MSVC)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/fp:strict>)
+  # THE CONFORMING PREPROCESSOR, REQUIRED RATHER THAN PREFERRED. CUDA 13
+  # ships CCCL, and cuda/std/__cccl/preprocessor.h is a hard #error under
+  # cl.exe's traditional preprocessor: "MSVC/cl.exe with traditional
+  # preprocessor is used ... please switch by passing /Zc:preprocessor". A
+  # Windows CUDA build therefore cannot compile a single .cu without it, and
+  # the failure is a compile-time stop rather than a warning. It was previously
+  # supplied by hand on the configure line, which works and is not something a
+  # user should have to know.
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+  # M_PI and friends: the Windows CRT hides them behind this macro, and both
+  # language arms need it.
+  add_compile_definitions(_USE_MATH_DEFINES)
 else()
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
 endif()
@@ -1656,9 +1668,13 @@ if(VLLM_CPP_VULKAN)
     src/vt/vulkan/vulkan_spirv.cpp)
   target_link_libraries(vllm PUBLIC ${CMAKE_DL_LIBS})
 endif()
-if(NOT WIN32)
-  # The persistent cache is also exercised by CPU-only NVFP4 emulation. Its
-  # current file-lock implementation is POSIX-only; Windows CUDA is out of W15.
+# The persistent cache is also exercised by CPU-only NVFP4 emulation. It was
+# gated on NOT WIN32 because its atomic write was POSIX-only, but
+# cuda_matmul_nvfp4_cutlass.cu references its symbols unconditionally, so a
+# Windows CUDA build linked with seven unresolved externals. The translation
+# unit now carries a _WIN32 branch with the same contract (write to a temporary,
+# then rename), so it compiles everywhere and the consumer resolves.
+if(TRUE)
   target_sources(vllm PRIVATE src/vt/cuda/nvfp4_persistent_cache.cpp)
 endif()
 # --- Tenstorrent backend (BACKEND-TENSTORRENT W0 skeleton) -------------------
@@ -2889,6 +2905,16 @@ file(WRITE "${_vllm_shared_stub}"
   "// The C ABI + engine come from the force-linked static `vllm` archive.\n")
 
 add_library(vllm_shared SHARED "${_vllm_shared_stub}")
+# On Windows a SHARED target emits an import library named after OUTPUT_NAME --
+# vllm.lib -- which is exactly the file the STATIC `vllm` target already writes
+# to the same directory, and the linker refuses:
+#   LINK : fatal error LNK1149: output filename matches input filename
+# ELF and Mach-O have no such collision (libvllm.so beside libvllm.a), which is
+# why this appears only here. Rename the IMPORT LIBRARY only; the DLL stays
+# vllm.dll, so consumers and the packaging step are unaffected.
+if(WIN32)
+  set_target_properties(vllm_shared PROPERTIES ARCHIVE_OUTPUT_NAME vllm_import)
+endif()
 add_library(vllm::shared ALIAS vllm_shared)
 set_target_properties(vllm_shared PROPERTIES
   OUTPUT_NAME vllm

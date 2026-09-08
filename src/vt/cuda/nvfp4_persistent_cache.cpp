@@ -5,10 +5,21 @@
 #include <cerrno>
 #include <charconv>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(_WIN32)
+// PORTABILITY (local fix). CMakeLists.txt:1408 excludes this TU on Windows
+// ("Windows CUDA is out of W15") because of the POSIX calls below, but
+// cuda_matmul_nvfp4_cutlass.cu references its symbols UNCONDITIONALLY, so a
+// Windows CUDA build compiles and then fails to link with 7 unresolved
+// externals. The POSIX surface is one function; everything else in this file is
+// standard C++.
+#include <io.h>
+#else
 #include <fcntl.h>
+#endif
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -17,7 +28,9 @@
 #include <stdexcept>
 #include <system_error>
 #include <tuple>
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -679,6 +692,40 @@ void WriteNativeCacheAtomically(const std::filesystem::path& path,
                              path.string());
   }
 
+#if defined(_WIN32)
+  // Same contract as the POSIX path: write a sibling temp, flush it, then
+  // replace atomically. std::filesystem::rename overwrites on Windows.
+  const std::filesystem::path temporary_path =
+      parent / ("." + path.filename().string() + ".tmp" +
+                std::to_string(static_cast<unsigned long long>(
+                    reinterpret_cast<std::uintptr_t>(&contents))));
+  {
+    std::ofstream out(temporary_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      throw std::runtime_error("create NVFP4 cache temp: " +
+                               temporary_path.string());
+    }
+    out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+    out.flush();
+    if (!out) {
+      std::error_code ignored;
+      std::filesystem::remove(temporary_path, ignored);
+      throw std::runtime_error("write NVFP4 cache temp: " +
+                               temporary_path.string());
+    }
+  }
+  {
+    std::error_code ec;
+    std::filesystem::rename(temporary_path, path, ec);
+    if (ec) {
+      std::error_code ignored;
+      std::filesystem::remove(temporary_path, ignored);
+      throw std::runtime_error("replace NVFP4 cache: " + path.string() + ": " +
+                               ec.message());
+    }
+  }
+  return;
+#else
   std::string pattern =
       (parent / ("." + path.filename().string() + ".XXXXXX")).string();
   std::vector<char> temporary(pattern.begin(), pattern.end());
@@ -719,6 +766,7 @@ void WriteNativeCacheAtomically(const std::filesystem::path& path,
     std::filesystem::remove(temporary_path, ignored);
     throw;
   }
+#endif  // _WIN32
 }
 
 FlashInferImportResult ParseFlashInferCache(
