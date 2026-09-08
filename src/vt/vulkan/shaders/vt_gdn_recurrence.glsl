@@ -62,14 +62,31 @@
 #ifndef VT_GDN_RECURRENCE_GLSL
 #define VT_GDN_RECURRENCE_GLSL
 
-#define VT_GDN_BV 16u      // value-state rows per workgroup tile (fla BV)
-#define VT_GDN_NW 8u       // lanes cooperating on one row: VT_TG / VT_GDN_BV
+// TILE ROWS, a specialization constant so the occupancy sweep runs in ONE binary.
+// Default 16 reproduces every earlier build exactly.
+//
+// WHY IT IS SWEEPABLE. Measured 2026-09-06 on the 27B prefill: the grid is
+// n * Hv * ceil(Dv/BV) workgroups, which at one sequence is 1 * 48 * 8 = 384 --
+// on a card with 188 SMs, and each workgroup then walks the sequence
+// SEQUENTIALLY because the recurrence is data-dependent in t. Feeding more
+// sequences shows what that costs: per-sequence time falls 0.7396 -> 0.5185 ->
+// 0.4643 ms as the grid goes 384 -> 768 -> 1536 and then FLATTENS, so the
+// machine fills near 1536 and a single-sequence prefill is paying about 1.74x
+// for running a quarter of it.
+//
+// BV is the only term in that grid we control without touching the algorithm:
+// halving it doubles the workgroups at the same n. It is not free -- BV * NW
+// == VT_TG is fixed, so a smaller tile means a WIDER lane group per row, a
+// deeper reduction tree (log2 NW) and fewer Dk columns per lane. Which side
+// wins is a measurement, not a derivation.
+layout(constant_id = 7) const uint VT_GDN_BV = 16u;
+#define VT_GDN_NW (VT_TG / VT_GDN_BV)  // lanes cooperating on one row
 #define VT_GDN_MAX_DK 128u // compile-time bound on the tile's row width
 
 // The [BV,Dk] state slice, rows padded to Dk+1 to break the bank conflict a
 // power-of-two stride would give every lane of a row (cuda_gdn.cu:2445 does the
 // same, and for the same reason).
-shared float vt_gdn_sbh[VT_GDN_BV * (VT_GDN_MAX_DK + 1u)];
+shared float vt_gdn_sbh[VT_GDN_BV * (VT_GDN_MAX_DK + 1u)];  // sized by the spec constant
 shared float vt_gdn_bq[VT_GDN_MAX_DK];  // q' = q*scale, broadcast to every lane
 shared float vt_gdn_bk[VT_GDN_MAX_DK];  // k, likewise
 shared float vt_gdn_red[VT_TG];         // per-row partial sums

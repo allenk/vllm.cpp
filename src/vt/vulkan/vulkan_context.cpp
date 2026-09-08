@@ -189,6 +189,20 @@ inline uint64_t NowNs() {
           .count());
 }
 
+// Read once at file scope: device creation and pipeline creation are different
+// functions and both need it.
+static const bool kPipeStats = std::getenv("VT_VULKAN_PIPELINE_STATS") != nullptr;
+// EMPTY IS OFF, and that is not pedantry -- it cost a three-way comparison.
+// A harness set VT_VULKAN_COOPMAT2="" for its control leg, an empty string is not
+// nullptr, so the control ran with the tactic ON and the two arms came out
+// identical. Presence-testing an environment variable makes "unset" and "set to
+// nothing" different in a way no caller expects. Match the house form used by
+// VT_VULKAN_COOPMAT and the rest: set, and not starting with '0'.
+static const bool kCoopMat2 = [] {
+  const char* v = std::getenv("VT_VULKAN_COOPMAT2");
+  return v != nullptr && v[0] != 0 && v[0] != '0';
+}();
+
 // Registered on first use rather than unconditionally, so a run with profiling
 // off installs no handler at all.
 void DumpHostProfileAtExit() {
@@ -354,33 +368,160 @@ bool HasDeviceExtension(VkPhysicalDevice pd, const char* want) {
   return false;
 }
 
-// The ONE configuration the committed coopmat SPIR-V is written to:
-// 16x16x16, A/B bf16, C/Result f32, SUBGROUP scope. Vulkan requires an EXACT
-// match against a reported configuration -- there is no "nearest" -- so this
-// asks for exactly that tuple and nothing else.
-bool HasBf16F32CoopMatConfig(VkPhysicalDevice pd) {
+// CAPABILITY INVENTORY (VT_VULKAN_COOPMAT_LIST=1, default off).
+//
+// The chooser below picks one configuration; this prints the whole menu. Two
+// different questions, and only the second one can tell you what to build next.
+const char* CoopMatTypeName(VkComponentTypeKHR t) {
+  switch (t) {
+    case VK_COMPONENT_TYPE_FLOAT16_KHR: return "f16";
+    case VK_COMPONENT_TYPE_FLOAT32_KHR: return "f32";
+    case VK_COMPONENT_TYPE_FLOAT64_KHR: return "f64";
+    case VK_COMPONENT_TYPE_SINT8_KHR: return "s8";
+    case VK_COMPONENT_TYPE_SINT16_KHR: return "s16";
+    case VK_COMPONENT_TYPE_SINT32_KHR: return "s32";
+    case VK_COMPONENT_TYPE_UINT8_KHR: return "u8";
+    case VK_COMPONENT_TYPE_UINT16_KHR: return "u16";
+    case VK_COMPONENT_TYPE_UINT32_KHR: return "u32";
+    case VK_COMPONENT_TYPE_BFLOAT16_KHR: return "bf16";
+    default: return "?";
+  }
+}
+
+const char* CoopMatScopeName(VkScopeKHR sc) {
+  if (sc == VK_SCOPE_SUBGROUP_KHR) return "SUBGROUP";
+  if (sc == VK_SCOPE_WORKGROUP_KHR) return "WORKGROUP";
+  return "other";
+}
+
+void ListCoopMatConfigs(VkPhysicalDevice pd) {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  if (std::getenv("VT_VULKAN_COOPMAT_LIST") == nullptr) return;
   const VulkanApi& vk = Api();
-  if (vk.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR == nullptr) return false;
+  if (vk.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR == nullptr) {
+    std::fprintf(stderr, "[vt vulkan] COOPMAT LIST: entry point absent\n");
+    std::fflush(stderr);
+    return;
+  }
+  uint32_t count = 0;
+  if (vk.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(pd, &count, nullptr) != VK_SUCCESS) return;
+  std::vector<VkCooperativeMatrixPropertiesKHR> cfg(count);
+  for (auto& x : cfg) x.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+  if (vk.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(pd, &count, cfg.data()) != VK_SUCCESS) return;
+  std::fprintf(stderr, "[vt vulkan] COOPMAT LIST: %u reported configurations\n", count);
+  for (const auto& x : cfg) {
+    std::fprintf(stderr, "[vt vulkan]   %3ux%-3ux%-3u  A=%-4s B=%-4s C=%-4s R=%-4s  scope=%s%s\n",
+                 x.MSize, x.NSize, x.KSize, CoopMatTypeName(x.AType), CoopMatTypeName(x.BType),
+                 CoopMatTypeName(x.CType), CoopMatTypeName(x.ResultType),
+                 CoopMatScopeName(x.scope), x.saturatingAccumulation ? "  sat" : "");
+  }
+  std::fflush(stderr);
+
+  // AND THE NV SIDE, which reports through a DIFFERENT query and is where
+  // flexible dimensions and WORKGROUP scope live.
+  if (vk.vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV == nullptr) {
+    std::fprintf(stderr, "[vt vulkan] COOPMAT2: entry point absent\n");
+    std::fflush(stderr);
+    return;
+  }
+  uint32_t n2 = 0;
+  if (vk.vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(pd, &n2, nullptr) != VK_SUCCESS) return;
+  std::vector<VkCooperativeMatrixFlexibleDimensionsPropertiesNV> fx(n2);
+  for (auto& f : fx) {
+    f.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_FLEXIBLE_DIMENSIONS_PROPERTIES_NV;
+    f.pNext = nullptr;
+  }
+  if (vk.vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(pd, &n2, fx.data()) != VK_SUCCESS) return;
+  // The LIMITS matter as much as the list: a workgroup-scope matrix is bounded by
+  // MaxDimension, and workgroup scope RESERVES shared memory that the kernel then
+  // does not get to use. Both are properties, not guesses.
+  VkPhysicalDeviceCooperativeMatrix2PropertiesNV cm2p{};
+  cm2p.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_PROPERTIES_NV;
+  VkPhysicalDeviceProperties2 pr2{};
+  pr2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  pr2.pNext = &cm2p;
+  Api().vkGetPhysicalDeviceProperties2(pd, &pr2);
+  std::fprintf(stderr,
+               "[vt vulkan] COOPMAT2 LIMITS: wg_scope_max_workgroup=%u  "
+               "flexible_max_dimension=%u  wg_scope_reserved_shared=%u bytes\n",
+               cm2p.cooperativeMatrixWorkgroupScopeMaxWorkgroupSize,
+               cm2p.cooperativeMatrixFlexibleDimensionsMaxDimension,
+               cm2p.cooperativeMatrixWorkgroupScopeReservedSharedMemory);
+  std::fprintf(stderr, "[vt vulkan] COOPMAT2: %u flexible-dimension configurations\n", n2);
+  for (const auto& f : fx) {
+    std::fprintf(stderr,
+                 "[vt vulkan]   gran %2ux%-2ux%-2u  A=%-4s B=%-4s C=%-4s R=%-4s  scope=%s  wg_inv=%u%s\n",
+                 f.MGranularity, f.NGranularity, f.KGranularity,
+                 CoopMatTypeName(f.AType), CoopMatTypeName(f.BType),
+                 CoopMatTypeName(f.CType), CoopMatTypeName(f.ResultType),
+                 CoopMatScopeName(f.scope), f.workgroupInvocations,
+                 f.saturatingAccumulation ? "  sat" : "");
+  }
+  std::fflush(stderr);
+}
+
+// CHOOSE the bf16 cooperative-matrix tile, rather than assert one.
+//
+// This used to ask "is 16x16x16 bf16 subgroup present?" and the shader hardcoded
+// 16. On this card that is the only bf16 configuration reported, so the question
+// and the answer coincided -- but that coincidence is a property of ONE vendor.
+// An Adreno 840 reports fp16 cooperative matrix at 64x64x16, 64x32x16 and
+// 64x16x16; an AMD integrated part reports 16x16x16 for fp16 and nothing for
+// bf16; a D3D12 emulation layer reports nothing at all. A predicate that can only
+// answer yes or no about a shape we already committed to cannot see any of that.
+//
+// SELECTION RULE, and its honest status. Prefer the largest K, because K is the
+// loop trip count and this kernel was MEASURED to be latency-bound rather than
+// bandwidth-bound, so a shorter dependent chain is what helps. Then the largest
+// N, since decode shapes are wide. Then the SMALLEST M at least 16, because m is
+// the batch -- 32 rows at c=32 -- and a tile taller than the batch is padding.
+//
+// ⚠️ That ordering is UNEXERCISED here: this device offers exactly one bf16
+// configuration, so any rule picks it. It is written down so the first device
+// with a real choice tests a stated rule instead of an accident.
+struct CoopMatTile { uint32_t m = 0, n = 0, k = 0; };
+
+// Bound by the shared spill buffer the shader declares (64*64 floats).
+constexpr uint32_t kCoopMatTileMax = 64;
+
+CoopMatTile ChooseBf16F32CoopMatTile(VkPhysicalDevice pd) {
+  ListCoopMatConfigs(pd);
+  CoopMatTile best;
+  const VulkanApi& vk = Api();
+  if (vk.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR == nullptr) return best;
   uint32_t count = 0;
   if (vk.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(pd, &count, nullptr) != VK_SUCCESS) {
-    return false;
+    return best;
   }
   std::vector<VkCooperativeMatrixPropertiesKHR> cfg(count);
-  for (auto& c : cfg) c.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+  for (auto& x : cfg) x.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
   if (vk.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(pd, &count, cfg.data()) != VK_SUCCESS) {
-    return false;
+    return best;
   }
-  for (const auto& c : cfg) {
-    if (c.MSize == 16 && c.NSize == 16 && c.KSize == 16 &&
-        c.AType == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
-        c.BType == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
-        c.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
-        c.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
-        c.scope == VK_SCOPE_SUBGROUP_KHR) {
-      return true;
+  for (const auto& x : cfg) {
+    if (x.AType != VK_COMPONENT_TYPE_BFLOAT16_KHR ||
+        x.BType != VK_COMPONENT_TYPE_BFLOAT16_KHR ||
+        x.CType != VK_COMPONENT_TYPE_FLOAT32_KHR ||
+        x.ResultType != VK_COMPONENT_TYPE_FLOAT32_KHR ||
+        x.scope != VK_SCOPE_SUBGROUP_KHR) {
+      continue;
     }
+    if (x.MSize < 16 || x.MSize > kCoopMatTileMax || x.NSize > kCoopMatTileMax) continue;
+    if (best.k == 0) { best = {x.MSize, x.NSize, x.KSize}; continue; }
+    if (x.KSize > best.k) { best = {x.MSize, x.NSize, x.KSize}; continue; }
+    if (x.KSize < best.k) continue;
+    if (x.NSize > best.n) { best = {x.MSize, x.NSize, x.KSize}; continue; }
+    if (x.NSize < best.n) continue;
+    if (x.MSize < best.m) best = {x.MSize, x.NSize, x.KSize};
   }
-  return false;
+  if (best.k != 0 && std::getenv("VT_VULKAN_PROBE_LOG") != nullptr) {
+    std::fprintf(stderr, "[vt vulkan] COOPMAT TILE chosen: %ux%ux%u bf16->f32 subgroup\n",
+                 best.m, best.n, best.k);
+    std::fflush(stderr);
+  }
+  return best;
 }
 
 int FindComputeQueueFamily(VkPhysicalDevice pd) {
@@ -676,25 +817,43 @@ class BufferSet {
 };
 
 bool VulkanContext::Available() {
+  // DIAGNOSTIC (VT_VULKAN_PROBE_LOG=1, default off). Every failure below is a
+  // silent `return false`, and the platform registrar treats that as "no Vulkan
+  // here" and lets CurrentPlatform() fall through to CPU. That fallback is
+  // INVISIBLE: the server starts, answers requests, and reports throughput --
+  // it is simply the CPU's throughput. It cost a session to notice, and the
+  // tell was indirect (the "Asynchronous scheduling is enabled" line, which is
+  // really the CPU backend answering SupportsAsyncSampledTokenReadback true).
+  // A capability probe that declines without saying why is a measurement trap,
+  // so name the step that failed.
+  static const bool log = std::getenv("VT_VULKAN_PROBE_LOG") != nullptr;
+  auto no = [](const char* why) {
+    static const bool on = std::getenv("VT_VULKAN_PROBE_LOG") != nullptr;
+    if (on) { std::fprintf(stderr, "[vt vulkan] probe DECLINED: %s\n", why); std::fflush(stderr); }
+    return false;
+  };
   // Cached: probing creates and destroys an instance, and both registrars plus
   // the platform TU ask.
-  static const bool available = [] {
-    if (!LoadVulkanLibrary()) return false;
+  static const bool available = [&] {
+    if (!LoadVulkanLibrary()) return no("no Vulkan loader on this machine");
     const VulkanApi& vk = Api();
     // A 1.0-only loader cannot give us the 1.1 core features this backend needs.
-    if (vk.vkEnumerateInstanceVersion == nullptr) return false;
+    if (vk.vkEnumerateInstanceVersion == nullptr) return no("loader has no vkEnumerateInstanceVersion (1.0-only)");
     uint32_t loader_version = 0;
-    if (vk.vkEnumerateInstanceVersion(&loader_version) != VK_SUCCESS) return false;
+    if (vk.vkEnumerateInstanceVersion(&loader_version) != VK_SUCCESS) return no("vkEnumerateInstanceVersion failed");
     if (VK_API_VERSION_MAJOR(loader_version) == 1 &&
         VK_API_VERSION_MINOR(loader_version) < 1) {
-      return false;
+      return no("loader instance version < 1.1");
     }
     VkInstance instance = CreateInstance();
-    if (instance == VK_NULL_HANDLE) return false;
+    if (instance == VK_NULL_HANDLE) return no("vkCreateInstance returned VK_NULL_HANDLE");
     LoadInstanceFunctions(instance);
     const Probe probe = ProbeDevice(instance);
     vk.vkDestroyInstance(instance, nullptr);
-    return probe.ok;
+    if (!probe.ok) return no("no physical device met the requirements "
+                             "(>=1.1, compute queue, storageBuffer16BitAccess, HOST_VISIBLE|HOST_COHERENT)");
+    if (log) { std::fprintf(stderr, "[vt vulkan] probe OK: %s\n", probe.name); std::fflush(stderr); }
+    return true;
   }();
   return available;
 }
@@ -815,9 +974,14 @@ VulkanContext::VulkanContext() {
     }
   }
 
-  if (has_coopmat_ext && has_bf16_ext &&
-      HasBf16F32CoopMatConfig(probe.physical_device) && subgroup_size_ > 0) {
+  const CoopMatTile cm_tile = (has_coopmat_ext && has_bf16_ext)
+                                  ? ChooseBf16F32CoopMatTile(probe.physical_device)
+                                  : CoopMatTile{};
+  if (has_coopmat_ext && has_bf16_ext && cm_tile.k != 0 && subgroup_size_ > 0) {
     coopmat_bf16_f32_ = true;
+    coopmat_tile_m_ = cm_tile.m;
+    coopmat_tile_n_ = cm_tile.n;
+    coopmat_tile_k_ = cm_tile.k;
     coop_feat.cooperativeMatrix = VK_TRUE;
     bf16_feat.shaderBFloat16Type = VK_TRUE;
     bf16_feat.shaderBFloat16CooperativeMatrix = VK_TRUE;
@@ -826,6 +990,166 @@ VulkanContext::VulkanContext() {
     // Chain: f16 -> coopmat -> bf16.
     coop_feat.pNext = &bf16_feat;
     f16.pNext = &coop_feat;
+  }
+
+  // COOPERATIVE MATRIX 2, WORKGROUP SCOPE (VT_VULKAN_COOPMAT2=1), opt-in.
+  //
+  // Why it is wanted, and it is a measured why rather than a hoped-for one: at
+  // c=32 on 27B bf16, vt_matmul_coopmat owns 94.4% of GPU time with 0.1% of gap
+  // between dispatches, and cutting its loads 2.7x by register blocking bought
+  // 4.3% -- so it is LATENCY-bound, not bandwidth-bound. The KHR menu on this
+  // card offers exactly ONE bf16 configuration, 16x16x16 at SUBGROUP scope, so
+  // the small tile is not a choice and no retuning reaches a larger one.
+  //
+  // The NV extension reports, on this device, bf16->f32 at WORKGROUP scope up to
+  // 256 invocations with granularity 32x32x16 -- one workgroup cooperating on a
+  // large matrix rather than one subgroup per small tile, which is the shape of
+  // fix a latency-bound kernel wants. It also fits the measured decode shapes:
+  // m is 32 and every hot n and k is a multiple of 32 and 16.
+  //
+  // Enabled opt-in and separately from any shader that uses it, so that "the
+  // device was asked for the capability" and "a kernel used it" stay independently
+  // observable. Enabling it alone must change nothing, and that is testable.
+  VkPhysicalDeviceCooperativeMatrix2FeaturesNV cm2{};
+  bool return_cm2 = true;
+  if (kCoopMat2 && coopmat_bf16_f32_ &&
+      HasDeviceExtension(probe.physical_device, "VK_NV_cooperative_matrix2")) {
+    cm2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV;
+    // ASK FOR ALL THREE, ENABLE ONLY WHAT IS REPORTED. Two of these used to be
+    // set to VK_TRUE unconditionally on the strength of the extension being
+    // present, which is a different claim: a device may expose
+    // VK_NV_cooperative_matrix2 without offering workgroup scope. Requesting a
+    // feature the device does not have makes DEVICE CREATION fail, so the cost
+    // of assuming is not a slow fallback, it is no Vulkan backend at all --
+    // strictly worse than the generic path this tactic is supposed to be an
+    // optional improvement over.
+      // TENSOR ADDRESSING MUST BE ASKED FOR, not assumed because it works.
+      //
+      // vt_matmul_coopmat_wg was changed on 2026-09-06 to load through
+      // tensorLayoutNV with gl_CooperativeMatrixClampModeConstantNV, and its
+      // committed SPIR-V declares CooperativeMatrixTensorAddressingNV (5433) and
+      // TensorAddressingNV (5439). Those map to the cooperativeMatrixTensorAddressing
+      // feature, which was NOT being enabled -- so the shader ran on a device that
+      // had never been asked for what it uses. It worked and the outputs were
+      // bit-exact, and neither of those makes the usage legal. Found by an external
+      // read of the COMMITTED SPIR-V rather than the GLSL (RFG, 2026-09-06).
+      //
+      // Queried rather than asserted: if the device does not offer it the flag stays
+      // false and the tactic that needs it declines, instead of running a shader
+      // whose requirements the device never granted.
+      VkPhysicalDeviceCooperativeMatrix2FeaturesNV cm2_have{};
+      cm2_have.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV;
+      VkPhysicalDeviceFeatures2 feats2{};
+      feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+      feats2.pNext = &cm2_have;
+      if (vk.vkGetPhysicalDeviceFeatures2 != nullptr) {
+        vk.vkGetPhysicalDeviceFeatures2(probe.physical_device, &feats2);
+      }
+      coopmat2_tensor_addressing_ =
+          cm2_have.cooperativeMatrixTensorAddressing == VK_TRUE;
+      const bool have_wg = cm2_have.cooperativeMatrixWorkgroupScope == VK_TRUE;
+      const bool have_flex = cm2_have.cooperativeMatrixFlexibleDimensions == VK_TRUE;
+      // THE THREE A MATRIX-FORM ATTENTION WOULD NEED, reported before anyone
+      // writes it. llama.cpp's flash_attn_cm2.comp keeps the whole online
+      // softmax in cooperative matrices: coopMatReduceNV with
+      // gl_CooperativeMatrixReduceRowNV for the row max, coopMatPerElementNV for
+      // max/exp, and a conversion between the accumulator and the A-use matrix
+      // before the P x V multiply. Those are three SEPARATE features from the
+      // ones this backend enables today, so the port has a hardware gate that
+      // costs nothing to check and would otherwise be discovered after the
+      // kernel was written.
+      std::fprintf(stderr,
+                   "[vt vulkan] COOPMAT2 FEATURES: wg_scope=%d flexible=%d tensor_addr=%d "
+                   "reductions=%d per_element=%d conversions=%d block_loads=%d\n",
+                   have_wg ? 1 : 0, have_flex ? 1 : 0,
+                   cm2_have.cooperativeMatrixTensorAddressing == VK_TRUE ? 1 : 0,
+                   cm2_have.cooperativeMatrixReductions == VK_TRUE ? 1 : 0,
+                   cm2_have.cooperativeMatrixPerElementOperations == VK_TRUE ? 1 : 0,
+                   cm2_have.cooperativeMatrixConversions == VK_TRUE ? 1 : 0,
+                   cm2_have.cooperativeMatrixBlockLoads == VK_TRUE ? 1 : 0);
+      std::fflush(stderr);
+      cm2.cooperativeMatrixTensorAddressing =
+          coopmat2_tensor_addressing_ ? VK_TRUE : VK_FALSE;
+      cm2.cooperativeMatrixWorkgroupScope = have_wg ? VK_TRUE : VK_FALSE;
+      cm2.cooperativeMatrixFlexibleDimensions = have_flex ? VK_TRUE : VK_FALSE;
+      if (have_wg && have_flex) {
+        // THE LEGAL (M, N, K, invocations) TABLE, read from the device rather
+        // than written down from this card. The tactic consults it through
+        // coopmat2_wg_supports() instead of carrying its own pairing rules.
+        uint32_t nfx = 0;
+        if (vk.vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV != nullptr &&
+            vk.vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
+                probe.physical_device, &nfx, nullptr) == VK_SUCCESS &&
+            nfx != 0) {
+          std::vector<VkCooperativeMatrixFlexibleDimensionsPropertiesNV> fx(nfx);
+          for (auto& f : fx) {
+            f.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_FLEXIBLE_DIMENSIONS_PROPERTIES_NV;
+            f.pNext = nullptr;
+          }
+          if (vk.vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
+                  probe.physical_device, &nfx, fx.data()) == VK_SUCCESS) {
+            for (const auto& f : fx) {
+              if (f.scope != VK_SCOPE_WORKGROUP_KHR) continue;
+              if (f.AType != VK_COMPONENT_TYPE_BFLOAT16_KHR) continue;
+              if (f.BType != VK_COMPONENT_TYPE_BFLOAT16_KHR) continue;
+              if (f.CType != VK_COMPONENT_TYPE_FLOAT32_KHR) continue;
+              coopmat2_dims_.push_back({f.MGranularity, f.NGranularity, f.KGranularity,
+                                        f.workgroupInvocations});
+            }
+          }
+        }
+      }
+      if (!have_wg || !have_flex || coopmat2_dims_.empty()) {
+        // The extension is present but the device does not offer what this
+        // tactic needs. Say so and leave the generic subgroup path in charge.
+        std::fprintf(stderr,
+                     "[vt vulkan] COOPMAT2 declined: wg_scope=%d flexible_dims=%d "
+                     "bf16/f32 workgroup configs=%zu\n",
+                     have_wg ? 1 : 0, have_flex ? 1 : 0, coopmat2_dims_.size());
+        std::fflush(stderr);
+        return_cm2 = false;
+      }
+    if (return_cm2) {
+    cm2.pNext = f16.pNext;
+    f16.pNext = &cm2;
+    device_exts.push_back("VK_NV_cooperative_matrix2");
+    coopmat2_workgroup_ = true;
+    }
+    // Positively stated, not inferred from the absence of a warning -- the
+    // gate this campaign wrote after a backend fell back to CPU in silence.
+    if (return_cm2) {
+      std::fprintf(stderr,
+                   "[vt vulkan] COOPMAT2 ENABLED: workgroup scope + flexible dimensions "
+                   "(%zu bf16/f32 workgroup configs, tensor_addressing=%d)\n",
+                   coopmat2_dims_.size(), coopmat2_tensor_addressing_ ? 1 : 0);
+      std::fflush(stderr);
+    }
+  }
+  if (kCoopMat2 && !coopmat2_workgroup_) {
+    // Asked for and not obtained. Say so: a capability that silently fails to
+    // enable is the same class of defect as a backend that silently falls back.
+    std::fprintf(stderr, "[vt vulkan] COOPMAT2 requested but NOT enabled "
+                         "(extension absent, or the KHR bf16 path is off)\n");
+    std::fflush(stderr);
+  }
+
+  // PIPELINE STATISTICS (VT_VULKAN_PIPELINE_STATS=1), opt-in because it changes
+  // device creation and every kernel on this backend runs through that.
+  //
+  // WHY IT EXISTS: three separate results in this campaign were explained by
+  // "register pressure costs occupancy" -- an eight-slot GEMV block delivering a
+  // fifth of its predicted gain, a K-unroll making its kernel 23-29% slower, and
+  // a 2D tile losing while moving 1.5x less data. Three explanations, one
+  // mechanism, and it had never been MEASURED. A mechanism that has explained
+  // three results without being observed once is a story, not a finding.
+  VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pep{};
+  if (kPipeStats) {
+    pep.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+    pep.pipelineExecutableInfo = VK_TRUE;
+    pep.pNext = f16.pNext;
+    f16.pNext = &pep;
+    device_exts.push_back("VK_KHR_pipeline_executable_properties");
   }
 
   const float priority = 1.0f;
@@ -855,9 +1179,41 @@ VulkanContext::VulkanContext() {
   // fallback, llama.cpp `ggml_vk_create_buffer`:3065-3090 shape.
   VkPhysicalDeviceMemoryProperties mem{};
   Api().vkGetPhysicalDeviceMemoryProperties(probe.physical_device, &mem);
-  int type = FindMemoryType(mem, ~0u, kHostFlags | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  // ATTRIBUTION LEVER (local addition), VT_VULKAN_HOST_MEMORY=1.
+  //
+  // The predicate below reports unified_memory_ = true whenever a
+  // DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT type exists. That is true on GB10,
+  // where CPU and GPU really do share memory -- and equally true on a DISCRETE
+  // GPU with Resizable BAR, where the whole VRAM becomes host-visible but the
+  // CPU reaches it across PCIe. op_provider gates the portable reference tier on
+  // exactly this flag (ReferenceTierEligible), so on such a card the gate passes
+  // and CPU kernels run over VRAM.
+  //
+  // MEASURED on an RTX PRO 6000 Blackwell, same allocator vs malloc, 64 MB:
+  //     float read-modify-write   host 64475 MB/s   device 39.8 MB/s   1620x
+  //     memcpy host -> device     host 26351 MB/s   device 22599 MB/s     1x
+  // Writes are fine (write-combining); reads are uncached non-posted PCIe.
+  //
+  // Forcing plain HOST_VISIBLE puts every buffer in system RAM: the GPU then
+  // reads it over PCIe (slower compute) while the CPU reads it at full speed.
+  // If prefill improves under this lever despite the slower GPU access, the CPU
+  // reads were the bottleneck. Same shape as llama.cpp's
+  // GGML_VK_PREFER_HOST_MEMORY.
+  static const bool kPreferHost = [] {
+    const char* v = std::getenv("VT_VULKAN_HOST_MEMORY");
+    return v != nullptr && v[0] != '0';
+  }();
+  int type = kPreferHost
+                 ? -1
+                 : FindMemoryType(mem, ~0u, kHostFlags | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   unified_memory_ = type >= 0;
   if (type < 0) type = FindMemoryType(mem, ~0u, kHostFlags);
+  // Under the lever the buffers are plain HOST_VISIBLE|HOST_COHERENT system RAM,
+  // which is host-addressable by construction -- so the reference tier's safety
+  // condition holds and it must stay INSTALLED, or the two ops that have no
+  // Vulkan kernel (kRopeCosSinCache, kCausalConv1dFwd) lose their only
+  // implementation and the comparison cannot be made at all.
+  if (kPreferHost) unified_memory_ = true;
   VT_CHECK(type >= 0, "vulkan: no HOST_VISIBLE|HOST_COHERENT memory type");
   memory_type_index_ = static_cast<uint32_t>(type);
 
@@ -1064,6 +1420,64 @@ VulkanContext& VulkanContext::Get() {
   // `vk_instance` singleton and the Metal skeleton's MetalContext::Get).
   static VulkanContext* ctx = new VulkanContext();
   return *ctx;
+}
+
+// Grown on demand, never shrunk. See the header for why.
+//
+// Reuses AllocBuffer so the workspace obeys the same 32-bit-word rounding and
+// the same memory-type choice as every other operand this backend binds -- a
+// separate allocation path here would be a second place for that invariant to
+// drift.
+// See the header for why this is device data and not a rule written down here.
+bool VulkanContext::coopmat2_wg_supports(uint32_t m, uint32_t n, uint32_t k,
+                                         uint32_t invocations) const {
+  for (const auto& d : coopmat2_dims_) {
+    if (d.invocations != invocations) continue;
+    if (d.m_gran == 0 || d.n_gran == 0 || d.k_gran == 0) continue;
+    if (m % d.m_gran != 0 || n % d.n_gran != 0 || k % d.k_gran != 0) continue;
+    return true;
+  }
+  return false;
+}
+
+void* VulkanContext::Workspace(size_t bytes) {
+  if (bytes == 0) return ws_buffer_;
+  if (bytes <= ws_bytes_ && ws_buffer_ != nullptr) return ws_buffer_;
+  const VulkanApi& vk = Api();
+  auto device = Unpack<VkDevice>(device_);
+  // The old block is only released after the new one exists, so a failed grow
+  // leaves the previous workspace usable rather than leaving the context with
+  // neither.
+  void* old_buf = ws_buffer_;
+  void* old_mem = ws_memory_;
+  void* buf = nullptr;
+  void* mem = nullptr;
+  AllocBuffer(bytes, &buf, &mem);
+  if (buf == nullptr) return ws_buffer_;
+  ws_buffer_ = buf;
+  ws_memory_ = mem;
+  ws_bytes_ = bytes;
+  if (old_buf != nullptr) {
+    // DRAIN BEFORE FREEING, and the reason is that submission is pipelined.
+    //
+    // External review 2026-09-06 (VK-PREFILL-005, P1): the old workspace can
+    // still be BOUND by dispatches in a batch that has been submitted and has
+    // not yet completed. Growth happens when a later batch needs more splits
+    // than an earlier one -- exactly when an earlier batch is likely still in
+    // flight -- so destroying the buffer here hands the GPU a dead handle.
+    // Nothing caught it because a freed-and-unreused VkBuffer usually still
+    // reads back, which is the silent form of this bug, not its absence.
+    //
+    // Drain rather than defer: this path runs only when the workspace GROWS,
+    // which for a fixed model and split count happens a handful of times in a
+    // process, so a retire list would be more machinery than the event
+    // deserves. Workspace() is called before the dispatch's own binder, so
+    // there is no half-recorded op to lose.
+    FlushBatch("workspace grow");
+    vk.vkDestroyBuffer(device, Unpack<VkBuffer>(old_buf), nullptr);
+    vk.vkFreeMemory(device, Unpack<VkDeviceMemory>(old_mem), nullptr);
+  }
+  return ws_buffer_;
 }
 
 void* VulkanContext::AllocBuffer(size_t bytes, void** out_buffer, void** out_memory) {
@@ -1352,8 +1766,98 @@ VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
   cpci.stage.pName = "main";
   cpci.stage.pSpecializationInfo = spec_count != 0 ? &spec_info : nullptr;
   cpci.layout = p.layout;
+  // THE CAPTURE FLAG, without which the query below has no contract.
+  //
+  // External review 2026-09-06 (VK-PREFILL-006): the statistics query is only
+  // defined for a pipeline created with CAPTURE_STATISTICS, and we were asking
+  // for the numbers without asking for them to be kept. This driver returned
+  // plausible values anyway, which is why it survived -- and it is also why the
+  // register counts were quoted in three attributions as if they were evidence.
+  // A number a driver was never obliged to produce is not one to reason from.
+  //
+  // Set only under the diagnostic env var: the flag is documented to be able to
+  // change what the compiler emits, so leaving it on would make every shipped
+  // pipeline a slightly different object from the one that was measured.
+  if (kPipeStats && vk.vkGetPipelineExecutablePropertiesKHR != nullptr) {
+    cpci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+  }
+  // Statistics are queried right after creation, before the pipeline is used, so
+  // the numbers describe the object the driver actually built for THESE
+  // specialization values -- which is the whole point: two arms of the same
+  // shader differ only by a constant, and the register count is how you see that
+  // constant cost something.
   Check(vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, nullptr, &p.pipeline),
         "vkCreateComputePipelines");
+
+  // WHAT THE DRIVER ACTUALLY BUILT. One line per shader per specialization, once
+  // each, under VT_VULKAN_PIPELINE_STATS. The statistic names are driver-defined,
+  // so they are printed verbatim rather than mapped -- NVIDIA reports register
+  // counts and spill bytes here, and a spill is the thing worth seeing: it is
+  // silent, it only shows up as a slower kernel, and it is exactly what three
+  // results in this campaign were blamed on without evidence.
+  if (kPipeStats && vk.vkGetPipelineExecutablePropertiesKHR != nullptr) {
+    VkPipelineInfoKHR pi{};
+    pi.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR;
+    pi.pipeline = p.pipeline;
+    // RETURN CODES CHECKED, because the whole point of this block is to be
+    // evidence. External review 2026-09-06 (F3, second half): the counts came
+    // back through an out-parameter that four calls left untouched on failure,
+    // so a driver that refused the query would have produced an EMPTY histogram
+    // -- read as "no statistics available" when it means "we never asked
+    // correctly". VK_INCOMPLETE is a real answer too and is treated as one.
+    uint32_t n_exec = 0;
+    VkResult rc = vk.vkGetPipelineExecutablePropertiesKHR(device, &pi, &n_exec, nullptr);
+    if (rc != VK_SUCCESS && rc != VK_INCOMPLETE) {
+      std::fprintf(stderr, "[vt vulkan] PIPE %s  statistics unavailable (properties rc=%d)\n",
+                   key.c_str(), static_cast<int>(rc));
+      std::fflush(stderr);
+      n_exec = 0;
+    }
+    std::vector<VkPipelineExecutablePropertiesKHR> execs(n_exec);
+    for (auto& e : execs) e.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR;
+    if (n_exec != 0) {
+      vk.vkGetPipelineExecutablePropertiesKHR(device, &pi, &n_exec, execs.data());
+    }
+    for (uint32_t e = 0; e < n_exec; ++e) {
+      VkPipelineExecutableInfoKHR ei{};
+      ei.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR;
+      ei.pipeline = p.pipeline;
+      ei.executableIndex = e;
+      uint32_t n_st = 0;
+      VkResult src = vk.vkGetPipelineExecutableStatisticsKHR(device, &ei, &n_st, nullptr);
+      if (src != VK_SUCCESS && src != VK_INCOMPLETE) {
+        std::fprintf(stderr, "[vt vulkan] PIPE %s  exec %u statistics rc=%d\n", key.c_str(), e,
+                     static_cast<int>(src));
+        std::fflush(stderr);
+        continue;
+      }
+      std::vector<VkPipelineExecutableStatisticKHR> st(n_st);
+      for (auto& x : st) x.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
+      if (n_st != 0) vk.vkGetPipelineExecutableStatisticsKHR(device, &ei, &n_st, st.data());
+      std::string line = "[vt vulkan] PIPE " + key;
+      for (uint32_t x = 0; x < n_st; ++x) {
+        line += "  ";
+        line += st[x].name;
+        line += "=";
+        switch (st[x].format) {
+          case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+            line += st[x].value.b32 ? "1" : "0";
+            break;
+          case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+            line += std::to_string(st[x].value.i64);
+            break;
+          case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+            line += std::to_string(st[x].value.u64);
+            break;
+          default:
+            line += std::to_string(st[x].value.f64);
+            break;
+        }
+      }
+      std::fprintf(stderr, "%s\n", line.c_str());
+      std::fflush(stderr);
+    }
+  }
 
   VkDescriptorSetAllocateInfo dsai{};
   dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -1520,6 +2024,12 @@ uint64_t VulkanContext::gpu_span_batches() const {
   return gpu_span_batches_;
 }
 
+bool VulkanContext::BatchTouches(void* buffer) const {
+  if (buffer == nullptr) return false;
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  return static_cast<BufferSet*>(batch_buffers_)->Contains(buffer);
+}
+
 void VulkanContext::FlushIfBatchTouches(void* buffer, const char* why) {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
   // A host pointer (nullptr) cannot alias a bound VkBuffer, so it never forces a
@@ -1532,6 +2042,55 @@ void VulkanContext::FlushIfBatchTouches(void* buffer, const char* why) {
   // the silent stale-read this backend's flush contract exists to prevent.
   if (!static_cast<BufferSet*>(batch_buffers_)->Contains(buffer)) return;
   DrainLocked(why);
+}
+
+bool VulkanContext::TryDeviceCopy(void* dst_buffer, uint32_t dst_offset,
+                                  void* src_buffer, uint32_t src_offset,
+                                  size_t bytes) {
+  if (dst_buffer == nullptr || src_buffer == nullptr || bytes == 0) return false;
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  // Only worth doing when there is a batch to record into. With no batch open
+  // the memcpy path costs nothing extra, and opening one here would duplicate
+  // the query-pool reset the dispatch path owns.
+  if (!batch_open_) return false;
+
+  auto cmd = Unpack<VkCommandBuffer>(slot_cmd_[slot_]);
+  const VulkanApi& vk = Api();
+
+  VkMemoryBarrier pre{};
+  pre.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  pre.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  pre.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  vk.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &pre, 0, nullptr, 0,
+                          nullptr);
+
+  VkBufferCopy region{};
+  region.srcOffset = src_offset;
+  region.dstOffset = dst_offset;
+  region.size = bytes;
+  vk.vkCmdCopyBuffer(cmd, Unpack<VkBuffer>(src_buffer), Unpack<VkBuffer>(dst_buffer), 1,
+                     &region);
+
+  VkMemoryBarrier post{};
+  post.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  post.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  post.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  vk.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &post, 0, nullptr,
+                          0, nullptr);
+
+  // Both sides are now written or read by a command in this batch, so a later
+  // HOST touch of either must still drain. Registering them is what keeps that
+  // true; omitting it would trade one stall for a silent stale read.
+  auto& bound = *static_cast<BufferSet*>(batch_buffers_);
+  bound.Insert(dst_buffer);
+  bound.Insert(src_buffer);
+  // The smart-barrier hazard history tracks shader accesses only and knows
+  // nothing about this transfer, so make the next dispatch barrier
+  // unconditionally rather than let it consult a history that is now incomplete.
+  force_barrier_next_ = true;
+  return true;
 }
 
 void VulkanContext::FlushBatch(const char* why) {
@@ -1655,7 +2214,11 @@ void VulkanContext::FlushBatchLocked(const char* why) {
   slot_in_flight_[slot_] = true;
   ++submit_count_;
   if (kDispatchStats) {
-    std::fprintf(stderr, "[vt vulkan] FLUSH %u dispatches in one submit\n", batch_count_);
+    // `why` on the same line as the count: the exit-time TRIGGERS table sums
+    // reasons but loses their ORDER, and the order is the question here -- two
+    // drains per token, and which one sits where in the step decides the fix.
+    std::fprintf(stderr, "[vt vulkan] FLUSH %u dispatches in one submit  why=%s\n",
+                 batch_count_, why);
     std::fflush(stderr);
   }
   if (kHostProfile) {
@@ -1689,7 +2252,8 @@ void VulkanContext::FlushBatchLocked(const char* why) {
 void VulkanContext::Dispatch(const std::string& name, const void* const* buffers,
                              uint32_t buffer_count, const void* push_constants,
                              uint32_t push_size, uint32_t group_count_x,
-                             const uint32_t* spec_values, uint32_t spec_count) {
+                             const uint32_t* spec_values, uint32_t spec_count,
+                             const std::string& stats_label) {
   if (group_count_x == 0) return;  // nothing to do; an empty dispatch is illegal
   VT_CHECK(group_count_x <= max_workgroup_count_x_,
            "vulkan: dispatch needs " + std::to_string(group_count_x) +
@@ -1893,7 +2457,8 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   if (timed) {
     vk.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                            Unpack<VkQueryPool>(query_pool_), query_base + 1);
-    static_cast<std::vector<std::string>*>(slot_names_[slot_])->push_back(name);
+    static_cast<std::vector<std::string>*>(slot_names_[slot_])
+        ->push_back(stats_label.empty() ? name : stats_label);
   }
 
   const uint64_t hp_t_rec = kHostProfile ? NowNs() : 0;

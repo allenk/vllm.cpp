@@ -1,0 +1,203 @@
+#version 450
+// vt::Matmul / vt::MatmulBT — TILED cooperative-matrix tactic.
+//
+// WHY THIS EXISTS. `vt_matmul_coopmat.comp` gives one 16x16 output tile to one
+// subgroup and issues coopMatLoad straight from global memory on every K step,
+// with no shared-memory staging. Every output tile therefore re-reads a whole A
+// row-block and B column-block from DRAM. Measured on an RTX PRO 6000 Blackwell
+// (1792 GB/s roofline), against the 27B's own prefill shapes:
+//
+//   shape                    redundancy   pure-BW model   measured   effective
+//   mlp   512 x5120 x17408      62x          6.37 ms       5.89 ms   1884 GB/s
+//   mlp  2048 x5120 x17408     229x         25.47          24.90     1649 GB/s
+//
+// The two large shapes sit at 102-108% of a model that assumes the kernel is
+// bandwidth-bound on redundant reads, and at the card's roofline. So the 14.5 to
+// 27.9 TFLOP/s it delivers is not the tensor cores falling short; it is the
+// bandwidth being spent re-reading the same operands. It also explains why a
+// larger M is worse: 512 to 2048 takes redundancy from 62x to 229x.
+//
+// THE FIX IS TILING, NOT A NEWER EXTENSION. coopmat2 (VK_NV_cooperative_matrix2)
+// would help, and llama.cpp's mul_mm_cm2.comp uses it to reach 2300 tok/s of
+// prefill on this same card against our ~12 -- but it is an NV extension, and
+// AMD and Intel have only VK_KHR_cooperative_matrix. Since portability is the
+// entire reason the Vulkan backend exists, the redundancy is fixed here within
+// coopmat1, the way ncnn's gemm_cm.comp does it.
+//
+// WHAT THIS SHADER CHANGES, and only this:
+//   * a WORKGROUP of WG_SUBGROUPS subgroups owns one TILE_M x TILE_N output tile
+//     instead of one subgroup owning 16x16
+//   * A and B blocks for the current K step are staged ONCE into shared memory
+//     and read by every subgroup in the workgroup
+//   * each subgroup then walks its own 16x16 sub-tiles out of shared memory
+//
+// Redundancy falls from (M/16)(N/16) tile-loads to (M/TILE_M)(N/TILE_N), i.e. by
+// (TILE_M/16)(TILE_N/16) -- 16x at 64x64 -- before counting the reuse that
+// staging itself buys inside the workgroup.
+//
+// NUMERICS ARE UNCHANGED FROM THE UNTILED TACTIC. Same coopMatMulAdd over the
+// same 16x16x16 configuration, same f32 accumulator, same single round on store.
+// The K loop order per output element is identical; only WHERE the operands are
+// read from changes. It is gated against the scalar tactic exactly as the
+// untiled one is.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#include "vt_common.glsl"
+
+const uint VT_CM = 16u;          // the reported M = N = K tile extent
+const uint SG = 32u;             // subgroup size; the host refuses other sizes
+const uint WG_M = 2u;            // subgroup grid within the workgroup
+const uint WG_N = 2u;
+const uint SG_M = 2u;            // 16x16 sub-tiles per subgroup
+const uint SG_N = 2u;
+const uint TILE_M = VT_CM * SG_M * WG_M;   // 64
+const uint TILE_N = VT_CM * SG_N * WG_N;   // 64
+const uint KSTEP = 32u;                    // K staged per shared-memory round
+
+// Literal, not a specialization constant: vt_common.glsl records that
+// local_size_x_id makes glslang emit LocalSize 1 1 1 at the vulkan1.1 target,
+// which silently runs one thread per workgroup.
+layout(local_size_x = SG * WG_M * WG_N, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Ab32 { uint v[]; } A32;
+layout(binding = 1) readonly buffer Ab16 { bfloat16_t v[]; } A16;
+layout(binding = 2) readonly buffer Bb32 { uint v[]; } B32;
+layout(binding = 3) readonly buffer Bb16 { bfloat16_t v[]; } B16;
+layout(binding = 4) buffer Db32 { uint v[]; } D32;
+layout(binding = 5) buffer Db16 { uint16_t v[]; } D16;
+
+layout(constant_id = 0) const uint VT_MM_BT = 0u;
+layout(constant_id = 1) const uint VT_MM_OUT_DT = VT_DT_F32;
+
+layout(push_constant) uniform Params {
+  uint m;
+  uint n;
+  uint k;
+  uint a_off;
+  uint b_off;
+  uint out_off;
+} p;
+
+// Staged operands. A is [TILE_M][KSTEP], B is [TILE_N][KSTEP] -- B is stored
+// transposed relative to the KxN case so both are row-major-by-K here and the
+// coopMatLoad below is one shape for both orientations.
+shared bfloat16_t sh_a[TILE_M * KSTEP];
+shared bfloat16_t sh_b[TILE_N * KSTEP];
+
+// Spill for the bounds-checked, dtype-converting store. Same reasoning as the
+// untiled shader: a cooperative-matrix store cannot express bounds checks and
+// cannot do the VT_STORE dtype conversion.
+//
+// ONE REGION PER SUBGROUP, and that is not a micro-optimisation: the untiled
+// shader has a single subgroup so one 16x16 spill sufficed, but here four
+// subgroups reach the store at the same time. Sharing one region let them
+// overwrite each other's tiles -- MEASURED as worst rel err 1.750e+00 on the
+// first run, i.e. most outputs wrong, which is exactly what a race on the spill
+// looks like.
+shared float sh_o[WG_M * WG_N * VT_CM * VT_CM];
+
+void main() {
+  const uint tiles_n = (p.n + TILE_N - 1u) / TILE_N;
+  const uint tiles_m = (p.m + TILE_M - 1u) / TILE_M;
+  const uint tile = gl_WorkGroupID.x;
+  if (tile >= tiles_m * tiles_n) return;
+
+  uint tile_m = (tile / tiles_n) * TILE_M;
+  uint tile_n = (tile % tiles_n) * TILE_N;
+
+  // Ragged edges are handled by SHIFTING the last tile back, exactly as the
+  // untiled shader does, and for the same reason: coopMatLoad reads a full tile
+  // with no masking, so a partial tile reads past the operand and faults the GPU
+  // on the LOAD, which presents as a hang rather than an error. Shifting is
+  // exact -- a result row depends only on that row of A and on B, so the rows
+  // recomputed by two tiles get bit-identical values written twice.
+  if (tile_m + TILE_M > p.m) tile_m = p.m - TILE_M;
+  if (tile_n + TILE_N > p.n) tile_n = p.n - TILE_N;
+
+  const uint lid = gl_LocalInvocationID.x;
+  const uint sg_id = lid / SG;              // which subgroup in the workgroup
+  const uint sg_m = sg_id / WG_N;           // its position in the WG_M x WG_N grid
+  const uint sg_n = sg_id % WG_N;
+
+  coopmat<float, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseAccumulator> acc[SG_M][SG_N];
+  for (uint i = 0u; i < SG_M; ++i)
+    for (uint j = 0u; j < SG_N; ++j)
+      acc[i][j] = coopmat<float, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseAccumulator>(0.0);
+
+  const uint threads = SG * WG_M * WG_N;
+
+  for (uint k0 = 0u; k0 < p.k; k0 += KSTEP) {
+    // STAGE. Every invocation in the workgroup helps fill both blocks, so each
+    // operand element crosses the memory bus once per workgroup instead of once
+    // per 16x16 tile.
+    barrier();
+    for (uint idx = lid; idx < TILE_M * KSTEP; idx += threads) {
+      const uint r = idx / KSTEP;
+      const uint c = idx % KSTEP;
+      sh_a[idx] = A16.v[(p.a_off >> 1) + (tile_m + r) * p.k + k0 + c];
+    }
+    for (uint idx = lid; idx < TILE_N * KSTEP; idx += threads) {
+      const uint r = idx / KSTEP;
+      const uint c = idx % KSTEP;
+      if (VT_MM_BT == 1u) {
+        // b is [N,K]: the element we want is already (n, k).
+        sh_b[idx] = B16.v[(p.b_off >> 1) + (tile_n + r) * p.k + k0 + c];
+      } else {
+        // b is [K,N]: transpose on the way in so the inner loop sees one layout.
+        sh_b[idx] = B16.v[(p.b_off >> 1) + (k0 + c) * p.n + tile_n + r];
+      }
+    }
+    barrier();
+
+    // COMPUTE. Both staged blocks are [rows][KSTEP] row-major, so A loads
+    // RowMajor and B loads ColumnMajor (it holds B^T), matching the untiled
+    // shader's operand semantics.
+    for (uint kk = 0u; kk < KSTEP; kk += VT_CM) {
+      coopmat<bfloat16_t, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseA> ma[SG_M];
+      coopmat<bfloat16_t, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseB> mb[SG_N];
+      for (uint i = 0u; i < SG_M; ++i) {
+        const uint row = (sg_m * SG_M + i) * VT_CM;
+        coopMatLoad(ma[i], sh_a, row * KSTEP + kk, KSTEP,
+                    gl_CooperativeMatrixLayoutRowMajor);
+      }
+      for (uint j = 0u; j < SG_N; ++j) {
+        const uint col = (sg_n * SG_N + j) * VT_CM;
+        coopMatLoad(mb[j], sh_b, col * KSTEP + kk, KSTEP,
+                    gl_CooperativeMatrixLayoutColumnMajor);
+      }
+      for (uint i = 0u; i < SG_M; ++i)
+        for (uint j = 0u; j < SG_N; ++j)
+          acc[i][j] = coopMatMulAdd(ma[i], mb[j], acc[i][j]);
+    }
+  }
+
+  // STORE, one 16x16 sub-tile at a time through the shared spill, for the same
+  // two reasons the untiled shader gives: a coopmat store cannot bounds-check,
+  // and VT_STORE has to do the dtype conversion.
+  //
+  // Each subgroup owns its own spill region and writes its own tile with its own
+  // 32 lanes, so nothing crosses subgroup boundaries here. The barriers are
+  // still workgroup-wide because every subgroup executes exactly SG_M * SG_N
+  // iterations, so they are reached uniformly.
+  const uint lane = lid % SG;
+  const uint spill = sg_id * (VT_CM * VT_CM);
+  for (uint i = 0u; i < SG_M; ++i) {
+    for (uint j = 0u; j < SG_N; ++j) {
+      barrier();
+      coopMatStore(acc[i][j], sh_o, spill, VT_CM, gl_CooperativeMatrixLayoutRowMajor);
+      barrier();
+      const uint base_r = tile_m + (sg_m * SG_M + i) * VT_CM;
+      const uint base_c = tile_n + (sg_n * SG_N + j) * VT_CM;
+      for (uint idx = lane; idx < VT_CM * VT_CM; idx += SG) {
+        const uint r = idx / VT_CM;
+        const uint c = idx % VT_CM;
+        if (base_r + r >= p.m || base_c + c >= p.n) continue;
+        VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off,
+                 (base_r + r) * p.n + (base_c + c), sh_o[spill + idx]);
+      }
+    }
+  }
+}

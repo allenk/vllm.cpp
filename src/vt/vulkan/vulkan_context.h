@@ -28,6 +28,7 @@
 #define VT_VULKAN_VULKAN_CONTEXT_H_
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -101,9 +102,15 @@ class VulkanContext {
   // `string_to_spv` call sites at pin 237ad9b96, most inside dtype/quant/coopmat
   // loops) — here one module covers the axis and the count of committed artifacts
   // tracks shader FILES instead of their cross product.
+  // `stats_label`, when non-empty, is what the per-dispatch TIME histogram is
+  // keyed by instead of `name`. It exists so a shape can get its own row without
+  // becoming its own pipeline: `name` selects the module and the pipeline cache
+  // entry, so decorating IT would split the cache per shape -- a trap the shape
+  // histogram's own comment has warned about since it was written. This is the
+  // other half of that: the label never reaches GetPipeline.
   void Dispatch(const std::string& name, const void* const* buffers, uint32_t buffer_count,
                 const void* push_constants, uint32_t push_size, uint32_t group_count_x,
-                const uint32_t* spec_values = nullptr, uint32_t spec_count = 0);
+                const uint32_t* spec_values = nullptr, uint32_t spec_count = 0, const std::string& stats_label = std::string());
 
   // Was a pipeline for this SPIR-V module ever created? The cache key is the
   // module name plus its specialization values, so this asks "did any variant of
@@ -181,6 +188,28 @@ class VulkanContext {
   // bound by a dispatch in the currently open batch. See Backend::Copy for why
   // that is the exact condition.
   void FlushIfBatchTouches(void* buffer, const char* why);
+
+  // DEVICE-TO-DEVICE COPY RECORDED INTO THE OPEN BATCH, instead of the host
+  // memcpy that Backend::Copy would otherwise do.
+  //
+  // WHY THIS EXISTS. Vulkan allocations here are host-addressable, so Copy was
+  // written as memcpy for every case -- and a memcpy whose source a pending
+  // dispatch is still writing has to drain the batch first. Measured on a
+  // Qwen3-0.6B decode, EVERY drain came from a copy whose two sides were BOTH
+  // device buffers (dst_dev=1 src_dev=1): the model takes a working copy of the
+  // embedded hidden state each step, 1 x hidden_size x bf16 = 2048 bytes, and
+  // that one memcpy forced a full submit and fence of the ~400 dispatches ahead
+  // of it. A device-to-device copy has no reason to involve the host at all.
+  //
+  // Returns false when it could not be queued -- batching off, no batch open,
+  // either side not a Vulkan allocation -- and the caller must then fall back to
+  // the memcpy path INCLUDING its flush. Never silently drops the copy.
+  //
+  // Emits a barrier on each side: compute-write before transfer-read, and
+  // transfer-write before the next compute-read. Both are explicit rather than
+  // left to the dispatch barrier, whose access masks cover shader stages only.
+  bool TryDeviceCopy(void* dst_buffer, uint32_t dst_offset, void* src_buffer,
+                     uint32_t src_offset, size_t bytes);
   // Whether dispatch batching is active. Exposed so a test never has to restate
   // the default: the VK-A2 gate originally re-derived it from the environment
   // variable and silently asserted the wrong branch the moment the default
@@ -299,6 +328,24 @@ class VulkanContext {
   void* ScratchData() const { return scratch_mapped_; }
   static constexpr size_t kScratchBytes = 1024;
 
+  // A GPU-ONLY WORKSPACE, grown on demand and never shrunk.
+  //
+  // Distinct from the scratch above, which is 1 KB of host-mapped memory for the
+  // fused-chain step list. This one is for intermediates that only the GPU ever
+  // touches -- the split-K attention partials are the first user, at
+  // total_q * hq * splits * (head_dim + 2) floats, which is 65 KB on
+  // Qwen3-0.6B at 8 splits and 774 KB on the 27B at 32.
+  //
+  // Grown rather than sized once: the requirement depends on the batch and the
+  // model, and a fixed cap would either waste memory on small models or refuse
+  // large ones. Never shrunk, because the peak recurs every token and freeing it
+  // between calls would trade a one-time allocation for a per-token one.
+  void* Workspace(size_t bytes);
+
+  // Read-only form of the FlushIfBatchTouches test, for diagnostics that want
+  // to report an impending drain without causing one.
+  bool BatchTouches(void* buffer) const;
+
   // --- The VULKAN API VERSION. {1, 4} on GB10 (API 1.4.312). It is reached
   // through vt::Backend::DeviceCapabilityMajor/Minor
   // (src/vt/vulkan/vulkan_backend.cpp:144-145), which forwards to the
@@ -338,6 +385,29 @@ class VulkanContext {
   // which is why the scalar fallback is the tested-everywhere path and the
   // coopmat path is dgx-gated.
   bool coopmat_bf16_f32() const { return coopmat_bf16_f32_; }
+  // True only when VK_NV_cooperative_matrix2 was REQUESTED and OBTAINED.
+  bool coopmat2_workgroup() const { return coopmat2_workgroup_; }
+  // True only when the device was ASKED for tensor addressing and granted it.
+  // The workgroup shader loads through tensorLayoutNV, so a tactic that selects
+  // it without this is using a capability the device never enabled.
+  bool coopmat2_tensor_addressing() const { return coopmat2_tensor_addressing_; }
+
+  // IS THIS EXACT (M, N, K, invocations) A CONFIGURATION THE DEVICE OFFERS?
+  //
+  // The NV workgroup-scope path pairs matrix dimensions with an invocation
+  // count -- they are not independently choosable -- and the pairing is DEVICE
+  // DATA, reported through
+  // vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV. It was
+  // previously hardcoded in the tactic from what this one card reports, and an
+  // external review found the hardcoding already wrong for one override
+  // (M=16 was paired with 256 invocations, a combination this card does not
+  // offer). Asking the device is both the fix for that class of bug and the
+  // only form of it that can be right on a card we have not seen.
+  bool coopmat2_wg_supports(uint32_t m, uint32_t n, uint32_t k, uint32_t invocations) const;
+  // The tile the DRIVER reported and this context selected, not a constant.
+  uint32_t coopmat_tile_m() const { return coopmat_tile_m_; }
+  uint32_t coopmat_tile_n() const { return coopmat_tile_n_; }
+  uint32_t coopmat_tile_k() const { return coopmat_tile_k_; }
   uint32_t subgroup_size() const { return subgroup_size_; }
 
   // --- WIDE REDUCTION SHADERS (VK-RMSNORM). Every shader in this backend is
@@ -403,6 +473,10 @@ class VulkanContext {
   void* scratch_buffer_ = nullptr;   // VkBuffer
   void* scratch_memory_ = nullptr;   // VkDeviceMemory
   void* scratch_mapped_ = nullptr;   // host pointer
+
+  void* ws_buffer_ = nullptr;        // VkBuffer, GPU-only workspace
+  void* ws_memory_ = nullptr;        // VkDeviceMemory
+  size_t ws_bytes_ = 0;
   // Submits the open batch. Does NOT wait unless in-flight slots are exhausted.
   void FlushBatchLocked(const char* why = "explicit");  // caller holds mutex_
   // Submits the open batch AND waits for every submitted batch to complete, so
@@ -506,6 +580,14 @@ class VulkanContext {
   bool denorm_preserve_f32_ = false;
   bool sz_inf_nan_preserve_f32_ = false;
   bool coopmat_bf16_f32_ = false;
+  bool coopmat2_workgroup_ = false;
+  bool coopmat2_tensor_addressing_ = false;
+  // One entry per workgroup-scope bf16/f32 configuration the device reports.
+  struct CoopMat2Dim {
+    uint32_t m_gran, n_gran, k_gran, invocations;
+  };
+  std::vector<CoopMat2Dim> coopmat2_dims_;
+  uint32_t coopmat_tile_m_ = 16, coopmat_tile_n_ = 16, coopmat_tile_k_ = 16;
   uint32_t subgroup_size_ = 0;
   uint32_t max_workgroup_count_x_ = 0;
   uint32_t max_workgroup_invocations_ = 0;
@@ -550,6 +632,9 @@ uint32_t FlatGroupCount(int64_t n);
 // lever is numerically free.
 uint32_t MatmulColumnsPerLane();
 void SetMatmulColumnsPerLane(uint32_t ncols);
+// True once anyone has set the arm explicitly -- env var at startup, or a call to
+// SetMatmulColumnsPerLane. Shape-derived defaults must not override that.
+std::atomic<bool>& MatmulColumnsExplicit();
 
 }  // namespace vt::vulkan
 

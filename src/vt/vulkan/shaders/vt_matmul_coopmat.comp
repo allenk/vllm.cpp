@@ -69,6 +69,44 @@ layout(constant_id = 0) const uint VT_MM_BT = 0u;
 // destination varies.
 layout(constant_id = 1) const uint VT_MM_OUT_DT = VT_DT_F32;
 
+// REGISTER BLOCKING. Both default to 1, which reproduces the original kernel
+// exactly -- one accumulator, one A load and one B load per coopMatMulAdd.
+//
+// Why they exist, from the c=32 shape histogram: decode GEMM here is m=32 with n
+// in the tens of thousands, so a 16x16 tile gives 2 tile-rows and thousands of
+// tile-columns. Each workgroup then streams its OWN 16 rows of A and 16 columns
+// of B. At m=32 k=5120 n=34816 the loads total 713 M elements against 178 M of
+// useful operand -- 4.0x -- and HALF of that is A, re-read 2176 times to deliver
+// 0.33 MB.
+//
+// MR cuts the B re-reads (tile-rows share one B load); NR cuts the A re-reads
+// (tile-columns share one A load). At MR=2, NR=4 the same shape costs 267 M
+// elements, 1.5x rather than 4.0x.
+//
+// Slots are written out rather than looped over a spec-constant-sized array,
+// matching vt_matmul_vec's batch arms: an array of coopmat indexed by a loop
+// variable is not something to discover a driver's opinion of at runtime.
+layout(constant_id = 2) const uint VT_MM_CM_MR = 1u;   // 1 or 2
+layout(constant_id = 3) const uint VT_MM_CM_NR = 1u;   // 1, 2 or 4
+
+// TILE EXTENTS, SPECIALIZED RATHER THAN HARDCODED.
+//
+// These were `const uint VT_CM = 16u` with a comment calling 16 "the reported
+// tile extent". On this card that happens to be true -- the driver reports
+// exactly ONE bf16 configuration and it is 16x16x16 -- but that is a fact about
+// this vendor, not about Vulkan. An Adreno 840 reports fp16 cooperative matrix
+// at 64x64x16, 64x32x16 and 64x16x16, four times larger in M and N; an AMD
+// integrated part reports 16x16x16 for fp16 and none for bf16; a D3D12
+// emulation layer reports none at all.
+//
+// Asking the driver for ONE tuple can only ever answer yes or no about a shape
+// we already committed to, so the host now enumerates and specializes. M, N and
+// K are separate because the reported shapes are not square -- 16x8x16 and
+// 64x32x16 both appear in the wild.
+layout(constant_id = 4) const uint VT_CM_M = 16u;
+layout(constant_id = 5) const uint VT_CM_N = 16u;
+layout(constant_id = 6) const uint VT_CM_K = 16u;
+
 layout(push_constant) uniform Params {
   uint m;
   uint n;
@@ -78,11 +116,14 @@ layout(push_constant) uniform Params {
   uint out_off;
 } p;
 
-const uint VT_CM = 16u;  // the reported M = N = K tile extent
 
 // Spill buffer for the edge/non-f32 store path. Declared at file scope because a
 // shared declaration cannot live inside a function.
-shared float vt_cm_spill[VT_CM * VT_CM];
+// Sized to the largest tile the host will select (see kCoopMatTileMax), not to
+// the specialized extent: a specialization-constant-sized shared array is legal
+// but the host would then have to reason about shared-memory limits per variant,
+// and 16 KB is affordable on every device that reports cooperative matrix at all.
+shared float vt_cm_spill[64 * 64];
 
 void main() {
   // Output tile coordinates. THE HOST GUARANTEES n % 16 == 0 and m >= 16; a
@@ -94,82 +135,127 @@ void main() {
   // fault happens on the LOAD. At lm_head with M=1 this read ~30 KB past a small
   // activation buffer, faulted the GPU, and the fence never signalled: an
   // infinite vkWaitForFences that presents as a HANG rather than an error.
-  uint tiles_n = (p.n + VT_CM - 1u) / VT_CM;
+  // Each workgroup covers VT_MM_CM_MR x VT_MM_CM_NR tiles of 16x16.
+  const uint BM = VT_CM_M * VT_MM_CM_MR;
+  const uint BN = VT_CM_N * VT_MM_CM_NR;
+  uint tiles_n = (p.n + BN - 1u) / BN;
   uint tile = gl_WorkGroupID.x;
-  if (tile >= ((p.m + VT_CM - 1u) / VT_CM) * tiles_n) { return; }
-  uint tile_m = (tile / tiles_n) * VT_CM;
-  uint tile_n = (tile % tiles_n) * VT_CM;
+  if (tile >= ((p.m + BM - 1u) / BM) * tiles_n) { return; }
+  uint tile_m = (tile / tiles_n) * BM;
+  uint tile_n = (tile % tiles_n) * BN;
 
-  // RAGGED M, HANDLED BY SHIFTING THE LAST TILE BACK rather than masking the
-  // load. A trailing tile would read rows past M -- the fault described above --
-  // so it is slid down to start at M-16 and therefore reads only REAL rows.
+  // RAGGED M, HANDLED BY SHIFTING THE LAST BLOCK BACK rather than masking the
+  // load -- a trailing tile would read rows past M, which faults the GPU and
+  // presents as an infinite vkWaitForFences rather than an error. Exact for the
+  // same reason as before: a result row depends only on that row of A and on B,
+  // so rows shared with the predecessor recompute to bit-identical values.
   //
-  // This is exact, not an approximation. A result row depends solely on that row
-  // of A and on B, never on which tile computed it, so the rows this tile shares
-  // with its predecessor are recomputed to bit-identical values. The duplicate
-  // stores write the same bytes to the same addresses; the values are equal, so
-  // the interleaving cannot matter.
+  // N is NOT slid back. When either factor is blocked the host requires
+  // n % BN == 0 and m % BM == 0, so there is no ragged N; the unblocked path
+  // keeps the original behaviour where the store bound-check covers it.
+  // OWNERSHIP IS THE ORIGINAL ROW START, NOT THE SLID ONE.
   //
-  // It requires M >= 16, which the host predicate enforces. Below that there is
-  // no in-bounds 16-row window at all, and the decode path (M=1) is served by the
-  // GEMV tactic instead.
-  if (tile_m + VT_CM > p.m) { tile_m = p.m - VT_CM; }
+  // Sliding the last block back makes it recompute rows the previous block also
+  // computed, and the note above argues that is exact because the values are
+  // bit-identical. That is true of the VALUES and says nothing about the WRITES:
+  // two workgroups storing the same address concurrently and non-atomically is a
+  // data race in the memory model whatever they store. An external review
+  // (RFG-1, 2026-09-06, P1) put it exactly right -- "identical arithmetic does
+  // not make concurrent non-atomic writes race-free" -- and the producer had
+  // reasoned only about the values.
+  //
+  // So: keep the slid LOAD, and let each block store only the rows it was
+  // originally assigned. The last block still COMPUTES the overlap, because it
+  // must to fill its cooperative-matrix tile, and simply does not write it.
+  const uint tile_m_owned = tile_m;
+  if (tile_m + BM > p.m) { tile_m = p.m - BM; }
+  const uint tail_lo = tile_m_owned;
 
-  coopmat<float, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseAccumulator> acc =
-      coopmat<float, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseAccumulator>(0.0);
+#define VT_CM_ACC coopmat<float, gl_ScopeSubgroup, VT_CM_M, VT_CM_N, gl_MatrixUseAccumulator>
+  VT_CM_ACC acc0 = VT_CM_ACC(0.0), acc1 = VT_CM_ACC(0.0), acc2 = VT_CM_ACC(0.0),
+            acc3 = VT_CM_ACC(0.0), acc4 = VT_CM_ACC(0.0), acc5 = VT_CM_ACC(0.0),
+            acc6 = VT_CM_ACC(0.0), acc7 = VT_CM_ACC(0.0);
 
-  // K is walked in whole 16-wide steps. A ragged K tail cannot be masked inside a
-  // cooperative matrix load, so the HOST only selects this tactic when k % 16 ==
-  // 0; the assert-by-construction is that this loop covers exactly k.
-  for (uint k0 = 0u; k0 < p.k; k0 += VT_CM) {
-    coopmat<bfloat16_t, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseA> ma;
-    coopmat<bfloat16_t, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseB> mb;
+  // K is walked in whole 16-wide steps; the host only selects this tactic when
+  // k % 16 == 0, so this loop covers exactly k.
+  for (uint k0 = 0u; k0 < p.k; k0 += VT_CM_K) {
+    coopmat<bfloat16_t, gl_ScopeSubgroup, VT_CM_M, VT_CM_K, gl_MatrixUseA> ma0, ma1;
+    coopmat<bfloat16_t, gl_ScopeSubgroup, VT_CM_K, VT_CM_N, gl_MatrixUseB> mb0, mb1, mb2, mb3;
 
     // A is [M,K] row-major: element (i, q) at a_off/2 + i*k + q, stride k.
-    coopMatLoad(ma, A16.v, (p.a_off >> 1) + tile_m * p.k + k0, p.k, gl_CooperativeMatrixLayoutRowMajor);
-
-    if (VT_MM_BT == 1u) {
-      // b is [N,K]: the tile we need is rows [tile_n, tile_n+16) at columns
-      // [k0, k0+16), which is B^T in the multiply -- loaded as COLUMN major so
-      // the same memory serves as the B operand without a transpose pass.
-      coopMatLoad(mb, B16.v, (p.b_off >> 1) + tile_n * p.k + k0, p.k,
-                  gl_CooperativeMatrixLayoutColumnMajor);
-    } else {
-      // b is [K,N]: element (q, j) at b_off/2 + q*n + j, stride n.
-      coopMatLoad(mb, B16.v, (p.b_off >> 1) + k0 * p.n + tile_n, p.n,
+    coopMatLoad(ma0, A16.v, (p.a_off >> 1) + tile_m * p.k + k0, p.k, gl_CooperativeMatrixLayoutRowMajor);
+    if (VT_MM_CM_MR > 1u) {
+      coopMatLoad(ma1, A16.v, (p.a_off >> 1) + (tile_m + VT_CM_M) * p.k + k0, p.k,
                   gl_CooperativeMatrixLayoutRowMajor);
     }
 
-    acc = coopMatMulAdd(ma, mb, acc);
+    if (VT_MM_BT == 1u) {
+      // b is [N,K]: rows [tile_n, tile_n+16) at columns [k0, k0+16), loaded
+      // COLUMN major so the same memory serves as the B operand untransposed.
+      coopMatLoad(mb0, B16.v, (p.b_off >> 1) + tile_n * p.k + k0, p.k, gl_CooperativeMatrixLayoutColumnMajor);
+      if (VT_MM_CM_NR > 1u) {
+        coopMatLoad(mb1, B16.v, (p.b_off >> 1) + (tile_n + VT_CM_N) * p.k + k0, p.k, gl_CooperativeMatrixLayoutColumnMajor);
+      }
+      if (VT_MM_CM_NR > 2u) {
+        coopMatLoad(mb2, B16.v, (p.b_off >> 1) + (tile_n + 2u * VT_CM_N) * p.k + k0, p.k, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(mb3, B16.v, (p.b_off >> 1) + (tile_n + 3u * VT_CM_N) * p.k + k0, p.k, gl_CooperativeMatrixLayoutColumnMajor);
+      }
+    } else {
+      // b is [K,N]: element (q, j) at b_off/2 + q*n + j, stride n.
+      coopMatLoad(mb0, B16.v, (p.b_off >> 1) + k0 * p.n + tile_n, p.n, gl_CooperativeMatrixLayoutRowMajor);
+      if (VT_MM_CM_NR > 1u) {
+        coopMatLoad(mb1, B16.v, (p.b_off >> 1) + k0 * p.n + tile_n + VT_CM_N, p.n, gl_CooperativeMatrixLayoutRowMajor);
+      }
+      if (VT_MM_CM_NR > 2u) {
+        coopMatLoad(mb2, B16.v, (p.b_off >> 1) + k0 * p.n + tile_n + 2u * VT_CM_N, p.n, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(mb3, B16.v, (p.b_off >> 1) + k0 * p.n + tile_n + 3u * VT_CM_N, p.n, gl_CooperativeMatrixLayoutRowMajor);
+      }
+    }
+
+    // MR x NR products from MR + NR loads. That ratio IS the optimisation.
+    acc0 = coopMatMulAdd(ma0, mb0, acc0);
+    if (VT_MM_CM_NR > 1u) { acc1 = coopMatMulAdd(ma0, mb1, acc1); }
+    if (VT_MM_CM_NR > 2u) { acc2 = coopMatMulAdd(ma0, mb2, acc2);
+                            acc3 = coopMatMulAdd(ma0, mb3, acc3); }
+    if (VT_MM_CM_MR > 1u) {
+      acc4 = coopMatMulAdd(ma1, mb0, acc4);
+      if (VT_MM_CM_NR > 1u) { acc5 = coopMatMulAdd(ma1, mb1, acc5); }
+      if (VT_MM_CM_NR > 2u) { acc6 = coopMatMulAdd(ma1, mb2, acc6);
+                              acc7 = coopMatMulAdd(ma1, mb3, acc7); }
+    }
   }
 
-  // ALWAYS SPILL THROUGH SHARED MEMORY, then write elementwise. One path, not a
-  // fast path plus an edge path, and deliberately so:
-  //
-  //   * TYPE SAFETY. A direct coopMatStore into the destination would have to
-  //     target the uint32 view this backend binds (VT_STORE reaches f32 storage
-  //     through floatBitsToUint), i.e. store a coopmat<float> through a uint
-  //     pointer. glslang ACCEPTS that without complaint, which is exactly why it
-  //     is not relied on -- and no device reachable from CI can execute a coopmat
-  //     shader at all, so the mistake would not surface here.
-  //   * A ragged M or N needs bounds checking that a cooperative-matrix store
-  //     cannot express, and a non-f32 destination needs the dtype conversion
-  //     VT_STORE does. Both already require this pass.
-  //
-  // The cost is one shared-memory round trip per 16x16 tile. A direct-store fast
-  // path for the full-tile f32 case is a legitimate later refinement, but it is a
-  // SPEED change and belongs behind an A/B on real hardware, not in the landing
-  // that first has to be correct.
-  //
-  // RowMajor into shared memory keeps the (row, col) mapping the spec defines, so
-  // the elementwise pass below is layout-agnostic.
-  coopMatStore(acc, vt_cm_spill, 0, VT_CM, gl_CooperativeMatrixLayoutRowMajor);
-  barrier();
-  for (uint idx = gl_LocalInvocationID.x; idx < VT_CM * VT_CM; idx += gl_WorkGroupSize.x) {
-    uint r = idx / VT_CM;
-    uint c = idx % VT_CM;
-    if (tile_m + r >= p.m || tile_n + c >= p.n) continue;
-    VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, (tile_m + r) * p.n + (tile_n + c),
-             vt_cm_spill[idx]);
+  // Spill each accumulator through the SAME shared tile in turn. One shared
+  // round trip per 16x16 tile, exactly as before -- the store path is unchanged
+  // in kind, only repeated. The barriers make reuse of one buffer safe, and
+  // every invocation reaches all of them because the slot guards are on
+  // SPECIALIZATION constants and therefore uniform by construction.
+  // The store lower bound `tail_lo` is BLOCK-UNIFORM: tile_m_owned differs from
+  // tile_m only for the one slid tail block, so for every other workgroup the
+  // comparison is against that block own start and folds away. Hoisting it was
+  // not cosmetic: comparing against tile_m_owned inline inside the macro measured
+  // 1.20x slower on the whole GEMM (3661/3505 -> 4322/4315 ms, same-binary A/B),
+  // because the compiler could no longer treat the bound as loop-invariant.
+#define VT_CM_SPILL(ACC, RO, CO)                                                  \
+  barrier();                                                                      \
+  coopMatStore(ACC, vt_cm_spill, 0, VT_CM_N, gl_CooperativeMatrixLayoutRowMajor);    \
+  barrier();                                                                      \
+  for (uint i2 = gl_LocalInvocationID.x; i2 < VT_CM_M * VT_CM_N; i2 += gl_WorkGroupSize.x) { \
+    uint gr = tile_m + (RO) + i2 / VT_CM_N;                                          \
+    uint gc = tile_n + (CO) + i2 % VT_CM_N;                                          \
+    if (gr >= tail_lo && gr < p.m && gc < p.n) {                                 \
+      VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, gr * p.n + gc, vt_cm_spill[i2]);  \
+    }                                                                              \
+  }
+
+  VT_CM_SPILL(acc0, 0u, 0u)
+  if (VT_MM_CM_NR > 1u) { VT_CM_SPILL(acc1, 0u, VT_CM_N) }
+  if (VT_MM_CM_NR > 2u) { VT_CM_SPILL(acc2, 0u, 2u * VT_CM_N)
+                          VT_CM_SPILL(acc3, 0u, 3u * VT_CM_N) }
+  if (VT_MM_CM_MR > 1u) {
+    VT_CM_SPILL(acc4, VT_CM_M, 0u)
+    if (VT_MM_CM_NR > 1u) { VT_CM_SPILL(acc5, VT_CM_M, VT_CM_N) }
+    if (VT_MM_CM_NR > 2u) { VT_CM_SPILL(acc6, VT_CM_M, 2u * VT_CM_N)
+                            VT_CM_SPILL(acc7, VT_CM_M, 3u * VT_CM_N) }
   }
 }

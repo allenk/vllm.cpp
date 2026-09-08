@@ -189,6 +189,10 @@ void LoadDeviceFunctions(VkDevice device) {
            std::string("vulkan: device entry point missing: ") + #name);
   VT_VK_DEVICE_FUNCS(VT_VK_LOAD_DEVICE)
 #undef VT_VK_LOAD_DEVICE
+  // Optional: null is a legal answer, and the use sites check for it.
+#define VT_VK_LOAD_DEVICE_OPT(name)                                            g_api.name =                                                                     reinterpret_cast<PFN_##name>(g_api.vkGetDeviceProcAddr(device, #name));
+  VT_VK_DEVICE_FUNCS_OPTIONAL(VT_VK_LOAD_DEVICE_OPT)
+#undef VT_VK_LOAD_DEVICE_OPT
 }
 
 }  // namespace vt::vulkan

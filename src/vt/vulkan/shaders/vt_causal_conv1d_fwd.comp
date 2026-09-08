@@ -1,0 +1,201 @@
+#version 450
+// vt::CausalConv1dFwd — the GDN PREFILL depthwise causal conv.
+//
+// WHY THIS EXISTS. This op had no Vulkan kernel and fell to the portable CPU
+// reference tier. MEASURED on an RTX PRO 6000 Blackwell, warm server, one
+// 576-token prefill of Qwen3.6-27B:
+//
+//     t(s)   proc CPU%   GPU%   GPU MB
+//        2      2427        0    69346
+//       25      3927        1    69404
+//       49      2179        0    69446
+//
+// 49 s wall, of which ~1.2 s is GPU work: the GPU sits at 0-1% while the
+// process holds 30-39 cores. Of 104 ops, exactly two fell to the reference
+// tier, and this is the one that runs once per GDN layer -- 48 of them in this
+// model. So the prefill was CPU-bound on a single missing kernel.
+//
+// This is one op of upstream's VK-G work row (linear attention, MLA, conv).
+//
+// SHAPE OF THE WORK, and why it is NOT llama.cpp's shape. llama.cpp's
+// ssm_conv.comp parallelises over tokens too (BLOCK_SIZE=32, TOKENS_PER_WG=16)
+// and gets away with it because ggml's dataflow is SSA: its conv op only
+// produces outputs, and advancing the state is a separate node. This op does
+// both in one kernel -- it reads the OLD state while computing outputs, then
+// OVERWRITES that state with the last K-1 input samples. Splitting tokens
+// across invocations would put those two against each other across invocation
+// boundaries.
+//
+// So the unit here is ONE INVOCATION PER (sequence, channel), which is exactly
+// the CPU kernel's own chunking unit (`ForRows(n * c_dim, ...)`), and the old
+// state is copied into a private array first -- again exactly what the CPU
+// kernel does with `old_row`. Each (s, c) pair then owns its output column
+// slice and its state row outright, so there is no cross-invocation hazard and
+// no barrier is needed.
+//
+// The parallelism that gives up is real but sufficient: n * c_dim, which on
+// this model is thousands of invocations per layer, each doing t_len * k
+// multiply-adds. Parallelising tokens as well (llama.cpp's shape, requiring the
+// state write to be split into a second dispatch) is a later refinement and
+// belongs behind an A/B, not in the landing that first has to be correct.
+//
+// PORTED 1:1 from src/vt/cpu/cpu_ops.cpp CausalConv1dFwdKernel. The accumulation
+// order per output element is identical, the silu spelling is the reference's
+// own (`acc / (1 + exp(-acc))`, not `acc * sigmoid(acc)`, which rounds
+// differently), and VT_LOAD/VT_STORE keep the same single round on store.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer Ob32 { uint v[]; } O32;
+layout(binding = 1) buffer Ob16 { uint16_t v[]; } O16;
+layout(binding = 2) readonly buffer Xb32 { uint v[]; } X32;
+layout(binding = 3) readonly buffer Xb16 { uint16_t v[]; } X16;
+layout(binding = 4) readonly buffer Wb32 { uint v[]; } W32;
+layout(binding = 5) readonly buffer Wb16 { uint16_t v[]; } W16;
+// bias; aliases the weight when the caller passed none (p.has_bias == 0).
+layout(binding = 6) readonly buffer Bb32 { uint v[]; } B32;
+layout(binding = 7) readonly buffer Bb16 { uint16_t v[]; } B16;
+// conv_state, read AND written in place; f32 or bf16 (p.st_dt).
+layout(binding = 8) buffer Sb32 { uint v[]; } ST32;
+layout(binding = 9) buffer Sb16 { uint16_t v[]; } ST16;
+// query_start_loc, i32, n+1 entries.
+layout(binding = 10) readonly buffer Qb { uint v[]; } QSL;
+// has_initial_state, i32 or i8 per sequence (p.his_is_i8 picks the read).
+layout(binding = 11) readonly buffer Hb { uint v[]; } HIS;
+
+layout(push_constant) uniform Params {
+  uint n;            // conv_state.shape[0] — sequence count
+  uint c_dim;        // x.shape[1]
+  uint k;            // weight.shape[1]
+  uint width;        // k - 1
+  uint x_rs;         // x.stride[0], in elements (x may be a padded-row view)
+  uint max_t_len;    // x.shape[0]: no sequence can be longer than the input
+  uint has_bias, his_is_i8, silu;
+  uint out_dt, x_dt, w_dt, bias_dt, st_dt;
+  uint out_off, x_off, w_off, bias_off, st_off, qsl_off, his_off;
+} p;
+
+// The private window, sized for the largest K this backend accepts. The host
+// predicate refuses anything wider, so the loop below never runs past it.
+const uint VT_CONV_MAX_WIDTH = 8u;
+
+// TOKEN BLOCKS PER (sequence, channel). 1 is the original mapping -- one
+// invocation walks the whole sequence -- and is what the host asks for whenever
+// the grid is already big enough.
+//
+// WHY THIS IS SAFE TO SPLIT, which is the whole reason it is worth doing here
+// and was NOT worth doing for the GDN recurrence beside it: this convolution
+// carries NO state along t. Output t reads x[t-K+1 .. t] and, only while
+// t < K-1, the pre-roll window. So the t loop is embarrassingly parallel, and
+// the only serialising piece -- advancing conv_state at the end -- is given to
+// block 0, which always exists and reads x rather than anything a sibling
+// writes. No barrier, no cross-workgroup dependency, unchanged arithmetic.
+//
+// MEASURED, and this is the reason to bother: the grid is n * c_dim
+// invocations, which for one sequence of this model is 1 * 10240 = 80
+// workgroups on a card with 188 SMs. Feeding more sequences shows what that
+// costs -- 4x the work moved ms/call only 0.2287 -> 0.2455, i.e. +7% -- so the
+// kernel is nowhere near throughput-limited at this grid, it simply has too few
+// invocations to fill the machine.
+layout(constant_id = 0) const uint VT_CONV_BLOCKS = 1u;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.n * p.c_dim * VT_CONV_BLOCKS) { return; }
+  uint blk = gid % VT_CONV_BLOCKS;
+  uint sc = gid / VT_CONV_BLOCKS;
+  uint s = sc / p.c_dim;
+  uint c = sc % p.c_dim;
+
+  // begin/end come from query_start_loc.
+  //
+  // ⚠️ t_len IS A LOOP BOUND AND THE SUBTRACTION IS UNSIGNED. If end < begin --
+  // a non-monotonic table, a wrong buffer offset, anything -- `end - begin`
+  // wraps to nearly 2^32 and the output loop below becomes effectively
+  // infinite. On a GPU that is not a crash: the dispatch never finishes, the
+  // fence never signals, and it presents as a HANG with no error, which is
+  // exactly the failure mode upstream documents for an out-of-bounds
+  // coopMatLoad. It cost a ten-minute hang before this guard existed.
+  //
+  // The CPU reference has two VT_CHECKs for this (cpu_ops.cpp:1051,1054) and I
+  // did not port them; the host now checks as well, and this is the second line
+  // of defence because a device-side loop bound must never depend on data being
+  // well-formed.
+  uint begin = QSL.v[(p.qsl_off >> 2) + s];
+  uint end = QSL.v[(p.qsl_off >> 2) + s + 1u];
+  if (end < begin) { return; }
+  uint t_len = end - begin;
+  if (t_len > p.max_t_len) { return; }
+
+  // has_initial_state is i32 or i8 per sequence. The i8 case is read through the
+  // u32 view and shifted, since this backend binds byte data through the 32-bit
+  // window like every other dtype-erased operand.
+  bool init;
+  if (p.his_is_i8 != 0u) {
+    uint word = HIS.v[(p.his_off >> 2) + (s >> 2)];
+    init = ((word >> ((s & 3u) * 8u)) & 0xFFu) != 0u;
+  } else {
+    init = HIS.v[(p.his_off >> 2) + s] != 0u;
+  }
+
+  uint srow = (s * p.c_dim + c) * p.width;
+
+  // COPY THE OLD STATE FIRST. This is the whole reason the kernel is safe
+  // without a barrier: the output loop below reads the pre-roll window while the
+  // final loop overwrites it, and the CPU reference resolves that same conflict
+  // the same way (`old_row`).
+  float old_row[VT_CONV_MAX_WIDTH];
+  for (uint j = 0u; j < p.width; ++j) {
+    old_row[j] = VT_LOAD(ST32, ST16, p.st_dt, p.st_off, srow + j);
+  }
+
+  float b = p.has_bias != 0u ? VT_LOAD(B32, B16, p.bias_dt, p.bias_off, c) : 0.0;
+
+  // This block's slice of the sequence. tb is derived from t_len rather than
+  // passed in, so a short sequence simply leaves the later blocks empty instead
+  // of the host having to know each length.
+  const uint tb = (t_len + VT_CONV_BLOCKS - 1u) / VT_CONV_BLOCKS;
+  const uint t_lo = blk * tb;
+  const uint t_hi = min(t_lo + tb, t_len);
+
+  for (uint t = t_lo; t < t_hi; ++t) {
+    float acc = b;
+    for (uint j = 0u; j < p.k; ++j) {
+      // ti is the token index of window slot j, and it goes NEGATIVE into the
+      // carried state, so the arithmetic is signed even though every index that
+      // reaches a buffer is not.
+      int ti = int(t) - (int(p.k) - 1 - int(j));
+      float v = 0.0;
+      if (ti >= 0) {
+        v = VT_LOAD(X32, X16, p.x_dt, p.x_off, (begin + uint(ti)) * p.x_rs + c);
+      } else if (init) {
+        v = old_row[uint(int(p.width) + ti)];  // state col (K-1)+(t-i)
+      }
+      acc += VT_LOAD(W32, W16, p.w_dt, p.w_off, c * p.k + j) * v;
+    }
+    // Silu spelled as the CPU reference spells it (cpu_ops.cpp:916);
+    // `acc * sigmoid(acc)` is a different rounding.
+    VT_STORE(O32, O16, p.out_dt, p.out_off, (begin + t) * p.c_dim + c,
+             p.silu != 0u ? (acc / (1.0 + exp(-acc))) : acc);
+  }
+
+  // ADVANCE THE STATE, once per (sequence, channel). Block 0 owns it: it always
+  // exists even when t_len is shorter than the block count, and everything it
+  // reads is either x (read-only) or its own copy of the old window.
+  if (blk != 0u) { return; }
+
+  // new column j holds token (t_len - width + j), falling back into the shifted
+  // old window when the sequence is shorter than K-1.
+  for (uint j = 0u; j < p.width; ++j) {
+    int tj = int(t_len) - int(p.width) + int(j);
+    float v = 0.0;
+    if (tj >= 0) {
+      v = VT_LOAD(X32, X16, p.x_dt, p.x_off, (begin + uint(tj)) * p.x_rs + c);
+    } else if (init) {
+      v = old_row[uint(int(p.width) + tj)];
+    }
+    VT_STORE(ST32, ST16, p.st_dt, p.st_off, srow + j, v);
+  }
+}

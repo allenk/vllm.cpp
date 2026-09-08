@@ -1,0 +1,395 @@
+#version 460
+// WORKGROUP-SCOPE cooperative-matrix GEMM (VK_NV_cooperative_matrix2).
+//
+// WHY THIS EXISTS, and it is a measured why rather than a hoped-for one.
+//
+// At c=32 on 27B bf16, vt_matmul_coopmat owns 94.4% of GPU time and the gap
+// between dispatches is 0.1%, so there is no idle to reclaim -- the whole deficit
+// is inside one kernel. Register blocking cut its loads 2.7x and bought 4.3%,
+// which settles the mechanism: it is LATENCY-bound, not bandwidth-bound on its
+// own redundancy. The comment in that shader claiming otherwise was measured at
+// m=512 and 2048, which is prefill; at decode m of 32 the redundancy is only
+// m/16.
+//
+// A latency-bound kernel is not fixed by moving fewer bytes. It is fixed by a
+// shorter dependent chain and a better inner loop, and the subgroup-scope shader
+// cannot get either: it runs one 32-lane subgroup over one 16x16 output tile with
+// two loads per multiply-accumulate, and 16x16x16 is the ONLY bf16 configuration
+// this vendor reports, so there is no larger tile to move to.
+//
+// Workgroup scope is a different machine. One workgroup of 256 invocations
+// cooperates on a single large matrix and the DRIVER generates the tiling,
+// staging and instruction schedule inside it. That is the same bet llama.cpp
+// makes with mul_mm_cm2.comp, and it is what upstream's own plan lists as the
+// unbuilt VK-C row.
+//
+// ⚠️ SCOPE, STATED PLAINLY: VK_NV_cooperative_matrix2 is a VENDOR extension.
+// NVIDIA only -- not AMD, not Adreno, not Mali, not Intel, and there is no KHR
+// equivalent for flexible dimensions or workgroup scope in Vulkan header 328. So
+// this is NVIDIA's peak expressed through Vulkan, and it belongs to the
+// per-vendor peak tier, NOT to the universal baseline. The subgroup kernel stays
+// the path everywhere else, and the host must decline to here rather than assume.
+//
+// DEVICE LIMITS, read rather than assumed (VT_VULKAN_COOPMAT_LIST=1 prints them):
+//   workgroup-scope max workgroup size = 256
+//   flexible max dimension             = 1024
+//   workgroup-scope reserved shared    = 8192 bytes
+// and the reported bf16->f32 workgroup configurations are granularity 16x16x16 at
+// 32 and 64 invocations, 32x16x16 at 128, and 32x32x16 at 256.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_NV_cooperative_matrix2 : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "vt_common.glsl"
+
+// THE WORKGROUP SIZE IS SPECIALIZED, which is normally a landmine in this tree
+// and is safe in exactly this module.
+//
+// vt_common.glsl records the failure: at the vulkan1.1 target, local_size_x_id
+// makes glslang emit "ExecutionMode LocalSize 1 1 1" plus the legacy BuiltIn
+// WorkgroupSize vector, the literal 1 wins, every workgroup runs ONE thread, and
+// cross-device NMSE went from 1e-14 to 0.99 on an op as simple as add. Silent.
+//
+// The same note says the modern LocalSizeId needs SPIR-V 1.2 with
+// VK_KHR_maintenance4, core in Vulkan 1.3 -- and this is the one module compiled
+// at 1.3, because GL_NV_cooperative_matrix2 requires it anyway.
+//
+// VERIFIED BY DISASSEMBLY rather than by that reasoning: at vulkan1.3 glslang
+// emits "ExecutionModeId 4 LocalSizeId 7 8 8", the modern form. The landmine is
+// a vulkan1.1 landmine and does not reach here.
+//
+// Why it has to be specialized: the reported bf16 workgroup configurations pair a
+// GRANULARITY with an INVOCATION COUNT -- 16x16x16 at 32 and 64 invocations,
+// 32x16x16 at 128, 32x32x16 at 256. Serving m=16 as well as m=32 means two
+// different workgroup sizes, and a literal would mean two modules.
+layout(local_size_x_id = 9, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Ab32 { uint v[]; } A32;
+layout(binding = 1) readonly buffer Ab16 { bfloat16_t v[]; } A16;
+layout(binding = 2) readonly buffer Bb32 { uint v[]; } B32;
+layout(binding = 3) readonly buffer Bb16 { bfloat16_t v[]; } B16;
+layout(binding = 4) buffer Db32 { uint v[]; } D32;
+layout(binding = 5) buffer Db16 { uint16_t v[]; } D16;
+// bf16 view of the same output buffer, for the direct cooperative store below.
+layout(binding = 5) buffer Db16b { bfloat16_t v[]; } D16B;
+
+// 0 -> b is [K,N] row-major; 1 -> b is [N,K] (the torch Linear weight layout).
+layout(constant_id = 0) const uint VT_MM_BT = 0u;
+layout(constant_id = 1) const uint VT_MM_OUT_DT = VT_DT_F32;
+
+// Matrix extents. M is the batch and wants to be exactly it; N is how many
+// output columns one A load is amortised over, and is the whole point of coming
+// here; K is the loop step. All three are specialization constants because the
+// reported granularities differ per device and per workgroup size.
+layout(constant_id = 2) const uint VT_WG_M = 32u;
+layout(constant_id = 3) const uint VT_WG_N = 128u;
+layout(constant_id = 4) const uint VT_WG_K = 16u;
+
+layout(push_constant) uniform Params {
+  uint m, n, k, a_off, b_off, out_off;
+} p;
+
+// The accumulator has to come back through memory to be converted to the output
+// dtype, exactly as in the subgroup shader -- the hot path here writes bf16, so a
+// direct coopMatStore into the destination is not available.
+//
+// Sized to the largest tile the host will select (32x128 f32 = 16 KB), which
+// leaves room beside the 8 KB the driver reserves for workgroup scope. A larger
+// N would buy more A reuse and cost shared memory; that trade is a measurement,
+// not a guess, and the constant above is what makes it one.
+// SPILL IS SPEC-SIZED, because a fixed maximum costs more than the tile gains.
+//
+// External research named the epilogue and the tile ceiling as one problem: the
+// accumulator returns through this buffer to be converted to the output dtype, so
+// 16 KB of it capped wg_m * wg_n at 4096 -- and 64x64 is exactly 4096, so the tile
+// could not grow at all.
+//
+// The first attempt simply raised it to 128*128 floats (64 KB) and MEASURED WORSE
+// EVERYWHERE, including at the tile sizes that had fit before: 64x64 went from
+// 1114.7 ms to 3369.5. At 64 KB per workgroup this device holds one workgroup per
+// SM, so the fixed allocation destroyed occupancy for every shape, not just the
+// large ones. Traffic against occupancy again, this time in shared memory.
+//
+// SCOPE, per external review (2026-09-06, P2): the retreat numbers above are the
+// FIXED 64 KB attempt. The spec-sized sweep that followed -- 64x64 1112.6,
+// 64x128 2221.8, 128x128 2043.2 ms, each variant allocating only its own tile --
+// is the fair one, and it still favours 64x64. But that is a result about THIS
+// epilogue on THIS device, not a general finding that larger tiles cannot pay:
+// llama.cpp affords 128x128 because it has no epilogue buffer at all.
+//
+// So the buffer follows the tile: VT_WG_SPILL is a specialization constant the
+// host sets to wg_m * wg_n, and each pipeline variant allocates only what its own
+// tile needs. The host already reasons about the area limit, so it is the right
+// place to reason about the byte limit too.
+layout(constant_id = 5) const uint VT_WG_SPILL = 4096u;
+// DIRECT COOPERATIVE STORE, opt-in. 0 keeps the shared-memory epilogue.
+//
+// llama.cpp's cm2 matmul has no epilogue at all: it converts the accumulator to
+// the output type and hands it to coopMatStoreTensorNV
+// (mul_mm_cm2.comp:408/451/495). Ours goes accumulator -> barrier -> shared
+// spill -> barrier -> every thread reads back -> per-element convert -> scalar
+// store, which is a fixed cost on every one of the 17,408 tiles the widest
+// prefill shape dispatches.
+//
+// ⚠️ NOT ASSUMED EQUIVALENT. The hot prefill GEMM's output dtype is bf16
+// (measured: the pipeline key is |1,2,64,64,64,4096,256|, and 2 is bf16), so
+// this path depends on GLSL's float->bfloat16_t conversion matching this
+// project's F32ToBF16 -- round-to-nearest-even with NaN quieting. That is a
+// question the gate answers, not one the code may presume: it is compared
+// bit-for-bit against the spill path before it can be a default.
+//
+// ⇒ GATE PASSED, MEASUREMENT SAYS NO. The conversion IS ours: logits compared
+// against the spill path came back nmse 0, max_abs 0, and the token ids match
+// -- so GLSL's float->bfloat16_t is round-to-nearest-even here and the contract
+// survives. But the epilogue was not the cost. Interleaved, three rounds, the
+// whole prefill GEMM: 2438.9/2472.3/2466.2 ms with the spill against
+// 2471.8/2474.5/2489.8 with the direct store -- 0.99x, 1.00x, 0.99x.
+//
+// The arithmetic agrees in hindsight and should have been done first: one tile
+// runs 80 K-blocks of 64x64x64, about 41.9 MFLOP, which at the measured ~70
+// TFLOP/s is ~0.6 us -- and the measured per-tile cost IS 0.612 us. The tile is
+// essentially all matmul; a fixed epilogue had nowhere to hide.
+//
+// ⇒ So this removes "the epilogue" from the candidate list with evidence rather
+// than leaving it as a plausible story. Kept, default off, because it is the
+// cleaner code and costs nothing to keep -- and because a later change that
+// makes tiles cheaper could move the balance.
+layout(constant_id = 10) const uint VT_WG_DIRECT_STORE = 0u;
+// GROUPED TILE TRAVERSAL. 1 keeps the plain row-major order.
+//
+// WHY, and the arithmetic is the whole argument. Row-major order walks every
+// column tile of one row-block before moving down, so B is re-streamed ONCE PER
+// ROW-BLOCK. With m=2048 that is 32 sweeps of the entire B matrix:
+//
+//     n       col tiles   B size    B streamed in total
+//     10240      160      105 MB          3.4 GB
+//     34816      544      357 MB         11.4 GB
+//
+// A 105 MB working set can live in this card's L2 across one sweep; a 357 MB one
+// cannot, so every row-block pays for B again. That is measured, not assumed:
+// the same-m same-k shapes run at 103.6 TFLOP/s (n=10240) and 68.5 (n=34816),
+// and all three tile axes were swept to green -- the problem was never the tile
+// SIZE, it was the tile ORDER.
+//
+// Grouping G row-blocks and walking columns across all of them divides the B
+// re-streaming by G. Bit-identical by construction: this only renumbers which
+// workgroup computes which output tile.
+layout(constant_id = 11) const uint VT_WG_GROUP_M = 1u;
+// K-LOOP UNROLL. 1 keeps the plain loop.
+//
+// THE UNTESTED CELL, and why it is not a repeat of a swept axis. Two results
+// look contradictory and are not:
+//   * we measured VT_WG_K 16 -> 64 as 1.79x, at unroll = 1;
+//   * an external K-loop unroll sweep of 1/2/4/8 measured nothing, and that
+//     experiment states it did not change the tile, so it ran at BK = 64.
+// llama.cpp's cm2 matmul uses BK = 16 with an eight-deep unroll
+// (mul_mm_cm2.comp:341, UNROLL_K = BK * 8). Neither sweep visited that point.
+//
+// The mechanism that makes the two axes interact is register pressure. A 64x64
+// bf16 A matrix is 8 KB, about 8 registers per lane at 256 invocations; A and B
+// together are ~16, so four pairs in flight is ~64 registers on top of a 64x64
+// f32 accumulator's ~16. At BK = 64 the unroll is paid for and buys no overlap,
+// which is what the external null result looks like. At BK = 16 the A matrix is
+// 2 KB, about 2 registers per lane, and eight pairs in flight cost what one
+// pair costs at BK = 64.
+//
+// This is a MECHANISM, not a measurement: [[unroll]] is a strong request to
+// remove loop control and does not promise the loads overlap. Only the paired
+// (BK, unroll) sweep can say, and single-axis results cannot predict it.
+//
+// ⇒ SWEPT. THE MECHANISM IS REAL AND THE CONCLUSION WAS WRONG. Relative to
+// (BK=64, U=1), whole prefill GEMM, grouped traversal on:
+//
+//     BK=16  U=2/4/8   0.580 / 0.614 / 0.637     deeper unroll helps  +9.8%
+//     BK=32  U=2/4     0.816 / 0.847             deeper unroll helps  +3.8%
+//     BK=64  U=1/2     1.011 / 0.960             deeper unroll HURTS  -5.0%
+//     at a fixed 128 K per body: (16,8) 0.637 < (32,4) 0.847 < (64,2) 0.960
+//
+// So the predicted interaction is there and measurable -- unrolling pays where
+// the matrices are small and costs where they are large, which is the register
+// story. But BK dominates it by an order of magnitude, and llama's (16, 8) is
+// 0.637x ON THIS KERNEL. Whatever makes that configuration work for llama is
+// not the unroll depth.
+//
+// The K axis is now closed in both directions: 128 was wired for this sweep
+// because 16 -> 32 -> 64 was the only monotone trend, and it reverses --
+// (128, 1) is 0.871x. The optimum is 64, and it is a maximum, not an edge.
+layout(constant_id = 12) const uint VT_WG_KUNROLL = 1u;
+shared float vt_wg_spill[VT_WG_SPILL];
+
+void main() {
+  const uint tiles_n = p.n / VT_WG_N;
+  const uint tile = gl_WorkGroupID.x;
+  // RAGGED M WITHOUT SLIDING, USING THE EXTENSION THAT CAN EXPRESS IT.
+  //
+  // This slid the last M block back so its cooperative-matrix load stayed in
+  // range, then masked the store so the two overlapping blocks did not both
+  // write. That works, costs 1.2x, and exists only because a plain coopMatLoad
+  // cannot express a bound.
+  //
+  // GL_NV_cooperative_matrix2 CAN express it. A tensorLayout carries the real M
+  // and K, and gl_CooperativeMatrixClampModeConstantNV makes an out-of-range
+  // read return a constant instead of faulting -- which is how llama.cpp handles
+  // the same problem in mul_mm_cm2.comp: its layouts are built with that clamp
+  // mode and it never slides a tile. This shader already required the extension
+  // for workgroup scope; only the tensor-layout half of it was unused.
+  //
+  // So: no slide, no overlap, no ownership mask, and no race to reason about.
+  const uint tiles_m = (p.m + VT_WG_M - 1u) / VT_WG_M;
+  if (tile >= tiles_m * tiles_n) { return; }
+  uint tm_idx;
+  uint tn_idx;
+  if (VT_WG_GROUP_M == 1u) {
+    tm_idx = tile / tiles_n;
+    tn_idx = tile % tiles_n;
+  } else {
+    // The last group is short whenever tiles_m is not a multiple of the group,
+    // so its size is computed rather than assumed -- using the nominal group
+    // size there would fold two different output tiles onto one workgroup.
+    const uint per_group = VT_WG_GROUP_M * tiles_n;
+    const uint g = tile / per_group;
+    const uint first_m = g * VT_WG_GROUP_M;
+    const uint gsize = min(VT_WG_GROUP_M, tiles_m - first_m);
+    const uint idx = tile - g * per_group;
+    tm_idx = first_m + (idx % gsize);
+    tn_idx = idx / gsize;
+  }
+  const uint tile_m = tm_idx * VT_WG_M;
+  const uint tile_n = tn_idx * VT_WG_N;
+
+  // NO RAGGED HANDLING HERE, deliberately. The subgroup shader slides a trailing
+  // tile back because it must serve every shape; this tactic is opt-in and the
+  // host only selects it when m, n and k divide exactly. A cooperative-matrix
+  // load cannot mask, and reading past an operand faults the GPU as an infinite
+  // vkWaitForFences rather than an error -- so the guard belongs in the
+  // predicate, where it can be stated, not in the shader, where it would be
+  // silent.
+  coopmat<float, gl_ScopeWorkgroup, VT_WG_M, VT_WG_N, gl_MatrixUseAccumulator> acc =
+      coopmat<float, gl_ScopeWorkgroup, VT_WG_M, VT_WG_N, gl_MatrixUseAccumulator>(0.0);
+
+  // INTERIOR FAST PATH: TRIED, MEASURED, REVERTED.
+  //
+  // llama.cpp detects a tile fully inside M and N with aligned strides and runs
+  // it through UNCLAMPED layouts with alignment hints and an unrolled K loop,
+  // leaving the conservative path for the edge (mul_mm_cm2.comp:345). External
+  // research proposed the same for us, reasoning that a ragged prompt should not
+  // make every interior tile pay edge handling. At m=1026 with a 64-row tile that
+  // is 16 interior tiles carrying a cost only the 17th needs, so the reasoning is
+  // sound and the result is still negative:
+  //
+  //     clamped everywhere (this code)   wg 1112.6 / 1114.7 ms
+  //     unclamped fast path + unroll     wg 3085.6 / 3130.3
+  //     unclamped fast path, no unroll   wg 2980.0 / 2994.3
+  //
+  // Bisected because the first attempt changed two things at once: removing the
+  // unroll recovers 3.5%, and the remaining 2.7x sits with the two-path form
+  // itself. Output was bit-identical throughout, so this is a speed result only.
+  //
+  // ⚠️ WHAT "the two-path form" MEANS HERE IS NOT SETTLED, and an earlier version
+  // of this note said "the BRANCH ITSELF" as though it were. External review
+  // 2026-09-06 (F4) is right that three timings separate the variants and nothing
+  // more: branch execution, code duplication, register allocation across two
+  // bodies each holding a workgroup-scope accumulator, and instruction scheduling
+  // all move together when a second copy of this loop appears, and none of them
+  // was measured apart. The times stand; the mechanism is a candidate.
+  //
+  // What this does NOT establish: that llama.cpp gains nothing from its version.
+  // Its shader is generated per variant and specialised far more heavily, and the
+  // driver may treat the two-path form differently there. What it does establish
+  // is that transplanting the branch into this kernel loses.
+  // LOOP-INVARIANT LAYOUTS, BUILT ONCE. Every one of these depends only on the
+  // push constants and the tile, so rebuilding them per K step was 80 rebuilds
+  // per tile on the shapes this kernel serves. llama.cpp's cm2 matmul hoists the
+  // same objects above its K loop (mul_mm_cm2.comp:357). This was introduced
+  // when the loads were converted to tensor addressing and never revisited --
+  // the conversion was the interesting part and this rode along with it.
+  //
+  // ⇒ MEASURED NEUTRAL: 0.999 / 0.986 / 0.969 on the whole prefill GEMM, i.e.
+  // inside the noise and if anything slightly down. The compiler was already
+  // hoisting them. Kept because it is the clearer source and matches the
+  // reference, NOT because it bought anything -- and recorded so the next reader
+  // does not spend the same hour on it.
+  tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tlA0 =
+      createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+  tlA0 = setTensorLayoutDimensionNV(tlA0, p.m, p.k);
+  tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tlB0 =
+      createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+  tlB0 = setTensorLayoutDimensionNV(tlB0, (VT_MM_BT == 1u) ? p.n : p.k,
+                                    (VT_MM_BT == 1u) ? p.k : p.n);
+  const tensorViewNV<2, false, 1, 0> tvT0 = createTensorViewNV(2, false, 1, 0);
+
+  const uint kstep = VT_WG_K * VT_WG_KUNROLL;
+  uint k_base = 0u;
+  for (; VT_WG_KUNROLL > 1u && k_base + kstep <= p.k; k_base += kstep) {
+    [[unroll]] for (uint u = 0u; u < VT_WG_KUNROLL; ++u) {
+      const uint ku = k_base + u * VT_WG_K;
+      coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_WG_M, VT_WG_K, gl_MatrixUseA> mau;
+      coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_WG_K, VT_WG_N, gl_MatrixUseB> mbu;
+      coopMatLoadTensorNV(mau, A16.v, (p.a_off >> 1),
+                          sliceTensorLayoutNV(tlA0, tile_m, VT_WG_M, ku, VT_WG_K));
+      if (VT_MM_BT == 1u) {
+        coopMatLoadTensorNV(mbu, B16.v, (p.b_off >> 1),
+                            sliceTensorLayoutNV(tlB0, tile_n, VT_WG_N, ku, VT_WG_K), tvT0);
+      } else {
+        coopMatLoadTensorNV(mbu, B16.v, (p.b_off >> 1),
+                            sliceTensorLayoutNV(tlB0, ku, VT_WG_K, tile_n, VT_WG_N));
+      }
+      acc = coopMatMulAdd(mau, mbu, acc);
+    }
+  }
+  for (uint k0 = k_base; k0 < p.k; k0 += VT_WG_K) {
+    coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_WG_M, VT_WG_K, gl_MatrixUseA> ma;
+    coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_WG_K, VT_WG_N, gl_MatrixUseB> mb;
+
+    // The layouts carry the true extents, so a tile at the M or N edge reads
+    // clamped zeros instead of faulting.
+    coopMatLoadTensorNV(ma, A16.v, (p.a_off >> 1),
+                        sliceTensorLayoutNV(tlA0, tile_m, VT_WG_M, k0, VT_WG_K));
+
+    if (VT_MM_BT == 1u) {
+      // b is [N,K]; the multiply wants [K,N], so the same memory is read through
+      // a transposing view rather than a second pass.
+      coopMatLoadTensorNV(mb, B16.v, (p.b_off >> 1),
+                          sliceTensorLayoutNV(tlB0, tile_n, VT_WG_N, k0, VT_WG_K), tvT0);
+    } else {
+      coopMatLoadTensorNV(mb, B16.v, (p.b_off >> 1),
+                          sliceTensorLayoutNV(tlB0, k0, VT_WG_K, tile_n, VT_WG_N));
+    }
+
+    acc = coopMatMulAdd(ma, mb, acc);
+  }
+
+  if (VT_WG_DIRECT_STORE == 1u && VT_MM_OUT_DT == VT_DT_BF16) {
+    // The same tensor layout the loads use, pointed at D and clamped, so the
+    // tail rows this tile does not own are dropped by the hardware instead of
+    // by the `gr >= p.m` test below.
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tlD =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    tlD = setTensorLayoutDimensionNV(tlD, p.m, p.n);
+    coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_WG_M, VT_WG_N, gl_MatrixUseAccumulator> md =
+        coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_WG_M, VT_WG_N, gl_MatrixUseAccumulator>(acc);
+    coopMatStoreTensorNV(md, D16B.v, (p.out_off >> 1),
+                         sliceTensorLayoutNV(tlD, tile_m, VT_WG_M, tile_n, VT_WG_N));
+    return;
+  }
+
+  barrier();
+  coopMatStore(acc, vt_wg_spill, 0, VT_WG_N, gl_CooperativeMatrixLayoutRowMajor);
+  barrier();
+
+  for (uint idx = gl_LocalInvocationID.x; idx < VT_WG_M * VT_WG_N;
+       idx += gl_WorkGroupSize.x) {
+    const uint r = idx / VT_WG_N;
+    const uint c = idx % VT_WG_N;
+    const uint gr = tile_m + r;
+    // Upper bound only: without the slide there is no overlap, so there is no
+    // ownership question -- only the tail rows this tile does not own.
+    if (gr >= p.m) { continue; }
+    VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, gr * p.n + (tile_n + c),
+             vt_wg_spill[idx]);
+  }
+}

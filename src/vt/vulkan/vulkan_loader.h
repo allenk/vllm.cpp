@@ -55,7 +55,18 @@ namespace vt::vulkan {
 // the extension, and llvmpipe (the only Vulkan device CI can reach) exposes
 // VK_KHR_cooperative_matrix not at all. Callers null-check instead.
 #define VT_VK_INSTANCE_FUNCS_OPTIONAL(X)                 \
-  X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+  X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)   \
+  X(vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV)
+
+// OPTIONAL device entry points. These belong to an extension this backend
+// enables ONLY on demand (VK_KHR_pipeline_executable_properties, gated by
+// VT_VULKAN_PIPELINE_STATS), so vkGetDeviceProcAddr legitimately returns null
+// for them on a normal run. They were in the MANDATORY list for one afternoon,
+// which meant every run without that env var threw during VulkanContext
+// construction -- and because the caller catches and falls back, the visible
+// result was not an error but a 27B model quietly served from the CPU.
+// The use site already null-checks; the load site must match it.
+#define VT_VK_DEVICE_FUNCS_OPTIONAL(X)          X(vkGetPipelineExecutablePropertiesKHR)       X(vkGetPipelineExecutableStatisticsKHR)
 
 #define VT_VK_DEVICE_FUNCS(X)          \
   X(vkDestroyDevice)                   \
@@ -92,6 +103,7 @@ namespace vt::vulkan {
   X(vkCmdPushConstants)                \
   X(vkCmdDispatch)                     \
   X(vkCmdPipelineBarrier)              \
+  X(vkCmdCopyBuffer)                   \
   X(vkCreateQueryPool)                 \
   X(vkDestroyQueryPool)                \
   X(vkCmdResetQueryPool)               \
@@ -114,6 +126,7 @@ struct VulkanApi {
   VT_VK_INSTANCE_FUNCS(VT_VK_DECL)
   VT_VK_INSTANCE_FUNCS_OPTIONAL(VT_VK_DECL)
   VT_VK_DEVICE_FUNCS(VT_VK_DECL)
+  VT_VK_DEVICE_FUNCS_OPTIONAL(VT_VK_DECL)
 #undef VT_VK_DECL
 };
 

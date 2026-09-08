@@ -1,0 +1,142 @@
+// GDN prefill with the recurrent state held in REGISTERS.
+//
+// WHY. llama.cpp runs the same sequential per-token recurrence on the same card
+// and is 4.2x faster: 11.77 ms per 512 tokens against our 49.67. The recurrence
+// is not the difference -- both walk t one step at a time, which an earlier note
+// in this campaign checked and correctly reported. What that note then got WRONG
+// was the inference: it concluded that because the STRUCTURE matches, GDN could
+// not be a source of the gap. Structure being equal says nothing about
+// efficiency, and the measurement says the efficiency differs by 4.2x.
+//
+// The two differences, both in the work decomposition, and they compound:
+//
+//   1. WHERE THE STATE LIVES. vt_gdn_recurrence.glsl keeps the [BV, Dk] state
+//      slice in SHARED memory and rewrites it twice per token, with barriers
+//      around the q/k broadcast and a shared-memory halving tree for each of the
+//      two reductions. Over 1024 tokens that is 1024 rounds of shared traffic
+//      and barriers. llama keeps its slice in per-lane REGISTERS for the whole
+//      token loop and never spills it.
+//
+//   2. HOW WIDE A ROW IS. Ours puts VT_GDN_NW = 8 lanes on one value row, so the
+//      reduction is a 3-level shared tree. llama puts a full subgroup (32) on
+//      one row, so the reduction is a single subgroupAdd -- no shared memory and
+//      no barrier at all.
+//
+// Consequence for the grid, which is the other half of the 4.2x: ours is
+// n * Hv * ceil(Dv/16) = 384 workgroups of 128 threads for one sequence; this is
+// n * Hv * Dv = 6144 workgroups of 32, four times the threads on a card that
+// measured saturation near 1536 workgroups.
+//
+// SCOPE. Prefill only, and only when Dk == Dv == 128 so ROWS_PER_LANE is exactly
+// 4 and one subgroup covers a row. The host declines everything else to the
+// shared-state kernel, which stays correct for every shape. Same arithmetic in
+// the same order per element as vt_gdn_step, but the Dk contraction is summed
+// across 32 lanes instead of 8, so the reduction ORDER differs and the gate is
+// the project's 5e-4 bar rather than bitwise.
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define VT_TG 32u
+#include "vt_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Qb32 { uint v[]; } Q32;
+layout(binding = 1) readonly buffer Qb16 { uint16_t v[]; } Q16;
+layout(binding = 2) readonly buffer Kb32 { uint v[]; } K32;
+layout(binding = 3) readonly buffer Kb16 { uint16_t v[]; } K16;
+layout(binding = 4) readonly buffer Vb32 { uint v[]; } V32;
+layout(binding = 5) readonly buffer Vb16 { uint16_t v[]; } V16;
+layout(binding = 6) buffer Ob32 { uint v[]; } O32;
+layout(binding = 7) buffer Ob16 { uint16_t v[]; } O16;
+layout(binding = 8) readonly buffer Gb { uint v[]; } G;
+layout(binding = 9) readonly buffer Eb { uint v[]; } BETA;
+layout(binding = 10) buffer Sb { uint v[]; } S;
+layout(binding = 11) readonly buffer Mb { uint v[]; } QSL;
+
+layout(constant_id = 0) const uint VT_PC_QKV_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_PC_OUT_DT = VT_DT_F32;
+// Dk / subgroup width. 4 at Dk = 128, which is the only shape the host lets in.
+layout(constant_id = 2) const uint VT_GDN_RPL = 4u;
+
+layout(push_constant) uniform Params {
+  uint hk, dk, hv, dv;
+  uint nv;
+  uint ratio;
+  uint has_idx;
+  uint n_state_rows;
+  uint q_off, k_off, v_off, out_off, g_off, beta_off, state_off, meta_off;
+  float scale;
+} p;
+
+void main() {
+  // One workgroup per (sequence, value head, value ROW). The row is what a
+  // subgroup owns; the lanes split its Dk contraction.
+  const uint wg = gl_WorkGroupID.x;
+  const uint vrow = wg % p.dv;
+  const uint sh = wg / p.dv;
+  const uint h_v = sh % p.hv;
+  const uint s = sh / p.hv;
+  const uint h_k = h_v / p.ratio;
+  const uint lane = gl_LocalInvocationID.x;
+
+  const uint sbase =
+      (p.state_off >> 2) + ((s * p.hv + h_v) * p.dv + vrow) * p.dk;
+
+  // THE STATE, in registers for the whole token loop.
+  float st[8];
+  [[unroll]] for (uint r = 0u; r < VT_GDN_RPL; ++r) {
+    st[r] = uintBitsToFloat(S.v[sbase + r * VT_TG + lane]);
+  }
+
+  const int t0 = int(QSL.v[(p.meta_off >> 2) + s]);
+  const int t1 = int(QSL.v[(p.meta_off >> 2) + s + 1u]);
+
+  for (int t = t0; t < t1; ++t) {
+    const uint qkbase = (uint(t) * p.hk + h_k) * p.dk;
+    const uint hidx = uint(t) * p.hv + h_v;
+
+    float kr[8];
+    float qr[8];
+    [[unroll]] for (uint r = 0u; r < VT_GDN_RPL; ++r) {
+      const uint c = r * VT_TG + lane;
+      kr[r] = VT_LOAD(K32, K16, VT_PC_QKV_DT, p.k_off, qkbase + c);
+      qr[r] = VT_LOAD(Q32, Q16, VT_PC_QKV_DT, p.q_off, qkbase + c) * p.scale;
+    }
+
+    const float decay = exp(uintBitsToFloat(G.v[(p.g_off >> 2) + hidx]));
+    const float beta_t = uintBitsToFloat(BETA.v[(p.beta_off >> 2) + hidx]);
+
+    // (S * exp(g)) @ k, fused with the decay pass -- the same fusion the shared
+    // kernel does, just with the state already in registers.
+    float pdot = 0.0;
+    [[unroll]] for (uint r = 0u; r < VT_GDN_RPL; ++r) {
+      st[r] *= decay;
+      pdot += st[r] * kr[r];
+    }
+    const float dot = subgroupAdd(pdot);
+
+    const float vv = VT_LOAD(V32, V16, VT_PC_QKV_DT, p.v_off, hidx * p.dv + vrow);
+    const float vp = (vv - dot) * beta_t;
+
+    // (S + outer(v', k)) @ q', again fused with the rank-1 update.
+    float po = 0.0;
+    [[unroll]] for (uint r = 0u; r < VT_GDN_RPL; ++r) {
+      st[r] += vp * kr[r];
+      po += st[r] * qr[r];
+    }
+    const float o = subgroupAdd(po);
+
+    if (lane == 0u) {
+      VT_STORE(O32, O16, VT_PC_OUT_DT, p.out_off, hidx * p.dv + vrow, o);
+    }
+  }
+
+  [[unroll]] for (uint r = 0u; r < VT_GDN_RPL; ++r) {
+    S.v[sbase + r * VT_TG + lane] = floatBitsToUint(st[r]);
+  }
+}

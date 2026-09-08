@@ -1,0 +1,60 @@
+#version 450
+// vt::MoeSiluMul -- flat elementwise out[i] = silu(gate[i]) * up[i], with gate
+// and up living in SEPARATE buffers.
+//
+// WHY A SECOND SHADER rather than reusing vt_silu_and_mul. That one is the
+// CONCATENATED form: a single [t, 2d] tensor whose halves are gate and up,
+// which is what the safetensors checkpoint hands us ("qwen3_5 dense merged
+// gate_up", qwen3_5.cpp:526). A GGUF stores ffn_gate and ffn_up as two separate
+// tensors (qwen3_5_gguf_weights.cpp:1264-1272 -- llama.cpp's layout), so the
+// GGUF path calls vt::MoeSiluMul(out, gate, up) instead. That OpId had no
+// Vulkan registration, so every layer's activation dropped to the portable CPU
+// tier and the whole model went with it: Qwen3.6-27B at c=1 read 4.65 TOTAL
+// tok/s against the safetensors path's 204.9 -- a 44x slowdown with the GPU at
+// 2% utilisation. The op name is misleading and worth saying plainly: there is
+// nothing MoE about it, it is a two-operand SwiGLU.
+//
+// llama.cpp draws exactly this distinction and resolves it the same way: its
+// GLU shader takes a `mode`, where 0 is the concatenated form and 2 is "Split",
+// reading data_a[i] and data_b[i] from two bindings
+// (ggml/src/ggml-vulkan/vulkan-shaders/glu_main.glsl @ 237ad9b96). We keep two
+// shaders instead of one moded shader because vt_silu_and_mul already ships and
+// is specialized for its indexing; what the two share is the arithmetic, not
+// the addressing.
+//
+// Math ported 1:1 from src/vt/cpu/cpu_ops.cpp:452-462 MoeSiluMulKernel, which
+// spells silu as `g / (1 + exp(-g))`. This shader writes
+// `gate * vt_sigmoid(gate) * up`, matching vt_silu_and_mul's spelling of the
+// same expression -- consistency with the shipped sibling was chosen over
+// bit-matching the CPU's division, so the gate against the CPU reference is
+// numeric (the project's 5e-4 bar), not bitwise. llama.cpp's swiglu.comp writes
+// `a / (1.0f + exp(-a)) * b`, the same function.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Gb32 { uint v[]; } G32;
+layout(binding = 1) readonly buffer Gb16 { uint16_t v[]; } G16;
+layout(binding = 2) readonly buffer Ub32 { uint v[]; } U32;
+layout(binding = 3) readonly buffer Ub16 { uint16_t v[]; } U16;
+layout(binding = 4) buffer Db32 { uint v[]; } D32;
+layout(binding = 5) buffer Db16 { uint16_t v[]; } D16;
+
+layout(push_constant) uniform Params {
+  uint n;         // total elements; gate, up and out all carry exactly this many
+  uint gate_dt;
+  uint up_dt;
+  uint out_dt;
+  uint gate_off;  // byte offsets of each operand within its whole-bound buffer
+  uint up_off;
+  uint out_off;
+} p;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= p.n) { return; }
+  float g = VT_LOAD(G32, G16, p.gate_dt, p.gate_off, i);
+  float u = VT_LOAD(U32, U16, p.up_dt, p.up_off, i);
+  VT_STORE(D32, D16, p.out_dt, p.out_off, i, g * vt_sigmoid(g) * u);
+}

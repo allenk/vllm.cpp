@@ -1,0 +1,69 @@
+#version 450
+// vt::PagedAttention, PASS 2 of the two-pass split-K form.
+//
+// Combines the VT_PAS_WG partials that pass 1 wrote for each (query token,
+// query head) into the final row. The online-softmax combine is closed form:
+// take the global maximum of the per-split maxima, rescale each split's
+// denominator and accumulator by exp(m_g - m_global), sum, and divide once.
+//
+// Pass 1 deliberately stored the UNNORMALISED accumulator, which is what makes
+// that rescale possible; a per-split division would have thrown the information
+// away.
+//
+// ONE WORKGROUP PER (token, head), lanes splitting the head dimension. The work
+// here is VT_PAS_WG * d multiply-adds per row -- tiny next to pass 1 -- so this
+// pass is about correctness of the merge, not about its own parallelism.
+//
+// A split that saw no key keeps m = -inf and l = 0 from pass 1, and
+// exp(-inf - m_global) is 0, so it drops out with no special case. The row where
+// EVERY split is empty is the jmax < jmin row the CPU kernel leaves untouched,
+// handled by the inv == 0 branch.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer PARb { float v[]; } PAR;
+layout(binding = 1) buffer Db32 { uint v[]; } D32;
+layout(binding = 2) buffer Db16 { uint16_t v[]; } D16;
+
+layout(constant_id = 0) const uint VT_PAM_OUT_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_PAS_WG = 8u;
+
+layout(push_constant) uniform Params {
+  uint total_q;
+  uint hq;
+  uint d;
+  uint par_off;
+  uint out_off;
+} p;
+
+void main() {
+  const uint unit = gl_WorkGroupID.x;
+  if (unit >= p.total_q * p.hq) { return; }
+  const uint tid = gl_LocalInvocationID.x;
+
+  const uint pbase = (p.par_off >> 2) + unit * VT_PAS_WG * (p.d + 2u);
+
+  float gm = -1.0 / 0.0;
+  for (uint i = 0u; i < VT_PAS_WG; ++i) {
+    gm = max(gm, PAR.v[pbase + i * (p.d + 2u)]);
+  }
+  float den = 0.0;
+  for (uint i = 0u; i < VT_PAS_WG; ++i) {
+    const float li = PAR.v[pbase + i * (p.d + 2u) + 1u];
+    if (li > 0.0) den += li * exp(PAR.v[pbase + i * (p.d + 2u)] - gm);
+  }
+  const float inv = den > 0.0 ? 1.0 / den : 0.0;
+
+  const uint qbase = unit * p.d;
+  for (uint e = tid; e < p.d; e += 128u) {
+    float tot = 0.0;
+    for (uint i = 0u; i < VT_PAS_WG; ++i) {
+      const uint b = pbase + i * (p.d + 2u);
+      const float li = PAR.v[b + 1u];
+      if (li > 0.0) tot += PAR.v[b + 2u + e] * exp(PAR.v[b] - gm);
+    }
+    VT_STORE(D32, D16, VT_PAM_OUT_DT, p.out_off, qbase + e, tot * inv);
+  }
+}

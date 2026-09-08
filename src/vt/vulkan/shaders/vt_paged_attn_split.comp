@@ -1,0 +1,196 @@
+#version 450
+// vt::PagedAttention, PASS 1 of the two-pass split-K form.
+//
+// WHY A SECOND PASS EXISTS AT ALL. The single-workgroup kernel dispatches
+// total_q * hq workgroups, which for a single-stream decode of Qwen3-0.6B is
+// 1 * 16 = SIXTEEN. Measured on this card, throughput keeps scaling to about
+// 256 workgroups of this shape and saturates there, so one stream was using
+// roughly 6% of the parallelism available, and vt_paged_attn was 49.8% of all
+// GPU time at 70.1 us per call against llama.cpp's FLASH_ATTN_EXT at 6.38 us.
+// Splitting inside the workgroup already went as far as the hardware allows --
+// 1024 invocations, 32 subgroups -- so the only remaining axis is across
+// workgroups, and that needs somewhere to put the partial results.
+//
+// THE SPLIT IS TWO-LEVEL AND MULTIPLICATIVE. Workgroup w owns subgroups
+// w*32 .. w*32+31 of a global split of VT_PAS_WG * gl_NumSubgroups ways; each
+// subgroup walks keys jmin + gs, jmin + gs + total, ... So the serial depth per
+// subgroup is n / (VT_PAS_WG * 32) and the workgroup count becomes
+// total_q * hq * VT_PAS_WG.
+//
+// WHAT IT WRITES. One partial per (unit, workgroup-split): the running max, the
+// denominator, and the unnormalised accumulator -- NOT the divided result. The
+// online-softmax combine is closed form, so pass 2 rescales each partial by
+// exp(m_g - max_g) and sums; dividing here would lose the information that makes
+// that possible.
+//
+// STRIDED, NOT CONTIGUOUS, key assignment, for the same two reasons as the
+// single-pass kernel: neighbouring splits touch neighbouring keys at the same
+// moment, and the per-split trip count comes out equal without a remainder rule,
+// which matters because barrier() must be reached by every invocation.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Qb32 { uint v[]; } Q32;
+layout(binding = 1) readonly buffer Qb16 { uint16_t v[]; } Q16;
+layout(binding = 2) readonly buffer Kb32 { uint v[]; } K32;
+layout(binding = 3) readonly buffer Kb16 { uint16_t v[]; } K16;
+layout(binding = 4) readonly buffer Vb32 { uint v[]; } V32;
+layout(binding = 5) readonly buffer Vb16 { uint16_t v[]; } V16;
+// Partials, f32 always: they are an internal intermediate, never a model tensor,
+// so there is no dtype to match and no reason to lose bits before the combine.
+layout(binding = 6) buffer PARb { float v[]; } PAR;
+layout(binding = 7) readonly buffer BTb { uint v[]; } BT;
+layout(binding = 8) readonly buffer SLb { uint v[]; } SL;
+layout(binding = 9) readonly buffer QSLb { uint v[]; } QSL;
+
+layout(constant_id = 0) const uint VT_PA_Q_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_PA_K_DT = VT_DT_F32;
+layout(constant_id = 2) const uint VT_PA_V_DT = VT_DT_F32;
+layout(constant_id = 3) const uint VT_PAS_WG = 8u;   // workgroups per (token, head)
+
+layout(push_constant) uniform Params {
+  uint total_q;
+  uint hq;
+  uint d;
+  uint block_size;
+  uint qpk;
+  uint num_reqs;
+  uint causal;
+  int window_left;
+  int window_right;
+  uint kc_blk, kc_pg, kc_hd;
+  uint vc_blk, vc_pg, vc_hd;
+  uint bt_row, bt_col;
+  uint q_off, k_off, v_off, par_off;
+  uint bt_off, sl_off, qsl_off;
+  float scale;
+  float softcap;
+} p;
+
+#define VT_PA_ACC_MAX 8
+
+shared float vt_pa_red[32u * 32u];
+shared float vt_pa_m[32u];
+shared float vt_pa_l[32u];
+
+void main() {
+  const uint gid = gl_WorkGroupID.x;
+  const uint unit = gid / VT_PAS_WG;       // (query token, query head)
+  const uint wsplit = gid % VT_PAS_WG;     // which slice of the key range
+  if (unit >= p.total_q * p.hq) { return; }
+
+  const uint t = unit / p.hq;
+  const uint h = unit % p.hq;
+  const uint g = h / p.qpk;
+
+  const uint sp = gl_SubgroupID;
+  const uint lin = gl_SubgroupInvocationID;
+  const uint nsub = gl_NumSubgroups;
+  const uint sgsz = gl_SubgroupSize;
+  const uint nsplit = VT_PAS_WG * nsub;            // global split count
+  const uint gs = wsplit * nsub + sp;              // this subgroup's split index
+
+  uint qsl_base = p.qsl_off >> 2;
+  uint r = 0u;
+  for (uint i = 0u; i < p.num_reqs; ++i) {
+    if (t >= QSL.v[qsl_base + i] && t < QSL.v[qsl_base + i + 1u]) { r = i; break; }
+  }
+  uint q0 = QSL.v[qsl_base + r];
+  uint query_len = QSL.v[qsl_base + r + 1u] - q0;
+  int seqlen = int(SL.v[(p.sl_off >> 2) + r]);
+  int pos = int(seqlen) - int(query_len) + int(t - q0);
+
+  int jmin = p.window_left >= 0 ? max(0, pos - p.window_left) : 0;
+  int jmax = p.causal != 0u ? pos : seqlen - 1;
+  if (p.window_right >= 0) jmax = min(jmax, pos + p.window_right);
+  jmax = min(jmax, seqlen - 1);
+
+  const uint qbase = (t * p.hq + h) * p.d;
+
+  float acc[VT_PA_ACC_MAX];
+  for (uint s = 0u; s < VT_PA_ACC_MAX; ++s) acc[s] = 0.0;
+  float m = -1.0 / 0.0;
+  float l = 0.0;
+
+  const int span = jmax >= jmin ? (jmax - jmin + 1) : 0;
+  const int steps = (span + int(nsplit) - 1) / int(nsplit);
+
+  for (int it = 0; it < steps; ++it) {
+    const int j = jmin + it * int(nsplit) + int(gs);
+    const bool live = (j <= jmax);
+
+    uint kbase = 0u;
+    uint vbase = 0u;
+    if (live) {
+      uint blk = BT.v[(p.bt_off >> 2) + uint(r) * p.bt_row + (uint(j) / p.block_size) * p.bt_col];
+      uint off = uint(j) % p.block_size;
+      kbase = blk * p.kc_blk + off * p.kc_pg + g * p.kc_hd;
+      vbase = blk * p.vc_blk + off * p.vc_pg + g * p.vc_hd;
+    }
+
+    float partial = 0.0;
+    if (live) {
+      for (uint e = lin; e < p.d; e += sgsz) {
+        partial += VT_LOAD(Q32, Q16, VT_PA_Q_DT, p.q_off, qbase + e)
+                 * VT_LOAD(K32, K16, VT_PA_K_DT, p.k_off, kbase + e);
+      }
+    }
+    // `live` is uniform within a subgroup: every lane of the group shares j.
+    const float dot = subgroupAdd(partial);
+
+    if (live) {
+      float sv = dot * p.scale;
+      if (p.softcap > 0.0) sv = p.softcap * tanh(sv / p.softcap);
+      float m_new = max(m, sv);
+      float corr = exp(m - m_new);
+      float w = exp(sv - m_new);
+      l = l * corr + w;
+      uint slot = 0u;
+      for (uint e = lin; e < p.d; e += sgsz, ++slot) {
+        acc[slot] = acc[slot] * corr
+                  + w * VT_LOAD(V32, V16, VT_PA_V_DT, p.v_off, vbase + e);
+      }
+      m = m_new;
+    }
+  }
+
+  // Fold this workgroup's subgroups into ONE partial, then store it. The
+  // cross-workgroup fold is pass 2's job.
+  barrier();
+  if (lin == 0u) { vt_pa_m[sp] = m; vt_pa_l[sp] = l; }
+  barrier();
+
+  float gm = vt_pa_m[0];
+  for (uint i = 1u; i < nsub; ++i) gm = max(gm, vt_pa_m[i]);
+  float den = 0.0;
+  for (uint i = 0u; i < nsub; ++i) {
+    if (vt_pa_l[i] > 0.0) den += vt_pa_l[i] * exp(vt_pa_m[i] - gm);
+  }
+
+  // [unit][wsplit] -> (m, l, acc[d])
+  const uint pbase = (p.par_off >> 2) + (unit * VT_PAS_WG + wsplit) * (p.d + 2u);
+  if (sp == 0u && lin == 0u) {
+    PAR.v[pbase] = gm;
+    PAR.v[pbase + 1u] = den;
+  }
+
+  uint slot = 0u;
+  for (uint e = lin; e < p.d; e += sgsz, ++slot) {
+    barrier();
+    vt_pa_red[sp * 32u + lin] = acc[slot];
+    barrier();
+    if (sp == 0u) {
+      float tot = 0.0;
+      for (uint i = 0u; i < nsub; ++i) {
+        if (vt_pa_l[i] > 0.0) tot += vt_pa_red[i * 32u + lin] * exp(vt_pa_m[i] - gm);
+      }
+      // UNNORMALISED, deliberately: pass 2 needs the raw accumulator to rescale
+      // it against the global maximum before it can divide.
+      PAR.v[pbase + 2u + e] = tot;
+    }
+  }
+}

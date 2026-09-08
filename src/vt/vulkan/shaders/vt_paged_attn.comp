@@ -24,9 +24,78 @@
 // the head-dim slices. This keeps the per-lane state to acc[] only, and matches
 // the CPU's structure of "one output row per unit of work".
 #extension GL_GOOGLE_include_directive : require
+// Requested here as well as in vt_common.glsl: glslang scopes an #extension
+// to the unit that states it, and the subgroup calls are in this file.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 #include "vt_common.glsl"
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+// SPLIT-K OVER THE SEQUENCE, inside one workgroup.
+//
+// WHY. The previous shape gave one 128-lane workgroup to each (query token,
+// query head) and had it walk the whole key range serially. The work is O(n)
+// either way -- nobody avoids the multiply-adds -- but that shape spends it as
+// WIDTH 128, DEPTH n, and time follows depth. Measured on Qwen3-0.6B at c=1,
+// cost per token grew 8.54 -> 13.05 -> 21.5 -> 38.0 ms as context grew 256 ->
+// 2048, while llama.cpp's Vulkan backend held 2.05 ms flat on the same
+// checkpoint, precision, device and harness.
+//
+// It also leaves the GPU idle. A single-stream decode dispatches total_q * hq =
+// 1 * 16 workgroups. Measured on this device, throughput keeps scaling to about
+// 256 workgroups of this shape and saturates there (c=1/4/16/32 -> 43.6 / 160.0
+// / 299.5 / 294.2 tok/s aggregate), so one stream uses roughly 6% of the
+// parallelism the card wants, and the fully-fed cost per token is 3.3 ms
+// against llama.cpp's 2.05 -- i.e. most of the single-stream gap is occupancy,
+// not kernel quality.
+//
+// WHAT CHANGED. The workgroup is now VT_PA_SPLIT groups of VT_TG lanes. Group
+// sp walks keys jmin+sp, jmin+sp+SPLIT, ... so the depth is n/SPLIT while the
+// width becomes SPLIT*VT_TG. Each group keeps its own running (m, l, acc), and
+// they are merged at the end with the standard online-softmax combine, which is
+// closed-form: rescale each group's l and acc by exp(m_g - max_g m_g).
+//
+// TWO EARLIER ATTEMPTS FAILED AND ARE WORTH RECORDING. Shrinking the workgroup
+// to a single subgroup, to make vt_tg_sum's barriers nearly free, was 2.3-2.8x
+// SLOWER -- the head-dim parallelism is load-bearing and barriers are not the
+// cost. Unrolling four key loads per iteration for memory-level parallelism
+// changed nothing measurable. Neither touched the actual constraint, which is
+// that only 16 workgroups exist and each one is a long serial walk.
+//
+// STRIDED, NOT CONTIGUOUS, key assignment: neighbouring groups then touch
+// neighbouring keys at the same moment, and the per-group iteration count comes
+// out equal without a separate remainder rule -- which matters because barrier()
+// must be reached by every invocation, so the loop trip count has to be uniform
+// across the whole workgroup. Out-of-range steps still execute the reduction and
+// contribute zero rather than skipping it.
+// ONE SUBGROUP PER SPLIT GROUP.
+//
+// The previous shape gave each split group VT_TG = 128 lanes, so folding one
+// key's partials cost a shared-memory halving tree -- eight workgroup barriers
+// PER KEY STEP. Measured with VT_VULKAN_DISPATCH_STATS on Qwen3-0.6B,
+// vt_paged_attn is 49.8% of all GPU time at 70.1 us per call, against
+// llama.cpp's FLASH_ATTN_EXT at 6.38 us, and that 11x is the whole 1.84x
+// end-to-end gap: removing it would take the forward from 2018 to 1104 ms.
+//
+// Making a group exactly one subgroup buys two things at once:
+//   * the per-key fold becomes a bare subgroupAdd -- ZERO barriers, where the
+//     tree cost eight, and the reduction happens once per KEY rather than once
+//     per dispatch, so this is worth ~32x more here than in vt_matmul_vec where
+//     the same substitution measured 2%;
+//   * the workgroup's 1024 lanes split into 32 groups instead of 8, so the
+//     serial depth per group falls from n/8 to n/32.
+//
+// SUBGROUP INDICES, NOT ARITHMETIC ON tid. Which invocation lands in which
+// subgroup is implementation-defined, so the group is identified by
+// gl_SubgroupID and the lane by gl_SubgroupInvocationID rather than by
+// tid / VT_TG. That is what makes this portable rather than an assumption about
+// NVIDIA's mapping.
+//
+// The split count is therefore gl_NumSubgroups, a runtime value; the shared
+// arrays are sized for VT_PA_SPLIT_MAX and only the first gl_NumSubgroups slots
+// are used.
+#define VT_PA_SPLIT_MAX 32u
+
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer Qb32 { uint v[]; } Q32;
 layout(binding = 1) readonly buffer Qb16 { uint16_t v[]; } Q16;
@@ -70,6 +139,15 @@ layout(push_constant) uniform Params {
 // host asserts it rather than trusting it.
 #define VT_PA_ACC_MAX 8
 
+// Scratch for the END-OF-CALL merge only. The per-key fold no longer touches
+// shared memory at all.
+shared float vt_pa_red[VT_PA_SPLIT_MAX * 32u];
+shared float vt_pa_m[VT_PA_SPLIT_MAX];
+shared float vt_pa_l[VT_PA_SPLIT_MAX];
+
+// No group-sum helper any more: a split group IS a subgroup, so the fold is a
+// bare subgroupAdd at the call site with no shared memory and no barrier.
+
 void main() {
   uint unit = gl_WorkGroupID.x;              // one workgroup per (token, head)
   if (unit >= p.total_q * p.hq) { return; }
@@ -100,44 +178,57 @@ void main() {
 
   uint qbase = (t * p.hq + h) * p.d;
 
+  const uint sp = gl_SubgroupID;              // this lane's split group
+  const uint lin = gl_SubgroupInvocationID;   // lane within the group
+  const uint nsplit = gl_NumSubgroups;
+  const uint sgsz = gl_SubgroupSize;
+
   float acc[VT_PA_ACC_MAX];
   for (uint s = 0u; s < VT_PA_ACC_MAX; ++s) acc[s] = 0.0;
   float m = -1.0 / 0.0;  // -inf
   float l = 0.0;
 
-  if (jmax >= jmin) {
-    for (int j = jmin; j <= jmax; ++j) {
+  // Uniform trip count across the whole workgroup: the merge below uses
+  // barrier(), and every invocation must reach it the same number of times.
+  // Groups whose key is past the end contribute zero rather than skipping.
+  const int span = jmax >= jmin ? (jmax - jmin + 1) : 0;
+  const int steps = (span + int(nsplit) - 1) / int(nsplit);
+
+  for (int it = 0; it < steps; ++it) {
+    const int j = jmin + it * int(nsplit) + int(sp);
+    const bool live = (j <= jmax);
+
+    uint kbase = 0u;
+    uint vbase = 0u;
+    if (live) {
       uint blk = BT.v[(p.bt_off >> 2) + uint(r) * p.bt_row + (uint(j) / p.block_size) * p.bt_col];
       uint off = uint(j) % p.block_size;
-      uint kbase = blk * p.kc_blk + off * p.kc_pg + g * p.kc_hd;
+      kbase = blk * p.kc_blk + off * p.kc_pg + g * p.kc_hd;
+      vbase = blk * p.vc_blk + off * p.vc_pg + g * p.vc_hd;
+    }
 
-      // Cooperative q.k over the head dimension: each lane sums its own slice,
-      // then one tree reduction over the workgroup.
-      float partial = 0.0;
-      for (uint e = tid; e < p.d; e += VT_TG) {
+    float partial = 0.0;
+    if (live) {
+      for (uint e = lin; e < p.d; e += sgsz) {
         partial += VT_LOAD(Q32, Q16, VT_PA_Q_DT, p.q_off, qbase + e)
                  * VT_LOAD(K32, K16, VT_PA_K_DT, p.k_off, kbase + e);
       }
-      // vt_tg_sum returns smem[0] to EVERY lane, and its leading barrier makes
-      // back-to-back calls in this loop safe (all lanes finish reading the
-      // previous total before the next call overwrites it). So no broadcast is
-      // needed: every lane derives the score from the same `dot` with the same
-      // instructions and therefore gets bit-identical results.
-      float dot = vt_tg_sum(tid, partial);
-      float s = dot * p.scale;
+    }
+    // The fold. `live` is uniform within a subgroup because every lane of the
+    // group shares the same j, so this sits in uniform control flow.
+    const float dot = subgroupAdd(partial);
+
+    if (live) {
+      float sv = dot * p.scale;
       // cpu_paged_attn.cpp:144-145: optional cap * tanh(score / cap).
-      if (p.softcap > 0.0) s = p.softcap * tanh(s / p.softcap);
+      if (p.softcap > 0.0) sv = p.softcap * tanh(sv / p.softcap);
 
-      // Online softmax update. Equivalent to the CPU's max/exp/denominator
-      // passes, evaluated incrementally.
-      float m_new = max(m, s);
+      float m_new = max(m, sv);
       float corr = exp(m - m_new);   // 0 on the first key, since m == -inf
-      float w = exp(s - m_new);
+      float w = exp(sv - m_new);
       l = l * corr + w;
-
-      uint vbase = blk * p.vc_blk + off * p.vc_pg + g * p.vc_hd;
       uint slot = 0u;
-      for (uint e = tid; e < p.d; e += VT_TG, ++slot) {
+      for (uint e = lin; e < p.d; e += sgsz, ++slot) {
         acc[slot] = acc[slot] * corr
                   + w * VT_LOAD(V32, V16, VT_PA_V_DT, p.v_off, vbase + e);
       }
@@ -145,11 +236,37 @@ void main() {
     }
   }
 
-  // cpu_paged_attn.cpp:150 divides by the denominator once; an empty window
-  // (jmax < jmin) leaves the row untouched there, so it is left zero here.
-  float inv = l > 0.0 ? 1.0 / l : 0.0;
+  // MERGE THE SPLIT GROUPS. Online softmax combines in closed form: pick the
+  // global max, rescale each group's denominator and accumulator by
+  // exp(m_g - m_global), and sum. A group that saw no key keeps m = -inf and
+  // l = 0, and exp(-inf - m_global) is 0, so it drops out without a special case
+  // unless EVERY group is empty -- which is the jmax < jmin row the CPU kernel
+  // leaves untouched, handled by inv = 0 below.
+  barrier();
+  if (lin == 0u) { vt_pa_m[sp] = m; vt_pa_l[sp] = l; }
+  barrier();
+
+  float gm = vt_pa_m[0];
+  for (uint i = 1u; i < nsplit; ++i) gm = max(gm, vt_pa_m[i]);
+  float gl = 0.0;
+  for (uint i = 0u; i < nsplit; ++i) {
+    if (vt_pa_l[i] > 0.0) gl += vt_pa_l[i] * exp(vt_pa_m[i] - gm);
+  }
+  float inv = gl > 0.0 ? 1.0 / gl : 0.0;
+
+  // One head-dim slot at a time so the scratch stays VT_PA_SPLIT * VT_TG.
+  // p.d is uniform, so the trip count is uniform and the barriers are safe.
   uint slot = 0u;
-  for (uint e = tid; e < p.d; e += VT_TG, ++slot) {
-    VT_STORE(D32, D16, VT_PA_OUT_DT, p.out_off, qbase + e, acc[slot] * inv);
+  for (uint e = lin; e < p.d; e += sgsz, ++slot) {
+    barrier();
+    vt_pa_red[sp * 32u + lin] = acc[slot];
+    barrier();
+    if (sp == 0u) {
+      float tot = 0.0;
+      for (uint i = 0u; i < nsplit; ++i) {
+        if (vt_pa_l[i] > 0.0) tot += vt_pa_red[i * 32u + lin] * exp(vt_pa_m[i] - gm);
+      }
+      VT_STORE(D32, D16, VT_PA_OUT_DT, p.out_off, qbase + e, tot * inv);
+    }
   }
 }

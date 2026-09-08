@@ -104,6 +104,65 @@ layout(constant_id = 4) const uint VT_MM_NCOLS = 1u;
 // spills to scratch memory would defeat the whole point of holding NCOLS
 // accumulators in registers.
 #define VT_MM_NCOLS_MAX 8u
+// ROW BLOCKING. One workgroup serves VT_MM_MROWS output ROWS of the same column
+// block, so each loaded b element feeds MROWS accumulators instead of one.
+//
+// WHY. The blocked body indexed workgroups as (row, column-block), which means
+// every row re-streamed the WHOLE b matrix. Measured on lm_head (k=5120,
+// n=248320, 2.5 GB of bf16 weights), ms/call against batch size:
+//
+//     m    measured   if b read once   if b re-read per row
+//     1     1.5439        1.5439             1.5439
+//     2     2.5872        1.5439             3.0878
+//     4     6.4939        1.5439             6.1756
+//     8    13.3646        1.5439            12.3512
+//
+// ⇒ It tracks the re-read column, not the read-once one. At c=4 that is 4.95 ms
+// wasted in every decode step (9.7% of the step) and it grows linearly with
+// concurrency -- which is exactly where this engine's gap to llama.cpp is
+// widest, so the waste and the gap have the same shape.
+//
+// MROWS * NCOLS <= VT_MM_NCOLS_MAX, because they share the accumulator array;
+// the host enforces it rather than the shader reading past the end.
+#define VT_MM_MROWS_MAX 8u
+layout(constant_id = 6) const uint VT_MM_MROWS = 1u;
+
+// VT_MM_KUNROLL -- memory-level parallelism for the column-blocked body.
+//
+// WHY: consecutive K iterations read addresses p.n apart. At the lm_head shape
+// (k=5120, n=248320, bf16) that is 496 KB between iterations, so the loop reads
+// 1 KB contiguous, jumps half a megabyte, reads 1 KB again. Only NCOLS loads are
+// in flight per lane, and measured on this box the kernel sits at 7.03 ms/call
+// for 2.54 GB of weights -- 367 GB/s, about 20% of the part's roof. The GEMV
+// kernel's comment describes the same symptom in the same words ("each lane has
+// a single outstanding read and the loop stalls on it") and fixes it the same
+// way.
+//
+// ORDER IS PRESERVED, which is the constraint this body has that the GEMV one
+// does not: each accumulator must keep the CPU kernel's sequential K order. So
+// the unroll does NOT introduce partial sums -- the loads are hoisted above the
+// FMAs, and the FMAs still add into the same accumulator in the same sequence.
+// Bit-identical by construction, and the memcmp test asserts it.
+//
+// MEASURED, AND THE HYPOTHESIS IS REFUTED. Same binary, interleaved, 27B bf16
+// c=8, ms/call for this kernel:
+//     KUNROLL=1   6.92 / 7.09      per-stream 13.65 / 13.42
+//     KUNROLL=4   8.52 / 9.17      per-stream 13.55 / 13.15
+// 23-29% SLOWER, token ids bit-identical either way. More reads in flight did not
+// help, so insufficient memory-level parallelism was the wrong diagnosis.
+//
+// What the refutation points at instead: consecutive K iterations are p.n apart,
+// which at this shape is 496 KB, so every iteration touches a DIFFERENT DRAM
+// page. That is a page-locality problem, not a parallelism one -- issuing more
+// requests to scattered pages cannot help and evidently hurts, most likely
+// through the register pressure that costs occupancy (the same mechanism that
+// capped the eight-slot GEMV block at a fifth of its predicted gain).
+//
+// So the real fix is a traversal change -- tile over K so a workgroup reuses
+// pages, or transpose the weight -- and both are much larger than this knob. The
+// arm is kept, DEFAULT 1, so the next person reads a measured dead end instead of
+// re-deriving it.
+layout(constant_id = 5) const uint VT_MM_KUNROLL = 1u;
 
 layout(push_constant) uniform Params {
   uint m;
@@ -127,36 +186,100 @@ void main() {
     // of 1024, and rounding the span down would silently drop output columns.
     const uint blocks = (p.n + per_group - 1u) / per_group;
     const uint gid = gl_WorkGroupID.x;
-    if (gid >= p.m * blocks) { return; }
-    const uint i = gid / blocks;               // output row
+    const uint row_blocks = (p.m + VT_MM_MROWS - 1u) / VT_MM_MROWS;
+    if (gid >= row_blocks * blocks) { return; }
+    const uint i = (gid / blocks) * VT_MM_MROWS;   // first output row of the block
     const uint base = (gid % blocks) * per_group;
     const uint t = gl_LocalInvocationID.x;
     const uint a_row = i * p.k;
 
     // One accumulator per output column this lane owns. Each runs the WHOLE K
     // reduction sequentially, so each is the CPU kernel's order for its element.
+    // acc[r * NCOLS + c]. MROWS == 1 leaves the indexing and the count exactly
+    // as they were, so that arm is unchanged.
     float acc[VT_MM_NCOLS_MAX];
-    for (uint c = 0u; c < VT_MM_NCOLS; ++c) { acc[c] = 0.0; }
+    for (uint e = 0u; e < VT_MM_MROWS * VT_MM_NCOLS; ++e) { acc[e] = 0.0; }
+    const uint rows_here = min(VT_MM_MROWS, p.m - i);
 
-    for (uint q = 0u; q < p.k; ++q) {
+    uint q = 0u;
+    // UNROLLED BODY: four K positions in flight. The four b loads for a column are
+    // issued before any of the FMAs that consume them, so the lane has 4 * NCOLS
+    // outstanding reads instead of NCOLS, while the accumulation sequence is
+    // exactly the one the rolled loop below performs.
+    for (; VT_MM_KUNROLL == 4u && q + 3u < p.k; q += 4u) {
+      const uint r0 = q * p.n, r1 = r0 + p.n, r2 = r1 + p.n, r3 = r2 + p.n;
+      // BOTH OPERANDS ARE HOISTED OUT OF THE OTHER'S LOOP, and the first version
+      // of this got it half right. `b` must leave the ROW loop -- that is what
+      // row blocking is for. But `a` must equally leave the COLUMN loop: putting
+      // its loads inside made every column re-read them, and MEASURED that cost
+      // more than the row sharing saved (m=1 went 1.54 -> 3.79 ms, m=2
+      // 2.59 -> 3.88). a is a broadcast, so it is not bus traffic; it is the
+      // dependent load in front of every FMA.
+      // CONSTANT TRIP COUNT, no data-dependent break. The first attempt guarded
+      // every row loop with `if (r >= rows_here) break;`, which is a RUNTIME
+      // bound -- so the loop could not be fully unrolled, `av` could not stay in
+      // registers, and MROWS=2 measured 4.05 ms against MROWS=1's 1.55 at the
+      // same grid and half the work. Out-of-range rows are CLAMPED to the last
+      // valid one instead: they compute a duplicate and are dropped at the
+      // store, which costs a few wasted FMAs on the final block only.
+      float av[VT_MM_MROWS_MAX * 4u];
+      for (uint r = 0u; r < VT_MM_MROWS; ++r) {
+        const uint ar = a_row + min(r, rows_here - 1u) * p.k;
+        av[r * 4u + 0u] = VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, ar + q);
+        av[r * 4u + 1u] = VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, ar + q + 1u);
+        av[r * 4u + 2u] = VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, ar + q + 2u);
+        av[r * 4u + 3u] = VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, ar + q + 3u);
+      }
+      for (uint c = 0u; c < VT_MM_NCOLS; ++c) {
+        const uint j = base + t + c * VT_TG;
+        if (j < p.n) {
+          const float b0 = VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, r0 + j);
+          const float b1 = VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, r1 + j);
+          const float b2 = VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, r2 + j);
+          const float b3 = VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, r3 + j);
+          for (uint r = 0u; r < VT_MM_MROWS; ++r) {
+            acc[r * VT_MM_NCOLS + c] += av[r * 4u + 0u] * b0;
+            acc[r * VT_MM_NCOLS + c] += av[r * 4u + 1u] * b1;
+            acc[r * VT_MM_NCOLS + c] += av[r * 4u + 2u] * b2;
+            acc[r * VT_MM_NCOLS + c] += av[r * 4u + 3u] * b3;
+          }
+        }
+      }
+    }
+    // Tail, and the whole loop when VT_MM_KUNROLL == 1. K is not required to be a
+    // multiple of 4 and truncating it would silently drop dot-product terms.
+    for (; q < p.k; ++q) {
       // Every lane in the workgroup reads the SAME a element -- a broadcast, and
       // the reason a is not the cost here even though it is re-read k times per
       // workgroup.
-      const float av = VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, a_row + q);
       const uint b_row = q * p.n;
+      float avt[VT_MM_MROWS_MAX];
+      for (uint r = 0u; r < VT_MM_MROWS; ++r) {
+        avt[r] = VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off,
+                         a_row + min(r, rows_here - 1u) * p.k + q);
+      }
       // The NCOLS loads are mutually independent and each is a coalesced 128-lane
       // contiguous read; together they cover per_group CONSECUTIVE elements.
       for (uint c = 0u; c < VT_MM_NCOLS; ++c) {
         const uint j = base + t + c * VT_TG;
         if (j < p.n) {
-          acc[c] += av * VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, b_row + j);
+          const float bv = VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, b_row + j);
+          for (uint r = 0u; r < VT_MM_MROWS; ++r) {
+            acc[r * VT_MM_NCOLS + c] += avt[r] * bv;
+          }
         }
       }
     }
 
-    for (uint c = 0u; c < VT_MM_NCOLS; ++c) {
-      const uint j = base + t + c * VT_TG;
-      if (j < p.n) { VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, i * p.n + j, acc[c]); }
+    for (uint r = 0u; r < VT_MM_MROWS; ++r) {
+      if (r >= rows_here) { break; }
+      for (uint c = 0u; c < VT_MM_NCOLS; ++c) {
+        const uint j = base + t + c * VT_TG;
+        if (j < p.n) {
+          VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, (i + r) * p.n + j,
+                   acc[r * VT_MM_NCOLS + c]);
+        }
+      }
     }
     return;
   }

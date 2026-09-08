@@ -79,6 +79,21 @@ OUT_SOURCE = REPO / "src" / "vt" / "vulkan" / "vulkan_spirv.cpp"
 # Vulkan 1.1 is the floor the backend requires (src/vt/vulkan/vulkan_context.cpp).
 TARGET_ENV = "vulkan1.1"
 
+# PER-SHADER TARGET ENVIRONMENT. vulkan1.1 is right for every shader that only
+# needs the core plus the storage/subgroup extensions, and raising it globally
+# would have been one character and the wrong change: it would silently permit
+# a 1.3-only construct to compile into a module the 1.1 shaders' devices are
+# expected to run.
+#
+# The cooperative_matrix2 shaders are the exception. VK_NV_cooperative_matrix2
+# and its tensor addressing are exposed to GLSL only at SPIR-V 1.6, which
+# glslang gates behind vulkan1.3; compiled at 1.1 the extension is rejected and
+# the module comes back without an entry point.
+TARGET_ENV_OVERRIDES = {
+    "vt_matmul_coopmat_wg.comp": "vulkan1.3",
+    "vt_paged_attn_cm2.comp": "vulkan1.3",
+}
+
 CANDIDATE_COMPILERS = ("glslang", "glslangValidator", "glslc")
 
 
@@ -108,8 +123,9 @@ def compiler_version(cc: pathlib.Path) -> str:
 def compile_one(cc: pathlib.Path, src: pathlib.Path) -> bytes:
     with tempfile.TemporaryDirectory() as td:
         spv = pathlib.Path(td) / (src.stem + ".spv")
+        target = TARGET_ENV_OVERRIDES.get(src.name, TARGET_ENV)
         if cc.name == "glslc":
-            cmd = [str(cc), f"--target-env={TARGET_ENV}", "-O", "-fshader-stage=compute",
+            cmd = [str(cc), f"--target-env={target}", "-O", "-fshader-stage=compute",
                    "-I", str(SHADER_DIR), "-o", str(spv), str(src)]
         else:
             # -g0 strips debug names (OpName/OpSource), which is most of the
@@ -119,7 +135,7 @@ def compile_one(cc: pathlib.Path, src: pathlib.Path) -> bytes:
             # exact numbers are 130,208 bytes with -Os vs 109,436 without), and
             # the driver's own optimizer does that work at pipeline creation
             # anyway.
-            cmd = [str(cc), "-V", "--target-env", TARGET_ENV, "-g0",
+            cmd = [str(cc), "-V", "--target-env", target, "-g0",
                    f"-I{SHADER_DIR}", "-o", str(spv), str(src)]
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0 or not spv.exists():

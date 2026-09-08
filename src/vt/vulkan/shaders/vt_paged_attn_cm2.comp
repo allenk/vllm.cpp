@@ -1,0 +1,237 @@
+// Prefill attention in COOPERATIVE-MATRIX form, for the one contract the model
+// actually uses.
+//
+// WHY THIS EXISTS. The scalar kernel beside it (vt_paged_attn.comp) gives one
+// workgroup to each (query token, head) and walks the context position by
+// position, doing a 256-wide scalar dot and a subgroupAdd per position. Measured
+// on the 27B prefill: 16.3 ms/call, 51.5 GFLOP, 3.2 TFLOP/s -- about 2.6% of
+// this card's compute peak, while the GEMM beside it in the same trace runs at
+// 80.4. The reduction depth is the same order as the useful work, so no amount
+// of tuning moves it; the operator has to become a matrix multiply.
+//
+// SCOPE, checked before this file was written rather than assumed. The variant
+// histogram reports every prefill attention call as hq=24, causal, NO sliding
+// window, NO logit softcap, and the device reports all seven
+// VK_NV_cooperative_matrix2 features including reductions, per-element
+// operations and conversions -- which the online softmax below needs and which
+// this backend had never queried. Anything outside that contract is declined on
+// the host and served by the scalar kernel.
+//
+// STRUCTURE, ported from llama.cpp's flash_attn_cm2.comp (the QK multiply, the
+// matrix-form online softmax, the rowsum-by-multiplying-by-ones trick, and the
+// smear-reduce that resizes the rescale factor to the value width). What is NOT
+// ported: the mask tensor, ALiBi slopes, split-K and the quantised decode paths,
+// none of which this contract uses.
+//
+// THE PAGED PART IS OURS AND IT IS WHY Bc IS FIXED TO THE PAGE SIZE. llama reads
+// a contiguous KV with a stride; ours is paged through a block table, and a
+// tensor layout cannot express a page table. With Bc == block_size every KV
+// block is exactly one page, so the block table contributes a base OFFSET and
+// the layout inside the page is a plain stride again. That is the whole trick,
+// and it is also the constraint: the host declines when block_size != Bc.
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_NV_cooperative_matrix2 : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "vt_common.glsl"
+
+// 256 invocations: the device pairs 32x32x16 bf16 workgroup-scope granularity
+// with exactly that count, and every multiply below is a multiple of it.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Q and the output are f32 by this op's contract; only the KV cache is bf16.
+layout(binding = 0) readonly buffer Qb32 { float v[]; } Q32;
+layout(binding = 1) readonly buffer Qb16 { bfloat16_t v[]; } Q16;
+layout(binding = 2) readonly buffer Kb32 { uint v[]; } K32;
+layout(binding = 3) readonly buffer Kb16 { bfloat16_t v[]; } K16;
+layout(binding = 4) readonly buffer Vb32 { uint v[]; } V32;
+layout(binding = 5) readonly buffer Vb16 { bfloat16_t v[]; } V16;
+layout(binding = 6) buffer Db32 { float v[]; } D32;
+layout(binding = 7) buffer Db16 { bfloat16_t v[]; } D16;
+layout(binding = 8) readonly buffer BTb { uint v[]; } BT;
+layout(binding = 9) readonly buffer SLb { uint v[]; } SL;
+layout(binding = 10) readonly buffer QSLb { uint v[]; } QSL;
+
+// Query rows per workgroup. 32 is the N/M granularity this device pairs with 256
+// invocations; 64 is legal too and is left to the sweep.
+layout(constant_id = 0) const uint VT_FA_BR = 32u;
+// Key columns per step. MUST equal the KV page size -- see the header.
+layout(constant_id = 1) const uint VT_FA_BC = 32u;
+// Head dimension, a constant so the matrix extents are compile-time.
+layout(constant_id = 2) const uint VT_FA_D = 256u;
+
+layout(push_constant) uniform Params {
+  uint total_q;
+  uint hq;
+  uint d;
+  uint block_size;
+  uint qpk;
+  uint num_reqs;
+  uint causal;
+  int window_left;
+  int window_right;
+  uint kc_blk, kc_pg, kc_hd;
+  uint vc_blk, vc_pg, vc_hd;
+  uint bt_row, bt_col;
+  uint q_off, k_off, v_off, out_off;
+  uint bt_off, sl_off, qsl_off;
+  float scale;
+  float softcap;
+} p;
+
+#define VT_FA_NEG_HALF (-3.0e38 / 2.0)
+
+float vt_fa_max2(const in float x, const in float y) { return max(x, y); }
+// The rescale factor is one value per ROW, and the accumulator it has to scale
+// is Br x D. Reducing with a smear spreads that row value across the wider
+// matrix, which is llama's trick and avoids a real diagonal matrix multiply.
+float vt_fa_smear(const in float x, const in float y) { return x; }
+
+float vt_fa_exp(const in uint row, const in uint col, const in float e) { return exp(e); }
+float vt_fa_max(const in uint row, const in uint col, const in float a, const in float b) {
+  return max(a, b);
+}
+// CAUSAL MASK. `qbase` is the absolute position of this block's first query row
+// and `kbase` is the absolute position of this step's first key, so the compare
+// is on absolute positions and needs no other state. Rows past the request's
+// query length compute nonsense and are dropped by the clamped store, which is
+// safe because every row of an attention output is independent of the others.
+float vt_fa_mask(const in uint row, const in uint col, const in float e,
+                 const in uint qbase, const in uint kbase) {
+  return (kbase + col > qbase + row) ? VT_FA_NEG_HALF : e;
+}
+
+void main() {
+  const uint gid = gl_WorkGroupID.x;
+  const uint h = gid % p.hq;
+  const uint t2 = gid / p.hq;
+  // An upper bound on blocks per request, so a workgroup's rows never straddle
+  // two requests -- they attend to different pages and could not share a tile.
+  // The excess workgroups return before touching memory.
+  const uint blocks_ub = (p.total_q + VT_FA_BR - 1u) / VT_FA_BR;
+  const uint r = t2 / blocks_ub;
+  const uint b = t2 % blocks_ub;
+  if (r >= p.num_reqs) { return; }
+
+  const uint qsl_base = p.qsl_off >> 2;
+  const uint q0 = QSL.v[qsl_base + r];
+  const uint q1 = QSL.v[qsl_base + r + 1u];
+  if (q1 <= q0) { return; }
+  const uint qlen = q1 - q0;
+  const uint row0 = b * VT_FA_BR;
+  if (row0 >= qlen) { return; }
+
+  const uint seqlen = SL.v[(p.sl_off >> 2) + r];
+  // Absolute position of query row `row0` in this request's sequence.
+  const uint qbase = seqlen - qlen + row0;
+  const uint g = h / p.qpk;
+
+  // Q is [T, Hq, D]: rows stride by Hq*D, the head is a base offset.
+  tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tlQ =
+      createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+  tlQ = setTensorLayoutDimensionNV(tlQ, q1, VT_FA_D);
+  tlQ = setTensorLayoutStrideNV(tlQ, p.hq * VT_FA_D, 1);
+
+  coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_D, gl_MatrixUseAccumulator> Qacc;
+  coopMatLoadTensorNV(Qacc, Q32.v, (p.q_off >> 2) + h * VT_FA_D,
+                      sliceTensorLayoutNV(tlQ, q0 + row0, VT_FA_BR, 0, VT_FA_D));
+  coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_D, gl_MatrixUseA> Qa =
+      coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_D, gl_MatrixUseA>(Qacc);
+
+  coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_D, gl_MatrixUseAccumulator> O =
+      coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_D, gl_MatrixUseAccumulator>(0.0);
+  coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseAccumulator> L =
+      coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseAccumulator>(0.0);
+  coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseAccumulator> M =
+      coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseAccumulator>(VT_FA_NEG_HALF);
+  const coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_FA_BC, VT_FA_BC, gl_MatrixUseB> Ones =
+      coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_FA_BC, VT_FA_BC, gl_MatrixUseB>(1.0);
+
+  // Causality bounds the sweep: no key past this block's LAST query position can
+  // contribute, so the loop stops there instead of at seqlen.
+  const uint rows_here = min(VT_FA_BR, qlen - row0);
+  const uint last_q = qbase + rows_here - 1u;
+  const uint j_end = (last_q / VT_FA_BC) + 1u;
+
+  for (uint j = 0u; j < j_end; ++j) {
+    const uint kbase = j * VT_FA_BC;
+    // One page per step: the block table gives the base, the layout gives the
+    // stride inside it.
+    const uint blk = BT.v[(p.bt_off >> 2) + r * p.bt_row + j * p.bt_col];
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tlK =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    tlK = setTensorLayoutDimensionNV(tlK, VT_FA_BC, VT_FA_D);
+    tlK = setTensorLayoutStrideNV(tlK, p.kc_pg, 1);
+    tensorViewNV<2, false, 1, 0> tvT = createTensorViewNV(2, false, 1, 0);
+
+    coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_FA_D, VT_FA_BC, gl_MatrixUseB> Kt;
+    coopMatLoadTensorNV(Kt, K16.v, (p.k_off >> 1) + blk * p.kc_blk + g * p.kc_hd,
+                        sliceTensorLayoutNV(tlK, 0, VT_FA_BC, 0, VT_FA_D), tvT);
+
+    coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseAccumulator> S =
+        coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseAccumulator>(0.0);
+    S = coopMatMulAdd(Qa, Kt, S);
+    S *= coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseAccumulator>(p.scale);
+    coopMatPerElementNV(S, S, vt_fa_mask, qbase, kbase);
+
+    coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseAccumulator> rowmax;
+    coopMatReduceNV(rowmax, S, gl_CooperativeMatrixReduceRowNV, vt_fa_max2);
+
+    const coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseAccumulator> Mold = M;
+    coopMatPerElementNV(M, rowmax, vt_fa_max, Mold);
+
+    coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseAccumulator> P;
+    coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseAccumulator> eM;
+    coopMatPerElementNV(P, S - M, vt_fa_exp);
+    coopMatPerElementNV(eM, Mold - M, vt_fa_exp);
+
+    const coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseA> Pa =
+        coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseA>(P);
+
+    // Row sums without a reduction: multiplying by a matrix of ones puts each
+    // row's total in every column of that row, which is the shape the rescale
+    // below wants anyway.
+    coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseAccumulator> rowsum =
+        coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_BC, gl_MatrixUseAccumulator>(0.0);
+    rowsum = coopMatMulAdd(Pa, Ones, rowsum);
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tlV =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    tlV = setTensorLayoutDimensionNV(tlV, VT_FA_BC, VT_FA_D);
+    tlV = setTensorLayoutStrideNV(tlV, p.vc_pg, 1);
+    coopmat<bfloat16_t, gl_ScopeWorkgroup, VT_FA_BC, VT_FA_D, gl_MatrixUseB> Vm;
+    coopMatLoadTensorNV(Vm, V16.v, (p.v_off >> 1) + blk * p.vc_blk + g * p.vc_hd,
+                        sliceTensorLayoutNV(tlV, 0, VT_FA_BC, 0, VT_FA_D));
+
+    L = eM * L + rowsum;
+
+    coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_D, gl_MatrixUseAccumulator> eMwide;
+    coopMatReduceNV(eMwide, eM, gl_CooperativeMatrixReduceRowNV, vt_fa_smear);
+    O *= eMwide;
+    O = coopMatMulAdd(Pa, Vm, O);
+  }
+
+  // Divide by the running denominator, smeared to the value width the same way.
+  coopmat<float, gl_ScopeWorkgroup, VT_FA_BR, VT_FA_D, gl_MatrixUseAccumulator> Lwide;
+  coopMatReduceNV(Lwide, L, gl_CooperativeMatrixReduceRowNV, vt_fa_smear);
+  [[unroll]] for (uint e = 0u; e < O.length(); ++e) {
+    O[e] = (Lwide[e] > 0.0) ? (O[e] / Lwide[e]) : 0.0;
+  }
+
+  // The store layout's row extent is this request's end, so the rows past its
+  // query length -- the ones the mask let compute nonsense -- are dropped by the
+  // clamp instead of by a branch.
+  tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tlD =
+      createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+  tlD = setTensorLayoutDimensionNV(tlD, q1, VT_FA_D);
+  tlD = setTensorLayoutStrideNV(tlD, p.hq * VT_FA_D, 1);
+  coopMatStoreTensorNV(O, D32.v, (p.out_off >> 2) + h * VT_FA_D,
+                       sliceTensorLayoutNV(tlD, q0 + row0, VT_FA_BR, 0, VT_FA_D));
+}
