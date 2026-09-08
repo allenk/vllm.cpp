@@ -228,8 +228,14 @@ struct Registrar {
     // vtable constructed from automatic ints, though CudaPlatform copies both
     // into cap_ by value (no pointer/reference to major/minor is retained). The
     // static outlives the registrar as RegisterPlatform requires.
+// MSVC does not know `#pragma GCC` and warns C4068, which /WX makes fatal. The
+// pragma exists only to silence the GCC false positive described above, so it is
+// guarded rather than dropped -- dropping it would trade a Windows build failure
+// for a Linux one.
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
     static CudaPlatform platform(
         major, minor, integrated != 0,
         // #1378: the conjunction is a named, CPU-testable decision now
@@ -240,7 +246,9 @@ struct Registrar {
         // them is gated on the CPU tier.
         HostMemoryIsDeviceAddressableFromAttrs(pageable, integrated),
         total_bytes);  // device 0 only
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
+#endif
     RegisterPlatform(DeviceType::kCUDA, &platform);
   }
 } registrar;
