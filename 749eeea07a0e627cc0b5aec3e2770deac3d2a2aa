@@ -1,0 +1,19 @@
+UNDERSTATED WHEN COMMITTED. This commit describes kv_cache_utils.cpp as one of
+"small supporting changes that travel with the above". It is not: it is the line
+that lets a Windows build load a model at all.
+
+std::fopen("/proc/meminfo", "re") -- the "e" is glibc's O_CLOEXEC extension. MSVC
+does not ignore it; __acrt_stdio_parse_mode rejects the mode string, calls the
+invalid-parameter handler, and __fastfail(FAST_FAIL_INVALID_ARG) takes the
+process down with no message and exit code 0xC0000409.
+
+Measured after the fact, on 2026-09-09: upstream main's Windows binary exits
+0xC0000409 loading Qwen3-0.6B and Qwen3.6-27B, safetensors and GGUF, with
+--device cpu and --device auto, 3/3 reproductions. Causality confirmed by
+restoring the flag in this tree: the crash returns, and removing it again serves
+normally. The backend is irrelevant -- this runs before one is chosen.
+
+Kept as a note rather than a rewritten message because the branch is pushed.
+It should be split into its own commit before this work is offered upstream:
+it is a one-line, self-contained fix for a process-killing defect with a minimal
+reproducer, which makes it a better first pull request than anything else here.
