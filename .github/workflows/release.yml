@@ -468,8 +468,59 @@ jobs:
           if-no-files-found: error
           overwrite: false
           retention-days: 7
+  # CUDA is a PREVIEW lane and says so: it is built for sm_120a ONLY.
+  # A Triton AOT artifact is a cubin and therefore single-arch, so the
+  # architecture the build declares has to match a vendored tree under
+  # src/vt/cuda/triton_aot_vendored/, and only sm_120a was generated on
+  # hardware here. Other architectures are not faked.
+  #
+  # The runner has no NVIDIA GPU, so this lane proves BUILD and PACKAGING.
+  # It does not prove execution, and nothing here should be read as if it
+  # did -- the Vulkan and CPU lanes above run their focused tests because
+  # those backends work on a runner; a CUDA test needs a card.
+  cuda_windows:
+    needs: plan
+    permissions:
+      contents: read
+    runs-on: windows-2022
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove Windows PowerShell and CRT rejection contracts
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_DATE_EPOCH: '0'
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: ./scripts/build-windows-release.ps1 -ContractTest
+      - name: Build, execute, package, and validate native Windows CUDA preview
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          $env:SOURCE_DATE_EPOCH = (git show -s --format=%ct HEAD).Trim()
+          $release = Get-Content release/release-version.json -Raw | ConvertFrom-Json
+          if ($release.version -ne $env:VERSION) { throw "release version drift" }
+          ./scripts/build-windows-release.ps1 `
+            -Backend cuda `
+            -ArtifactId windows-x86_64-msvc-cuda `
+            -BuildDir $env:GITHUB_WORKSPACE/build-release-windows-cuda
+      - name: Upload exact validated Windows CUDA asset triplet
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64-msvc-cuda-${{ github.sha }}
+          path: |
+            build-release-windows-cuda/release/vllm.cpp-${{ needs.plan.outputs.version }}-windows-x86_64-msvc-cuda.zip
+            build-release-windows-cuda/release/vllm.cpp-${{ needs.plan.outputs.version }}-windows-x86_64-msvc-cuda.zip.sha256
+            build-release-windows-cuda/release/vllm.cpp-${{ needs.plan.outputs.version }}-windows-x86_64-msvc-cuda.zip.provenance.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
   build:
-    needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64, mlx_arm64, cpu_windows, vulkan_windows]
+    needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64, mlx_arm64, cpu_windows, vulkan_windows, cuda_windows]
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -487,7 +538,7 @@ jobs:
       - name: Download exact validated CPU artifacts by immutable IDs
         uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }},${{ needs.vulkan_x86.outputs.artifact_id }},${{ needs.metal_arm64.outputs.artifact_id }},${{ needs.mlx_arm64.outputs.artifact_id }},${{ needs.cpu_windows.outputs.artifact_id }},${{ needs.vulkan_windows.outputs.artifact_id }}
+          artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }},${{ needs.vulkan_x86.outputs.artifact_id }},${{ needs.metal_arm64.outputs.artifact_id }},${{ needs.mlx_arm64.outputs.artifact_id }},${{ needs.cpu_windows.outputs.artifact_id }},${{ needs.vulkan_windows.outputs.artifact_id }},${{ needs.cuda_windows.outputs.artifact_id }}
           path: release-assets
           merge-multiple: true
       - name: Produce the byte-bound release handoff

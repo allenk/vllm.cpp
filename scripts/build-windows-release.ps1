@@ -3,7 +3,7 @@ param(
     [string]$SourceDir = (Resolve-Path (Join-Path $PSScriptRoot "..")),
     [string]$BuildDir = (Join-Path $SourceDir "build-release-windows-cpu"),
     [string]$StageDir = (Join-Path $BuildDir "stage"),
-    [ValidateSet("cpu", "vulkan")][string]$Backend = "cpu",
+    [ValidateSet("cpu", "vulkan", "cuda")][string]$Backend = "cpu",
     [string]$ArtifactId = "",
     [string]$SmokeModel = (Join-Path $SourceDir "tests/vllm/models/fixtures/llama_embed_e2e"),
     [int]$SmokePort = 18080,
@@ -766,14 +766,20 @@ Invoke-Checked cmake @(
     "-DVLLM_CPP_BUILD_VERSION=$env:VERSION",
     "-DVLLM_CPP_BUILD_EXAMPLES=ON",
     "-DVLLM_CPP_SERVER=ON",
-    "-DVLLM_CPP_CUDA=OFF",
-    "-DVLLM_CPP_CUDA_ARCHITECTURES=",
+    "-DVLLM_CPP_CUDA=$(if ($Backend -eq 'cuda') { 'ON' } else { 'OFF' })",
+    # sm_120a is consumer Blackwell. It is named EXPLICITLY rather than left to
+    # detection because a Triton AOT artifact is a cubin and therefore
+    # single-arch by nature: the vendored tree under
+    # src/vt/cuda/triton_aot_vendored/<arch>/ has to match what is being built,
+    # and a fat build would carry cubins for architectures whose trees are not
+    # all present.
+    "-DVLLM_CPP_CUDA_ARCHITECTURES=$(if ($Backend -eq 'cuda') { '120a' } else { '' })",
     "-DVLLM_CPP_HIP=OFF",
     "-DVLLM_CPP_HIP_ARCHITECTURES=",
     "-DVLLM_CPP_METAL=OFF",
     "-DVLLM_CPP_MLX=OFF",
     "-DMLX_ROOT=",
-    "-DVLLM_CPP_TRITON=OFF",
+    "-DVLLM_CPP_TRITON=$(if ($Backend -eq 'cuda') { 'ON' } else { 'OFF' })",
     "-DVLLM_CPP_VULKAN=$(if ($Backend -eq 'vulkan') { 'ON' } else { 'OFF' })",
     "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
 )
@@ -794,6 +800,11 @@ $targets = @(
 )
 if ($Backend -eq "vulkan") {
     $targets += @("test_vulkan_backend", "test_backend_cross_device")
+}
+if ($Backend -eq "cuda") {
+    # The arch manifest test is the one that would catch a build whose declared
+    # architectures and whose vendored AOT trees disagree.
+    $targets += @("test_cuda_backend", "test_cuda_arch_manifest")
 }
 Invoke-Checked cmake (@("--build", $BuildDir, "--config", "Release", "--target") + $targets)
 

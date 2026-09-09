@@ -219,12 +219,12 @@ class ReleasePipelineContract(unittest.TestCase):
                     block,
                 )
 
-    def test_workflow_collects_exactly_ten_triplets_and_two_indexes(self) -> None:
+    def test_workflow_collects_every_triplet_and_two_indexes(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         primary_jobs = (
             "cpu_x86", "cpu_arm64", "cpu_musl", "cuda_x86", "cuda_arm64",
             "vulkan_x86", "metal_arm64", "mlx_arm64", "cpu_windows",
-            "vulkan_windows",
+            "vulkan_windows", "cuda_windows",
         )
         build = self.checker.job_block(workflow, "build")
         self.assertIn(
@@ -235,9 +235,13 @@ class ReleasePipelineContract(unittest.TestCase):
             self.assertEqual(
                 build.count(f"${{{{ needs.{job}.outputs.artifact_id }}}}"), 1
             )
-        self.assertEqual(workflow.count(".provenance.json"), 10)
-        self.assertEqual(workflow.count(".sha256"), 10)
-        self.assertEqual(workflow.count("vllm.cpp-${{ needs.plan.outputs.version }}-"), 30)
+        self.assertEqual(workflow.count(".provenance.json"), len(primary_jobs))
+        self.assertEqual(workflow.count(".sha256"), len(primary_jobs))
+        # three files per artifact: the archive, its sha256 and its provenance
+        self.assertEqual(
+            workflow.count("vllm.cpp-${{ needs.plan.outputs.version }}-"),
+            len(primary_jobs) * 3,
+        )
         verify = self.checker.job_block(workflow, "verify")
         self.assertIn("--json-output verified/release-index.json", verify)
         self.assertIn("--markdown-output verified/RELEASE_INDEX.md", verify)
@@ -272,7 +276,7 @@ class ReleasePipelineContract(unittest.TestCase):
                 "windows-x86_64-msvc-cpu.tar.gz",
             ),
             "handoff omits Windows": (
-                ",${{ needs.cpu_windows.outputs.artifact_id }},${{ needs.vulkan_windows.outputs.artifact_id }}",
+                ",${{ needs.cpu_windows.outputs.artifact_id }},${{ needs.vulkan_windows.outputs.artifact_id }},${{ needs.cuda_windows.outputs.artifact_id }}",
                 "",
             ),
         }
@@ -1182,7 +1186,7 @@ class ReleasePipelineContract(unittest.TestCase):
         plan_download = """          artifact-ids: ${{ needs.plan.outputs.artifact_id }}
           path: plan
           merge-multiple: true"""
-        asset_download = """          artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }},${{ needs.vulkan_x86.outputs.artifact_id }},${{ needs.metal_arm64.outputs.artifact_id }},${{ needs.mlx_arm64.outputs.artifact_id }},${{ needs.cpu_windows.outputs.artifact_id }},${{ needs.vulkan_windows.outputs.artifact_id }}
+        asset_download = """          artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }},${{ needs.vulkan_x86.outputs.artifact_id }},${{ needs.metal_arm64.outputs.artifact_id }},${{ needs.mlx_arm64.outputs.artifact_id }},${{ needs.cpu_windows.outputs.artifact_id }},${{ needs.vulkan_windows.outputs.artifact_id }},${{ needs.cuda_windows.outputs.artifact_id }}
           path: release-assets
           merge-multiple: true"""
         self.assertIn(plan_download, original)
@@ -1440,7 +1444,7 @@ class ReleasePipelineContract(unittest.TestCase):
             "global write": ("permissions:\n  contents: read", "permissions:\n  contents: write"),
             "mutable upload": ("overwrite: false", "overwrite: true"),
             "primary tuple omitted from handoff": (
-                "needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64, mlx_arm64, cpu_windows, vulkan_windows]",
+                "needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64, mlx_arm64, cpu_windows, vulkan_windows, cuda_windows]",
                 "needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64, mlx_arm64, cpu_windows]",
             ),
             "name not SHA-bound": ("release-unverified-${{ github.sha }}", "release-unverified"),

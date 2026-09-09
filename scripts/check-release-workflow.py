@@ -511,6 +511,7 @@ def validate(text: str) -> list[str]:
         "mlx_arm64",
         "cpu_windows",
         "vulkan_windows",
+        "cuda_windows",
     )
     release_outputs = (
         ("build-release-cpu-x86", "linux-x86_64-glibc-cpu", "tar.gz"),
@@ -523,6 +524,7 @@ def validate(text: str) -> list[str]:
         ("build-release-mlx-arm64", "macos-arm64-metal-mlx", "tar.gz"),
         ("build-release-windows-cpu", "windows-x86_64-msvc-cpu", "zip"),
         ("build-release-windows-vulkan", "windows-x86_64-msvc-vulkan", "zip"),
+        ("build-release-windows-cuda", "windows-x86_64-msvc-cuda", "zip"),
     )
     read_only_jobs = (
         "plan",
@@ -569,11 +571,12 @@ def validate(text: str) -> list[str]:
         text.count(".sha256\n") != len(release_outputs)
         or text.count(".provenance.json\n") != len(release_outputs)
     ):
-        errors.append("release workflow must upload exactly ten archive triplets")
+        errors.append(f"release workflow must upload exactly {len(release_outputs)} archive triplets")
 
     windows_contracts = (
         ("cpu_windows", "cpu", "build-release-windows-cpu"),
         ("vulkan_windows", "vulkan", "build-release-windows-vulkan"),
+        ("cuda_windows", "cuda", "build-release-windows-cuda"),
     )
     for job, backend, build_dir in windows_contracts:
         block = blocks[job]
