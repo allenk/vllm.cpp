@@ -80,6 +80,7 @@
                  &VT_AOT_SYMBOL(sm_89, NAME),                              \
                  &VT_AOT_SYMBOL(sm_90a, NAME),                             \
                  &VT_AOT_SYMBOL(sm_100a, NAME),                            \
+                 &VT_AOT_SYMBOL(sm_120a, NAME),                            \
                  &VT_AOT_SYMBOL(sm_121a, NAME)},                           \
       __VA_ARGS__)
 #define VT_TRITON_AOT_LOAD(NAME)                                          \
@@ -91,6 +92,7 @@
                  &VT_AOT_LOAD_SYMBOL(sm_89, NAME),                        \
                  &VT_AOT_LOAD_SYMBOL(sm_90a, NAME),                       \
                  &VT_AOT_LOAD_SYMBOL(sm_100a, NAME),                      \
+                 &VT_AOT_LOAD_SYMBOL(sm_120a, NAME),                      \
                  &VT_AOT_LOAD_SYMBOL(sm_121a, NAME)})
 
 #define gdn_deltah_h48_default(...) \
@@ -5072,29 +5074,29 @@ T* EnsureGdnScratch(GdnScratchBuf& buf, size_t count, cudaStream_t s, const char
 // so concurrent first use from separate queues cannot double-load or race those
 // globals. CUDA primary-context modules are process-wide for the active device.
 struct GdnAotModuleOnce {
-  std::array<std::once_flag, 6> deltah_h48;
-  std::array<std::once_flag, 6> deltah_h32;
-  std::array<std::once_flag, 6> chunko_h48;
-  std::array<std::once_flag, 6> chunko_h32;
+  std::array<std::once_flag, 7> deltah_h48;
+  std::array<std::once_flag, 7> deltah_h32;
+  std::array<std::once_flag, 7> chunko_h48;
+  std::array<std::once_flag, 7> chunko_h32;
 #ifdef VLLM_CPP_TRITON_CHUNKO_BF16
-  std::array<std::once_flag, 6> chunko_bf16_h48;
-  std::array<std::once_flag, 6> chunko_bf16_h32;
+  std::array<std::once_flag, 7> chunko_bf16_h48;
+  std::array<std::once_flag, 7> chunko_bf16_h32;
 #endif
-  std::array<std::once_flag, 6> kkt_h48;
-  std::array<std::once_flag, 6> tril_h48;
-  std::array<std::once_flag, 6> wu_h48;
-  std::array<std::once_flag, 6> kkt_h32;
-  std::array<std::once_flag, 6> tril_h32;
-  std::array<std::once_flag, 6> wu_h32;
-  std::array<std::once_flag, 6> decode_h48;
-  std::array<std::once_flag, 6> decode_h32;
+  std::array<std::once_flag, 7> kkt_h48;
+  std::array<std::once_flag, 7> tril_h48;
+  std::array<std::once_flag, 7> wu_h48;
+  std::array<std::once_flag, 7> kkt_h32;
+  std::array<std::once_flag, 7> tril_h32;
+  std::array<std::once_flag, 7> wu_h32;
+  std::array<std::once_flag, 7> decode_h48;
+  std::array<std::once_flag, 7> decode_h32;
   // KDA chunk-prefill family (Kimi-Linear; H=32).
-  std::array<std::once_flag, 6> kda_gate_cumsum;
-  std::array<std::once_flag, 6> kda_kkt_inter;
-  std::array<std::once_flag, 6> kda_kkt_intra;
-  std::array<std::once_flag, 6> kda_wu;
-  std::array<std::once_flag, 6> kda_deltah_h32;
-  std::array<std::once_flag, 6> kda_gla_o;
+  std::array<std::once_flag, 7> kda_gate_cumsum;
+  std::array<std::once_flag, 7> kda_kkt_inter;
+  std::array<std::once_flag, 7> kda_kkt_intra;
+  std::array<std::once_flag, 7> kda_wu;
+  std::array<std::once_flag, 7> kda_deltah_h32;
+  std::array<std::once_flag, 7> kda_gla_o;
 };
 
 GdnAotModuleOnce& GdnAotModules() {
@@ -5262,10 +5264,57 @@ bool TryTritonDeltaH(cudaStream_t s, float* state, __nv_bfloat16* hstate, __nv_b
                      const __nv_bfloat16* k, const __nv_bfloat16* u, const __nv_bfloat16* w,
                      const float* gcum, const int32_t* qsl, const int32_t* boh, int64_t hk_n,
                      int64_t dk, int64_t hv_n, int64_t dv, int64_t n_seq, int64_t t_tot) {
-  if (!TritonAotAvailableOnCurrentDevice()) return false;
-  if (!GdnTritonEnvOn("VT_GDN_DELTAH_TRITON")) return false;  // default ON (see GdnTritonEnvOn); =0 restores hand path
-  if (dk != 128 || dv != 128 || hk_n != 16) return false;
-  if (hv_n != 48 && hv_n != 32) return false;
+  // DIAGNOSTIC (VT_GDN_TRITON_STATS=1, default off). A Triton-AOT A/B is worthless
+  // without proof the switch engaged: this path has FOUR independent ways to
+  // silently return false -- the build had no vendored tree for this arch, the env
+  // is =0, the head dims do not match, or hv_n is not one of the two pinned
+  // specializations. A null result under any of them looks exactly like "Triton is
+  // not faster". Counts every reason separately and prints once at exit.
+  static const bool kGdnStats = std::getenv("VT_GDN_TRITON_STATS") != nullptr;
+  static std::atomic<long long> kNoTree{0}, kEnvOff{0}, kBadDim{0}, kBadH{0}, kLaunched{0};
+  if (kGdnStats) {
+    static bool reg = false;
+    if (!reg) {
+      reg = true;
+      std::atexit([] {
+        std::fprintf(stderr,
+                     "[vt gdn] TRITON DELTA-H  launched=%lld  no-vendored-tree=%lld  "
+                     "env-off=%lld  dim-mismatch=%lld  hv_n-mismatch=%lld\n",
+                     kLaunched.load(), kNoTree.load(), kEnvOff.load(), kBadDim.load(),
+                     kBadH.load());
+        std::fflush(stderr);
+      });
+    }
+  }
+  if (!TritonAotAvailableOnCurrentDevice()) { if (kGdnStats && kNoTree.fetch_add(1) == 0) {
+      std::fprintf(stderr, "[vt gdn] TRITON DELTA-H BAILED: no-vendored-tree\n");
+      std::fflush(stderr);
+    } return false; }
+  if (!GdnTritonEnvOn("VT_GDN_DELTAH_TRITON")) {  // default ON; =0 restores hand path
+    if (kGdnStats && kEnvOff.fetch_add(1) == 0) {
+      std::fprintf(stderr, "[vt gdn] TRITON DELTA-H BAILED: env-off\n");
+      std::fflush(stderr);
+    }
+    return false;
+  }
+  if (dk != 128 || dv != 128 || hk_n != 16) { if (kGdnStats && kBadDim.fetch_add(1) == 0) {
+      std::fprintf(stderr, "[vt gdn] TRITON DELTA-H BAILED: dim-mismatch\n");
+      std::fflush(stderr);
+    } return false; }
+  if (hv_n != 48 && hv_n != 32) { if (kGdnStats && kBadH.fetch_add(1) == 0) {
+      std::fprintf(stderr, "[vt gdn] TRITON DELTA-H BAILED: hv_n-mismatch\n");
+      std::fflush(stderr);
+    } return false; }
+  // Print on the FIRST occurrence of each outcome rather than only at exit: the
+  // server runs with a hidden window and is killed, so atexit never fires and a
+  // missing stats line would be indistinguishable from "never engaged".
+  if (kGdnStats && kLaunched.fetch_add(1) == 0) {
+    std::fprintf(stderr, "[vt gdn] TRITON DELTA-H ENGAGED (first launch, hv_n=%lld)\n",
+                 static_cast<long long>(hv_n));
+    std::fflush(stderr);
+  } else if (!kGdnStats) {
+    // keep the counter meaningful when stats are off: no work, no print
+  }
   EnsureGdnDeltaHLoaded(hv_n);
   auto D = [](const void* p) { return reinterpret_cast<CUdeviceptr>(p); };
   const int32_t T = static_cast<int32_t>(t_tot);      // overwritten per-seq (IS_VARLEN)
