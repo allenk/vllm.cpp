@@ -350,12 +350,59 @@ hardware-blocked and why, is linked from [Project status](#project-status).
 |---|---|---|
 | **CUDA** | GB10 / DGX Spark (sm_121a) | Runtime-gated. 27B at/above vLLM throughput, 35B prefill-pending |
 | **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 to sm_121a) | Per-arch builds pass; ten-SM archive candidate awaits hosted cubin audit; no runtime proof here |
+| **CPU (Triton)** | x86-64 | Optional acceleration provider above the native CPU one, off unless `VLLM_CPP_TRITON_CPU` is set; kernels loaded at run time |
+| **RISC-V (RVV)** | riscv64 | Feasibility only: correct under `qemu-riscv64`, faithful to the x86 reference. No performance numbers, not in the release matrix |
 | **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis (SUPERSEDED, #1003), Arm i8mm tier |
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
-| **Vulkan** | Portable GPU | `opt-125m` STRICT token-exact; Qwen3.6-27B decode **matches llama.cpp Vulkan** (4.36 vs 4.35, denominator SUPERSEDED, #1003) |
+| **Vulkan** | Portable GPU | `opt-125m` STRICT token-exact; Qwen3.6-27B decode **matches llama.cpp Vulkan** (4.36 vs 4.35, denominator SUPERSEDED, #1003). Eight added shaders, the two `VK_NV_cooperative_matrix2` ones behind a device capability gate with a portable path; portability gated on Mesa lavapipe (8-wide subgroups) |
 | **ROCm** | AMD GPUs | Native EXL3 generation on gfx1151, matching the CPU reference. Discrete GPU correctness and competitive performance remain unverified ([evidence](.agents/specs/backend-rocm-exl3.md)) |
 | **Tenstorrent** | Blackhole | OPT-125m strict 6/6; Qwen3 gate wired, full rerun pending |
 | **Intel XPU / ANE** | Intel, Apple NPU | Spiked or roadmap |
+
+### Vulkan: NVIDIA fast paths behind a capability gate, portable by construction
+
+The Vulkan backend carries eight compute shaders beyond the portable set. Two of
+them use `VK_NV_cooperative_matrix2` -- a workgroup-scope cooperative-matrix GEMM
+with tensor addressing, and prefill attention expressed as matrix multiplies with
+the online softmax kept in cooperative matrices. The rest are portable: split-K
+decode attention and its merge pass, a gated-delta-net prefill that holds the
+recurrent state in registers, a causal conv1d forward, and a SwiGLU that takes
+gate and up as two separate tensors, which is the shape a GGUF checkpoint
+produces.
+
+**Every NVIDIA-specific path is reached only after the device is asked.** The
+cooperative-matrix-2 paths query the seven feature bits and the supported
+workgroup dimensions and decline, with a logged reason, when a shape is not
+offered; a device without them runs the portable kernels rather than failing to
+create a pipeline. Speedups from those two paths are NVIDIA hardware results and
+are not a cross-device improvement to this backend.
+
+**Portability is tested, not asserted.** The suite runs on Mesa lavapipe, whose
+subgroups are 8 wide against NVIDIA's 32. That found three memory overflows no
+NVIDIA GPU can produce: two attention kernels sized per-lane and per-split state
+from a hardcoded 32, which is simultaneously an assumption and, on NVIDIA, a
+fact. Both bounds now come from the device. On a 32-wide subgroup they
+specialize back to the values that were hardcoded, so the shared-memory
+footprint is unchanged there and the fix costs nothing on the device that was
+never broken -- measured at 0.996x with byte-identical output.
+
+### Triton on the CPU, and RISC-V
+
+A Triton-CPU acceleration provider registers above the native CPU provider and
+declines back to it for every op it does not serve, so a build that does not
+enable it is byte-identical to one without it. It is off unless
+`VLLM_CPP_TRITON_CPU` is set, loads its kernels from a shared library at run
+time, and can be turned off again in the same binary with
+`VT_OP_PROVIDER_DISABLE=triton-cpu` for an A/B. Naming: `VLLM_CPP_TRITON`
+already means the CUDA Triton-AOT cubins; these are unrelated paths.
+
+**RISC-V (RVV) is feasibility-verified, not shipped.** The compiler path
+(ONNX to a riscv64+RVV artifact) and a library path both execute correctly under
+`qemu-riscv64`, faithful to a host x86 reference. That is a functional result on
+an emulator: there are no performance numbers and there will not be until real
+silicon, so RVV is deliberately absent from the release matrix. Hand-written
+kernels for vendor matrix extensions are the direction after that, not a
+commitment.
 
 Per-arch build flags, per-op coverage, and the quantization format table:
 [docs/BUILD.md](docs/BUILD.md).
