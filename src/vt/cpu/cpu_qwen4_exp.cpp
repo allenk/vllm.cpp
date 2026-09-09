@@ -173,7 +173,7 @@ void ProjectRow(Queue& q, const Tensor& w, const float* x, int64_t out_dim,
 }
 
 void Qwen4ExpGatedResidualKernel(Queue& q, Tensor& mixed, Tensor* injection,
-                                 const Tensor& hyper, const Tensor& hc_norm_w,
+                                 const Tensor& hyper_state, const Tensor& hc_norm_w,
                                  const Tensor& mix_down, const Tensor& mix_up,
                                  const Tensor* block_inject,
                                  const Qwen4ExpGatedResidualArgs& args) {
@@ -181,7 +181,7 @@ void Qwen4ExpGatedResidualKernel(Queue& q, Tensor& mixed, Tensor* injection,
   const int64_t H = args.hidden_size;
   const int64_t R = args.lowrank;
   const int64_t flat = hc * H;
-  const int64_t T = hyper.shape[0];
+  const int64_t T = hyper_state.shape[0];
   const float eps = args.eps;
   // A TRUE division, never a reciprocal multiply. Upstream spells
   // `/ self.hc_count` and 1/hc is inexact for any hc that is not a power of two,
@@ -208,7 +208,7 @@ void Qwen4ExpGatedResidualKernel(Queue& q, Tensor& mixed, Tensor* injection,
       const int64_t g0 = j * H;
       double ss = 0.0;
       for (int64_t h = 0; h < H; ++h) {
-        const double v = LoadF32At(hyper, base + g0 + h);
+        const double v = LoadF32At(hyper_state, base + g0 + h);
         ss += v * v;
       }
       // eps is INSIDE the rsqrt, added to the MEAN SQUARE, never to the norm.
@@ -236,7 +236,7 @@ void Qwen4ExpGatedResidualKernel(Queue& q, Tensor& mixed, Tensor* injection,
       // widening isolates the reduction rather than also moving the multiplier.
       for (int64_t h = 0; h < H; ++h) {
         normed[static_cast<size_t>(g0 + h)] =
-            LoadF32At(hyper, base + g0 + h) * r *
+            LoadF32At(hyper_state, base + g0 + h) * r *
             (1.0f + LoadF32At(hc_norm_w, g0 + h));
       }
     }
@@ -293,20 +293,20 @@ void Qwen4ExpGatedResidualKernel(Queue& q, Tensor& mixed, Tensor* injection,
 // A RANK-1 UPDATE, and this loop is why it stays one. Both llama.cpp
 // implementations of this architecture materialise it as `repeat_4d` + `mul` —
 // a dense [H, hc, T] broadcast built and thrown away at 48 layers x 2 sites.
-void Qwen4ExpGatedResidualWriteBackKernel(Queue&, Tensor& hyper, const Tensor& block_out,
+void Qwen4ExpGatedResidualWriteBackKernel(Queue&, Tensor& hyper_state, const Tensor& block_out,
                                           const Tensor& injection,
                                           const Qwen4ExpGatedResidualArgs& args) {
   const int64_t hc = args.hc_count;
   const int64_t H = args.hidden_size;
   const int64_t flat = hc * H;
-  const int64_t T = hyper.shape[0];
+  const int64_t T = hyper_state.shape[0];
   for (int64_t t = 0; t < T; ++t) {
     for (int64_t j = 0; j < hc; ++j) {
       const float w = LoadF32At(injection, t * hc + j);
       const int64_t row = t * flat + j * H;
       for (int64_t h = 0; h < H; ++h) {
-        StoreF32At(hyper, row + h,
-                   LoadF32At(hyper, row + h) + LoadF32At(block_out, t * H + h) * w);
+        StoreF32At(hyper_state, row + h,
+                   LoadF32At(hyper_state, row + h) + LoadF32At(block_out, t * H + h) * w);
       }
     }
   }

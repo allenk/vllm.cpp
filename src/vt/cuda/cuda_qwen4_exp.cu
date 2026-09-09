@@ -43,7 +43,7 @@
 //
 // ─── BYTE IDENTITY, AND THE INTRINSICS IT REQUIRES ───────────────────────────
 // The host provider is pinned to `-ffp-contract=off` (CMakeLists.txt:41-56), so
-// the CPU arm evaluates `hyper + block_out * w` as a SEPARATE round-to-nearest
+// the CPU arm evaluates `hyper_state + block_out * w` as a SEPARATE round-to-nearest
 // multiply and a round-to-nearest add. nvcc's `-fmad` defaults to ON and is not
 // pinned, so `a + b * w` written plainly here would contract into a single
 // fma and produce a DIFFERENT — and slightly more accurate — answer, which is
@@ -137,17 +137,17 @@ __device__ inline void StoreAt(void* p, DTag tag, int64_t i, float v) {
 }
 
 // ---------------------------------------------------------------------------
-// vt::Qwen4ExpGatedResidualWriteBack — the rank-1 update, IN PLACE on `hyper`.
+// vt::Qwen4ExpGatedResidualWriteBack — the rank-1 update, IN PLACE on `hyper_state`.
 //
-//   hyper[t, j*H + h] += block_out[t, h] * injection[t, j]
+//   hyper_state[t, j*H + h] += block_out[t, h] * injection[t, j]
 //
-// One thread per OUTPUT element. `hyper` is `[T, hc*H]` contiguous, so the flat
-// grid index IS the `hyper` offset and the decomposition below is exact:
+// One thread per OUTPUT element. `hyper_state` is `[T, hc*H]` contiguous, so the flat
+// grid index IS the `hyper_state` offset and the decomposition below is exact:
 // `idx = t*(hc*H) + j*H + h`. Both llama.cpp implementations of this
 // architecture materialise this as `repeat_4d` + `mul` — a dense `[H, hc, T]`
 // broadcast built and thrown away 96 times a step (48 layers x 2 sites); the op
 // exists so neither arm has to, and the device arm keeps that property.
-__global__ void GatedResidualWriteBackKernel(void* hyper, DTag hyper_tag, const void* block_out,
+__global__ void GatedResidualWriteBackKernel(void* hyper_state, DTag hyper_tag, const void* block_out,
                                              DTag block_tag, const void* injection, DTag inj_tag,
                                              int64_t hc, int64_t hidden, int64_t n) {
   const int64_t flat = hc * hidden;
@@ -159,15 +159,15 @@ __global__ void GatedResidualWriteBackKernel(void* hyper, DTag hyper_tag, const 
     const int64_t j = rem / hidden;
     const int64_t h = rem - j * hidden;
     const float w = LoadAt(injection, inj_tag, t * hc + j);
-    const float base = LoadAt(hyper, hyper_tag, idx);
+    const float base = LoadAt(hyper_state, hyper_tag, idx);
     const float add = LoadAt(block_out, block_tag, t * hidden + h);
     // TWO roundings, never one fma — see the header. This is the whole reason
     // the gate can be a memcmp.
-    StoreAt(hyper, hyper_tag, idx, __fadd_rn(base, __fmul_rn(add, w)));
+    StoreAt(hyper_state, hyper_tag, idx, __fadd_rn(base, __fmul_rn(add, w)));
   }
 }
 
-void Qwen4ExpGatedResidualWriteBackKernelCuda(Queue& q, Tensor& hyper, const Tensor& block_out,
+void Qwen4ExpGatedResidualWriteBackKernelCuda(Queue& q, Tensor& hyper_state, const Tensor& block_out,
                                               const Tensor& injection,
                                               const Qwen4ExpGatedResidualArgs& args) {
   // `args.lowrank` and `args.eps` are DELIBERATELY not read. The args struct is
@@ -177,14 +177,14 @@ void Qwen4ExpGatedResidualWriteBackKernelCuda(Queue& q, Tensor& hyper, const Ten
   // would be reading a field with no meaning at this op.
   const int64_t hc = args.hc_count;
   const int64_t hidden = args.hidden_size;
-  const int64_t T = hyper.shape[0];
+  const int64_t T = hyper_state.shape[0];
   const int64_t n = T * hc * hidden;
   if (n == 0) return;  // empty-work early return, before the launch
-  const DTag hyper_tag = TagOf(hyper.dtype, "hyper");
+  const DTag hyper_tag = TagOf(hyper_state.dtype, "hyper_state");
   const DTag block_tag = TagOf(block_out.dtype, "block output");
   const DTag inj_tag = TagOf(injection.dtype, "injection");
   GatedResidualWriteBackKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(
-      hyper.data, hyper_tag, block_out.data, block_tag, injection.data, inj_tag, hc, hidden, n);
+      hyper_state.data, hyper_tag, block_out.data, block_tag, injection.data, inj_tag, hc, hidden, n);
   Check(cudaGetLastError(), "qwen4_exp_gated_residual_write_back launch");
 }
 
@@ -195,7 +195,7 @@ void Qwen4ExpGatedResidualWriteBackKernelCuda(Queue& q, Tensor& hyper, const Ten
 // is itself `Qwen4ExpTextHyperConnection.forward` (transformers v5.16.0
 // `models/qwen4_exp/modeling_qwen4_exp.py:940-971`), per token:
 //
-//   normed      = hc_norm(hyper)                 grouped RMS norm, group == H
+//   normed      = hc_norm(hyper_state)                 grouped RMS norm, group == H
 //   low         = silu( down(normed) / hc )      DIVISION 1, INSIDE the SiLU
 //   gate        = sigmoid( up(low) )             NO division here
 //   mixed[h]    = mean_j( gate[j,h] * normed[j,h] )
@@ -255,7 +255,7 @@ __device__ inline float SigmoidF(float x) {
 // STAGE 1 — the grouped RMS norm, ONE THREAD PER (token, hc stream). Each group
 // is `hidden` CONSECUTIVE elements, so no thread can see another's group, and
 // the walk is the host's ascending one.
-__global__ void HcGroupedNormKernel(float* normed, const void* hyper, DTag hyper_tag,
+__global__ void HcGroupedNormKernel(float* normed, const void* hyper_state, DTag hyper_tag,
                                     const void* hc_norm_w, DTag w_tag, int64_t T, int64_t hc,
                                     int64_t H, float eps) {
   const int64_t flat = hc * H;
@@ -270,7 +270,7 @@ __global__ void HcGroupedNormKernel(float* normed, const void* hyper, DTag hyper
     // the CPU arm rather than chosen — see the header.
     double ss = 0.0;
     for (int64_t h = 0; h < H; ++h) {
-      const double v = static_cast<double>(LoadAt(hyper, hyper_tag, base + h));
+      const double v = static_cast<double>(LoadAt(hyper_state, hyper_tag, base + h));
       ss = __dadd_rn(ss, __dmul_rn(v, v));
     }
     // eps is INSIDE the rsqrt, added to the MEAN SQUARE, never to the norm. The
@@ -286,7 +286,7 @@ __global__ void HcGroupedNormKernel(float* normed, const void* hyper, DTag hyper
       // convenience — the double above isolates the REDUCTION and must not also
       // move the multiplier.
       const float w = LoadAt(hc_norm_w, w_tag, j * H + h);
-      normed[base + h] = __fmul_rn(__fmul_rn(LoadAt(hyper, hyper_tag, base + h), r),
+      normed[base + h] = __fmul_rn(__fmul_rn(LoadAt(hyper_state, hyper_tag, base + h), r),
                                    __fadd_rn(1.0f, w));
     }
   }
@@ -362,7 +362,7 @@ Tensor ScratchF32(float* p, Device dev, int64_t rows, int64_t cols) {
 }
 
 void Qwen4ExpGatedResidualKernelCuda(Queue& q, Tensor& mixed, Tensor* injection,
-                                     const Tensor& hyper, const Tensor& hc_norm_w,
+                                     const Tensor& hyper_state, const Tensor& hc_norm_w,
                                      const Tensor& mix_down, const Tensor& mix_up,
                                      const Tensor* block_inject,
                                      const Qwen4ExpGatedResidualArgs& args) {
@@ -370,10 +370,10 @@ void Qwen4ExpGatedResidualKernelCuda(Queue& q, Tensor& mixed, Tensor* injection,
   const int64_t H = args.hidden_size;
   const int64_t R = args.lowrank;
   const int64_t flat = hc * H;
-  const int64_t T = hyper.shape[0];
+  const int64_t T = hyper_state.shape[0];
   if (T == 0 || flat == 0) return;  // empty-work early return, before any alloc
   const float hc_f = static_cast<float>(hc);
-  const DTag hyper_tag = TagOf(hyper.dtype, "hyper");
+  const DTag hyper_tag = TagOf(hyper_state.dtype, "hyper_state");
   const DTag w_tag = TagOf(hc_norm_w.dtype, "hc_norm weight");
   const DTag mixed_tag = TagOf(mixed.dtype, "mixed");
 
@@ -400,12 +400,12 @@ void Qwen4ExpGatedResidualKernelCuda(Queue& q, Tensor& mixed, Tensor* injection,
   } guard{scratch};
 
   HcGroupedNormKernel<<<GridFor(T * hc), kBlock, 0, AsStream(q)>>>(
-      d_normed, hyper.data, hyper_tag, hc_norm_w.data, w_tag, T, hc, H, args.eps);
+      d_normed, hyper_state.data, hyper_tag, hc_norm_w.data, w_tag, T, hc, H, args.eps);
   Check(cudaGetLastError(), "qwen4_exp_gated_residual norm launch");
 
-  Tensor t_normed = ScratchF32(d_normed, hyper.device, T, flat);
-  Tensor t_low = ScratchF32(d_low, hyper.device, T, R);
-  Tensor t_gate = ScratchF32(d_gate, hyper.device, T, flat);
+  Tensor t_normed = ScratchF32(d_normed, hyper_state.device, T, flat);
+  Tensor t_low = ScratchF32(d_low, hyper_state.device, T, R);
+  Tensor t_gate = ScratchF32(d_gate, hyper_state.device, T, flat);
   // `out[M,N] = a[M,K] @ b^T`, b in [N,K] row-major — the SAME orientation
   // `LinearNoBias` walks, which is ggml's src0 layout and GGUF's disk order, so
   // a block-typed weight needs no transpose (a block row cannot be transposed
@@ -424,7 +424,7 @@ void Qwen4ExpGatedResidualKernelCuda(Queue& q, Tensor& mixed, Tensor* injection,
   // that early return IS `Qwen4ExpTextModel`'s terminal `use_combine=False`
   // mixer. The dispatcher has already refused a half-specified pair.
   if (block_inject == nullptr) return;
-  Tensor t_inject = ScratchF32(d_inject, hyper.device, T, hc);
+  Tensor t_inject = ScratchF32(d_inject, hyper_state.device, T, hc);
   MatmulBT(q, t_inject, t_normed, *block_inject);
   const DTag inj_tag = TagOf(injection->dtype, "injection");
   HcInjectKernel<<<GridFor(n_inject), kBlock, 0, AsStream(q)>>>(injection->data, inj_tag,

@@ -2549,7 +2549,7 @@ void CheckQwen4ExpHc(const Qwen4ExpGatedResidualArgs& args, const char* name) {
 
 }  // namespace
 
-void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Tensor& hyper,
+void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Tensor& hyper_state,
                            const Tensor& hc_norm_w, const Tensor& mix_down,
                            const Tensor& mix_up, const Tensor* block_inject,
                            const Qwen4ExpGatedResidualArgs& args) {
@@ -2560,9 +2560,9 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
                std::to_string(args.lowrank));
   VT_CHECK(args.eps > 0.0f, std::string(name) + ": eps must be > 0");
   const int64_t flat = args.hc_count * args.hidden_size;
-  VT_CHECK(hyper.rank == 2 && hyper.shape[1] == flat,
-           std::string(name) + ": hyper must be [T, hc_count * hidden_size]");
-  const int64_t T = hyper.shape[0];
+  VT_CHECK(hyper_state.rank == 2 && hyper_state.shape[1] == flat,
+           std::string(name) + ": hyper_state must be [T, hc_count * hidden_size]");
+  const int64_t T = hyper_state.shape[0];
   VT_CHECK(mixed.rank == 2 && mixed.shape[0] == T && mixed.shape[1] == args.hidden_size,
            std::string(name) + ": mixed must be [T, hidden_size]");
   VT_CHECK(hc_norm_w.rank == 1 && hc_norm_w.shape[0] == flat,
@@ -2629,7 +2629,7 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
                  " keeps its blocks, so K must be a whole number of them");
     VT_CHECK(t.device == q.device, std::string(name) + ": " + what + " device mismatch");
   };
-  check_operand(hyper, "hyper", false);
+  check_operand(hyper_state, "hyper_state", false);
   check_operand(hc_norm_w, "hc_norm weight", false);
   check_projection(mix_down, "input_mix_weight_down");
   check_projection(mix_up, "input_mix_weight_up");
@@ -2640,18 +2640,18 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
   }
   reinterpret_cast<Qwen4ExpGatedResidualFn>(
       GetOp(OpId::kQwen4ExpGatedResidual, q.device.type))(
-      q, mixed, injection, hyper, hc_norm_w, mix_down, mix_up, block_inject, args);
+      q, mixed, injection, hyper_state, hc_norm_w, mix_down, mix_up, block_inject, args);
 }
 
-void Qwen4ExpGatedResidualWriteBack(Queue& q, Tensor& hyper, const Tensor& block_out,
+void Qwen4ExpGatedResidualWriteBack(Queue& q, Tensor& hyper_state, const Tensor& block_out,
                                     const Tensor& injection,
                                     const Qwen4ExpGatedResidualArgs& args) {
   constexpr const char* name = "qwen4_exp_gated_residual_write_back";
   CheckQwen4ExpHc(args, name);
   const int64_t flat = args.hc_count * args.hidden_size;
-  VT_CHECK(hyper.rank == 2 && hyper.shape[1] == flat,
-           std::string(name) + ": hyper must be [T, hc_count * hidden_size]");
-  const int64_t T = hyper.shape[0];
+  VT_CHECK(hyper_state.rank == 2 && hyper_state.shape[1] == flat,
+           std::string(name) + ": hyper_state must be [T, hc_count * hidden_size]");
+  const int64_t T = hyper_state.shape[0];
   VT_CHECK(block_out.rank == 2 && block_out.shape[0] == T &&
                block_out.shape[1] == args.hidden_size,
            std::string(name) + ": block output must be [T, hidden_size]");
@@ -2664,11 +2664,11 @@ void Qwen4ExpGatedResidualWriteBack(Queue& q, Tensor& hyper, const Tensor& block
     VT_CHECK(t.IsContiguous(), std::string(name) + ": " + what + " must be contiguous");
     VT_CHECK(t.device == q.device, std::string(name) + ": " + what + " device mismatch");
   };
-  check_operand(hyper, "hyper", true);
+  check_operand(hyper_state, "hyper_state", true);
   check_operand(block_out, "block output", false);
   check_operand(injection, "injection", false);
   reinterpret_cast<Qwen4ExpGatedResidualWriteBackFn>(
-      GetOp(OpId::kQwen4ExpGatedResidualWriteBack, q.device.type))(q, hyper, block_out,
+      GetOp(OpId::kQwen4ExpGatedResidualWriteBack, q.device.type))(q, hyper_state, block_out,
                                                                   injection, args);
 }
 

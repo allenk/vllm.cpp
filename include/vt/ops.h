@@ -2387,7 +2387,7 @@ using RmsNormGatedGroupFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*
 // upstream's `use_combine=False` early return (`block_inject_weight is None`,
 // modeling_qwen4_exp.py:966-967), which is the model-level mixer.
 using Qwen4ExpGatedResidualFn = void (*)(Queue&, Tensor& /*mixed*/,
-                                         Tensor* /*injection*/, const Tensor& /*hyper*/,
+                                         Tensor* /*injection*/, const Tensor& /*hyper_state*/,
                                          const Tensor& /*hc_norm_w*/,
                                          const Tensor& /*mix_down*/,
                                          const Tensor& /*mix_up*/,
@@ -2396,7 +2396,7 @@ using Qwen4ExpGatedResidualFn = void (*)(Queue&, Tensor& /*mixed*/,
 // The rank-1 write-back (vt::Qwen4ExpGatedResidualWriteBack), IN PLACE on the
 // stream.
 using Qwen4ExpGatedResidualWriteBackFn =
-    void (*)(Queue&, Tensor& /*hyper*/, const Tensor& /*block_out*/,
+    void (*)(Queue&, Tensor& /*hyper_state*/, const Tensor& /*block_out*/,
              const Tensor& /*injection*/, const Qwen4ExpGatedResidualArgs&);
 // Qwen4-Exp QSA pooled-key compressor (vt::Qwen4ExpQsaCompress): the side
 // cache's contents, one state per `compress_ratio` complete RAW keys.
@@ -3996,7 +3996,7 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 // to end, with the grouped RMS norm of `Qwen4ExpTextRMSNorm` (:167-178) at the
 // front. Per token:
 //
-//   normed[j*H+h] = hyper[j*H+h] * rsqrt(mean_h(hyper[j*H+.]^2) + eps)
+//   normed[j*H+h] = hyper_state[j*H+h] * rsqrt(mean_h(hyper_state[j*H+.]^2) + eps)
 //                                * (1 + hc_norm_w[j*H+h])    (group_size == H)
 //   low[r]        = silu( (mix_down[r] . normed) / hc )       -- DIVIDE INSIDE
 //   gate[p]       = sigmoid( mix_up[p] . low )                -- NO divide here
@@ -4030,12 +4030,12 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 // the W3 HOST reference needs (`qwen4_exp_hc.h` `GroupedRmsNorm` is vLLM's
 // `out * w` form and keeps it); it is NOT a step any caller of this op takes.
 //
-// SHAPES. hyper [T, hc*H]; hc_norm_w [hc*H]; mix_down [R, hc*H]; mix_up [hc*H, R]
+// SHAPES. hyper_state [T, hc*H]; hc_norm_w [hc*H]; mix_down [R, hc*H]; mix_up [hc*H, R]
 // (both in PyTorch `nn.Linear(bias=False)` `(out_features, in_features)` order);
 // block_inject [hc, hc*H] or nullptr; mixed [T, H]; injection [T, hc] or nullptr.
 // `injection` and `block_inject` must be null TOGETHER — a null pair is
 // upstream's `use_combine=False` mixer, which returns `mixed_input` alone.
-// `hyper` is READ ONLY and is NOT normalized in place: upstream returns the RAW
+// `hyper_state` is READ ONLY and is NOT normalized in place: upstream returns the RAW
 // stream and it is the raw stream the write-back adds to.
 //
 // PRECISION. f32 interior, per-group sum of squares accumulated in DOUBLE — the
@@ -4051,7 +4051,7 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 // dtype, and the kernel then routes that projection through `vt::MatmulBT`,
 // which dispatches `kMatmulBTQuant`. The released
 // `unsloth/Qwen3.8-Flash-Next-GGUF` stores all 194 of these mix weights as Q8_0
-// and cannot prefill otherwise. `hyper`, `hc_norm_w`, `mixed` and `injection`
+// and cannot prefill otherwise. `hyper_state`, `hc_norm_w`, `mixed` and `injection`
 // stay float and a block-typed one is refused BY NAME: the gamma is an
 // ELEMENTWISE multiplicand, which is the split llama.cpp makes for this same
 // architecture -- six projections declared `GGML_OP_MUL_MAT`
@@ -4060,7 +4060,12 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 // where a file-typed weight of this architecture meets an elementwise multiply
 // (`src/models/qwen4exp.cpp:1198-1202`). A float weight is bit-identical to
 // before: it keeps the same scalar accumulation in the same index order.
-void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Tensor& hyper,
+// NOT `hyper`. CCCL, reached through <cub/cub.cuh>, defines that identifier as
+// a macro expanding to `__int64` on Windows, so a parameter of that name
+// preprocesses to `const Tensor& __int64 ,` and every CUDA translation unit
+// that includes both cub and this header fails with "expected a )". Bisected
+// header by header, then confirmed by reading the preprocessed line.
+void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Tensor& hyper_state,
                            const Tensor& hc_norm_w, const Tensor& mix_down,
                            const Tensor& mix_up, const Tensor* block_inject,
                            const Qwen4ExpGatedResidualArgs& args);
@@ -4069,7 +4074,7 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
 // of `Qwen4ExpTextDecoderLayer.forward`:
 //   injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
 //   hidden_states = hyper_input + injection.flatten(-2)
-// i.e. `hyper[t, j*H + h] += block_out[t, h] * injection[t, j]`.
+// i.e. `hyper_state[t, j*H + h] += block_out[t, h] * injection[t, j]`.
 //
 // IT IS A RANK-1 UPDATE AND THIS OP IS WHY IT STAYS ONE. Both llama.cpp
 // implementations of this architecture materialise it as `repeat_4d` + `mul` —
@@ -4079,8 +4084,8 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
 // multiply. This op reads `block_out[t, h]` once per (j, h) and
 // `injection[t, j]` once per row.
 //
-// SHAPES. hyper [T, hc*H] (READ-WRITE); block_out [T, H]; injection [T, hc].
-void Qwen4ExpGatedResidualWriteBack(Queue& q, Tensor& hyper, const Tensor& block_out,
+// SHAPES. hyper_state [T, hc*H] (READ-WRITE); block_out [T, H]; injection [T, hc].
+void Qwen4ExpGatedResidualWriteBack(Queue& q, Tensor& hyper_state, const Tensor& block_out,
                                     const Tensor& injection,
                                     const Qwen4ExpGatedResidualArgs& args);
 

@@ -18,6 +18,7 @@
 
 #include <climits>
 #include <cstdint>
+#include <limits>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -30,7 +31,11 @@ namespace vt::cuda {
 namespace {
 
 constexpr int kBlock = 256;
-constexpr float kNegInf = -INFINITY;
+// -INFINITY rather than the macro: MSVC defines INFINITY as a double-typed
+// expression that overflows, so `constexpr float x = -INFINITY;` is rejected
+// with "floating-point value does not fit in required floating-point type".
+// The numeric_limits form is the portable spelling of the same value.
+constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 
 void Check(cudaError_t err, const char* what) {
   if (err != cudaSuccess) {
