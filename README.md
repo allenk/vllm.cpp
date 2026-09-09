@@ -350,7 +350,7 @@ hardware-blocked and why, is linked from [Project status](#project-status).
 |---|---|---|
 | **CUDA** | GB10 / DGX Spark (sm_121a) | Runtime-gated. 27B at/above vLLM throughput, 35B prefill-pending |
 | **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 to sm_121a) | Per-arch builds pass; ten-SM archive candidate awaits hosted cubin audit; no runtime proof here |
-| **CPU (Triton)** | x86-64 | Optional acceleration provider above the native CPU one, off unless `VLLM_CPP_TRITON_CPU` is set; kernels loaded at run time |
+| **CPU (Triton)** | x86-64 Linux | Optional acceleration provider above the native CPU one, off unless `VLLM_CPP_TRITON_CPU` is set. Kernels are loaded with `dlopen`, which is compiled out on Windows, so a Windows build registers the provider and declines every op |
 | **RISC-V (RVV)** | riscv64 | Feasibility only: correct under `qemu-riscv64`, faithful to the x86 reference. No performance numbers, not in the release matrix |
 | **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis (SUPERSEDED, #1003), Arm i8mm tier |
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
@@ -393,7 +393,16 @@ declines back to it for every op it does not serve, so a build that does not
 enable it is byte-identical to one without it. It is off unless
 `VLLM_CPP_TRITON_CPU` is set, loads its kernels from a shared library at run
 time, and can be turned off again in the same binary with
-`VT_OP_PROVIDER_DISABLE=triton-cpu` for an A/B. Naming: `VLLM_CPP_TRITON`
+`VT_OP_PROVIDER_DISABLE=triton-cpu` for an A/B.
+
+**It serves ops on Linux only, today.** The kernel loader is `dlopen` and is
+compiled out on Windows (`src/vt/triton_cpu/triton_cpu_provider.cpp`), so a
+Windows build with `VLLM_CPP_TRITON_CPU=1` registers the provider and then
+declines every op: correct, and identical to leaving it off. That is the
+`dlopen` rung of the linking ladder degrading exactly as designed, but it means
+a Windows CPU release carries the native provider alone. Lifting it needs
+`LoadLibrary`/`GetProcAddress` here AND a Windows toolchain that can emit the
+kernels, which is the larger half. Naming: `VLLM_CPP_TRITON`
 already means the CUDA Triton-AOT cubins; these are unrelated paths.
 
 **RISC-V (RVV) is feasibility-verified, not shipped.** The compiler path
