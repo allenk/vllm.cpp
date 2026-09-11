@@ -1780,6 +1780,12 @@ VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
   // pipeline a slightly different object from the one that was measured.
   if (kPipeStats && vk.vkGetPipelineExecutablePropertiesKHR != nullptr) {
     cpci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    // The internal representation is a SEPARATE capture bit. Statistics say
+    // how many registers the driver used; only the representation says what it
+    // emitted, which is what an instruction-count or branch-divergence claim
+    // needs. Asking for one and reading the other is how a hypothesis survives
+    // three campaigns without being tested.
+    cpci.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
   }
   // Statistics are queried right after creation, before the pipeline is used, so
   // the numbers describe the object the driver actually built for THESE
@@ -1856,6 +1862,83 @@ VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
       }
       std::fprintf(stderr, "%s\n", line.c_str());
       std::fflush(stderr);
+
+      // WHAT THE DRIVER EMITTED, not how much of it. Statistics answer "how many
+      // registers"; only the internal representation answers "what instructions",
+      // which is what an instruction-count or branch-divergence claim needs.
+      //
+      // Written to a FILE per (shader, specialization, representation): a SASS
+      // listing is megabytes, and a dump that floods the log is a dump nobody
+      // reads. Off unless VT_VULKAN_PIPELINE_IR names a directory, so the
+      // statistics path above keeps exactly its current cost.
+      const char* ir_dir = std::getenv("VT_VULKAN_PIPELINE_IR");
+      // ⚠️ An empty dump and an unasked question look identical from outside, and
+      // this campaign has already mistaken one for the other twice. So say which
+      // of the three it was -- knob unset, entry point absent, or driver
+      // answering zero -- before anyone reads "no representations" as a fact
+      // about the driver.
+      if (ir_dir == nullptr || ir_dir[0] == 0) {
+        std::fprintf(stderr, "[vt vulkan] PIPE %s  exec %u ir: "
+                             "VT_VULKAN_PIPELINE_IR unset, not asked\n",
+                     key.c_str(), e);
+        std::fflush(stderr);
+      } else if (vk.vkGetPipelineExecutableInternalRepresentationsKHR == nullptr) {
+        std::fprintf(stderr, "[vt vulkan] PIPE %s  exec %u ir: entry point absent\n",
+                     key.c_str(), e);
+        std::fflush(stderr);
+      }
+      if (ir_dir != nullptr && ir_dir[0] != 0 &&
+          vk.vkGetPipelineExecutableInternalRepresentationsKHR != nullptr) {
+        uint32_t n_ir = 0;
+        VkResult irc = vk.vkGetPipelineExecutableInternalRepresentationsKHR(
+            device, &ei, &n_ir, nullptr);
+        std::fprintf(stderr, "[vt vulkan] PIPE %s  exec %u ir: asked, rc=%d count=%u\n",
+                     key.c_str(), e, static_cast<int>(irc), n_ir);
+        std::fflush(stderr);
+        if (irc != VK_SUCCESS && irc != VK_INCOMPLETE) {
+          std::fprintf(stderr, "[vt vulkan] PIPE %s  exec %u internal-rep rc=%d\n",
+                       key.c_str(), e, static_cast<int>(irc));
+          std::fflush(stderr);
+          n_ir = 0;
+        }
+        if (n_ir != 0) {
+          std::vector<VkPipelineExecutableInternalRepresentationKHR> irs(n_ir);
+          for (auto& r : irs) {
+            r.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR;
+          }
+          // Two passes: the first fills dataSize, the second the bytes.
+          vk.vkGetPipelineExecutableInternalRepresentationsKHR(device, &ei, &n_ir,
+                                                               irs.data());
+          std::vector<std::vector<char>> bufs(n_ir);
+          for (uint32_t r = 0; r < n_ir; ++r) {
+            bufs[r].resize(irs[r].dataSize);
+            irs[r].pData = bufs[r].data();
+          }
+          vk.vkGetPipelineExecutableInternalRepresentationsKHR(device, &ei, &n_ir,
+                                                               irs.data());
+          for (uint32_t r = 0; r < n_ir; ++r) {
+            std::string stem = key + "." + std::to_string(e) + "." +
+                               std::to_string(r) + "." + irs[r].name;
+            for (char& c : stem) {
+              if (c == '/' || c == '\\' || c == ':' || c == ' ' || c == '*') c = '_';
+            }
+            const std::string path = std::string(ir_dir) + "/" + stem + ".txt";
+            std::FILE* f = std::fopen(path.c_str(), "wb");
+            if (f != nullptr) {
+              if (!bufs[r].empty()) {
+                std::fwrite(bufs[r].data(), 1, bufs[r].size(), f);
+              }
+              std::fclose(f);
+            }
+            std::fprintf(stderr,
+                         "[vt vulkan] PIPE %s  exec %u ir %u name=%s text=%d "
+                         "bytes=%zu -> %s\n",
+                         key.c_str(), e, r, irs[r].name, irs[r].isText ? 1 : 0,
+                         bufs[r].size(), path.c_str());
+            std::fflush(stderr);
+          }
+        }
+      }
     }
   }
 

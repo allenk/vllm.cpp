@@ -66,7 +66,7 @@ namespace vt::vulkan {
 // construction -- and because the caller catches and falls back, the visible
 // result was not an error but a 27B model quietly served from the CPU.
 // The use site already null-checks; the load site must match it.
-#define VT_VK_DEVICE_FUNCS_OPTIONAL(X)          X(vkGetPipelineExecutablePropertiesKHR)       X(vkGetPipelineExecutableStatisticsKHR)
+#define VT_VK_DEVICE_FUNCS_OPTIONAL(X)          X(vkGetPipelineExecutablePropertiesKHR)       X(vkGetPipelineExecutableStatisticsKHR)       X(vkGetPipelineExecutableInternalRepresentationsKHR)
 
 #define VT_VK_DEVICE_FUNCS(X)          \
   X(vkDestroyDevice)                   \
