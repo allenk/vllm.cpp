@@ -1,0 +1,29 @@
+#version 450
+// vt::MatmulBT at DECODE, the GEMV tactic -- the SUBGROUP-WIDTH module.
+//
+// Same body as vt_matmul_vec.comp (vt_matmul_vec_body.glsl); the only difference
+// is that the workgroup IS one subgroup on this part, so the end-of-dispatch
+// reduction is subgroupAdd and nothing else: gl_NumSubgroups is 1, the
+// cross-subgroup fold loops once, and the shared array holds one float per slot
+// instead of VT_TG of them.
+//
+// WHY IT EXISTS. llama.cpp builds its GEMV at two widths and picks per shape
+// (DMMV_WG_SIZE_SUBGROUP = subgroup_size, DMMV_WG_SIZE_LARGE = subgroup_size*4,
+// ggml-vulkan.cpp:5278); we had 128 hardcoded. At 128 the fold crosses four
+// subgroups and costs a shared-memory tree PER SLOT, and the slot count is the
+// batch size -- so that cost grows with concurrency, which is the shape of the
+// gap that is left against llama.cpp Vulkan: 96% of it at c=4, 90% at c=8.
+//
+// The width is a compile-time literal baked into its own module and matched by
+// the VT_TG define, per the rule in vt_common.glsl: LocalSizeId needs Vulkan 1.3
+// and this backend targets 1.1, so a host-settable width would be a knob that
+// silently corrupts. The host picks this module BY NAME.
+//
+// 32 IS THIS PART'S SUBGROUP SIZE, NOT A UNIVERSAL ONE. The host must only select
+// this module where the device reports subgroup_size == 32; on a 64-wide part it
+// would be a half-empty subgroup with the same fold cost, and the 128-wide module
+// stays the always-valid fallback.
+#extension GL_GOOGLE_include_directive : require
+#define VT_TG 32u
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+#include "vt_matmul_vec_body.glsl"

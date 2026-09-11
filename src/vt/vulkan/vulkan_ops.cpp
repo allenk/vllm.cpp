@@ -1755,10 +1755,51 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
     // Step 0 still reads exactly 0 because step 0 is the PREFILL output and
     // prefill never reaches this kernel -- the blindness teacher forcing was
     // added to remove.
-    static const uint32_t kReduce = [] {
+    static const uint32_t kReduceEnv = [] {
       const char* v = std::getenv("VT_VULKAN_GEMV_REDUCE");
       return (v != nullptr && std::strcmp(v, "1") == 0) ? 1u : 0u;
     }();
+
+    // WORKGROUP WIDTH AS A VARIANT, VT_VULKAN_GEMV_WG=32.
+    //
+    // llama.cpp builds this kernel at two widths and picks per shape
+    // (ggml-vulkan.cpp:5278: subgroup_size, or subgroup_size * 4); ours was 128,
+    // hardcoded in the shader, and never swept -- it is not in the closed-axis
+    // list, which covers tile size, tile order, K depth, K unroll x BK, epilogue
+    // store, layout hoisting, GQA head tile, the interior/edge split and BROWS.
+    //
+    // WHY IT IS A CANDIDATE FOR THE REMAINING 1.04-1.11x. At 128 the
+    // end-of-dispatch fold crosses four subgroups and costs a shared-memory tree
+    // PER SLOT, and NSLOT is the batch size -- so the cost grows with
+    // concurrency, which is the direction the gap grows (96% of llama.cpp Vulkan
+    // at c=4, 90% at c=8). VT_VULKAN_GEMV_REDUCE cannot test this: it changes how
+    // 128 invocations fold, not that there are 128 of them to fold across, which
+    // is why it measured 1.2% and no more.
+    //
+    // DEFAULT OFF, and gated on the device actually reporting a 32-wide subgroup:
+    // on a 64-wide part this module would run a half-empty subgroup and pay the
+    // same fold, and the 128-wide module is the always-valid fallback.
+    //
+    // THREE POINTS, not two. 128 is four subgroups on this part, 32 is one, and
+    // 64 is the middle: if what width buys back is the cross-subgroup fold, the
+    // curve has to be monotone, and a two-point result cannot tell that from a
+    // threshold. The 64 module is a measurement instrument first and a candidate
+    // second.
+    static const uint32_t kWantWg = [] {
+      const char* v = std::getenv("VT_VULKAN_GEMV_WG");
+      if (v == nullptr) return 128u;
+      const long n2 = std::strtol(v, nullptr, 10);
+      return (n2 == 32 || n2 == 64) ? static_cast<uint32_t>(n2) : 128u;
+    }();
+    // Both narrow modules assume the part's subgroup is 32 wide: 32 is then one
+    // subgroup and 64 is two. On a 64-wide part they would mean something else,
+    // so the 128 module stays the fallback rather than the request being honoured
+    // as written.
+    const uint32_t wg = (VulkanContext::Get().subgroup_size() == 32) ? kWantWg : 128u;
+    const bool use_sg32 = (wg != 128u);
+    // The subgroup fold is the POINT of the narrow module, so it selects the
+    // subgroup reduction rather than inheriting the default shared-memory tree.
+    const uint32_t kReduce = use_sg32 ? 1u : kReduceEnv;
     // VT_VULKAN_GEMV_BATCH -- the m > 1 axis, DEFAULT OFF (1 = old behaviour).
     //
     // At m > 1 each workgroup owns one (batch row, weight row) pair, so the SAME
@@ -1964,7 +2005,10 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
       std::snprintf(b2, sizeof(b2), "vt_matmul_vec k=%lld n=%lld", (long long)k, (long long)n);
       lbl = b2;
     }
-    Go("vt_matmul_vec", wide, p, groups, spec, 9, lbl);
+    Go(wg == 32u   ? "vt_matmul_vec_sg"
+     : wg == 64u ? "vt_matmul_vec_sg2"
+                 : "vt_matmul_vec",
+     wide, p, groups, spec, 9, lbl);
     return;
   }
 

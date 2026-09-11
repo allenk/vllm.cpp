@@ -1,0 +1,798 @@
+// vt::MatmulBT at DECODE, the GEMV tactic -- the SHARED BODY of the two
+// workgroup-width variants. Split out of vt_matmul_vec.comp on 2026-09-11,
+// following the vt_rms_norm / vt_rms_norm_wide precedent.
+//
+// WHY A SPLIT AND NOT A SPECIALIZATION CONSTANT. vt_common.glsl states the rule
+// and the measurement behind it: making VT_TG host-settable without also
+// specializing local_size_x advertises a knob that silently corrupts, because
+// LocalSizeId needs Vulkan 1.3 and this backend targets 1.1 on purpose -- on
+// llvmpipe the literal wins, every workgroup runs one thread, and cross-device
+// NMSE went from 1e-14 to 0.99. The supported mechanism is a compile-time
+// override baked into its own module, picked by NAME on the host, so a mismatch
+// is a different module rather than a different launch of the same one.
+//
+// WHAT THE VARIANTS ARE FOR. llama.cpp builds its GEMV at two workgroup widths
+// (DMMV_WG_SIZE_SUBGROUP = subgroup_size, DMMV_WG_SIZE_LARGE = subgroup_size*4)
+// and picks per shape; we had one, 128, hardcoded. At 128 the end-of-dispatch
+// reduction crosses four subgroups and costs a shared-memory tree per slot, and
+// the slot count IS the batch size -- so that cost grows with concurrency, which
+// is the shape of the remaining gap (96% of llama.cpp Vulkan at c=4, 90% at
+// c=8). At 32 the workgroup IS one subgroup and the fold is subgroupAdd alone.
+//
+// The 128-wide module is unchanged by this split and must stay byte-identical;
+// that is checked by regenerating and diffing its SPIR-V, not assumed.
+// vt::MatmulBT at DECODE — the GEMV tactic. One workgroup per output element,
+// lanes splitting K, tree-reduced.
+//
+// Structure ported from llama.cpp's mul_mat_vec.comp (a workgroup per output row,
+// lanes striding the reduction dimension, workgroup reduction at the end); the
+// per-element semantics remain our own cpu_ops.cpp MatmulChunked (:187-249), the
+// same oracle vt_matmul.comp answers to.
+//
+// WHY THIS EXISTS: COALESCING, NOT ARITHMETIC. A measured per-shader profile put
+// vt_matmul at ~55% of all GPU time in an e2e decode run, at 0.497 ms/call over
+// 792 calls. That kernel assigns one invocation per OUTPUT ELEMENT and loops K on
+// it, so for MatmulBT (b is [N,K], the torch Linear layout every model uses) lane
+// j reads b[j*k + q]. At a fixed q, adjacent lanes are k*2 bytes apart -- 2 KB for
+// a 1024-wide K. Every lane pulls its own 128-byte cache line to consume 2 bytes
+// of it, so a 128-lane workgroup fetches ~16 KB to use 256: a 64x waste of
+// bandwidth on a kernel that is entirely bandwidth-bound.
+//
+// Here lane t reads b[j*k + t], so adjacent lanes read ADJACENT addresses and the
+// same 128 lanes fetch 2 fully-used cache lines instead of 128 barely-used ones.
+// The arithmetic is identical; only the assignment of work to lanes changes.
+//
+// BT-ONLY, DELIBERATELY. In the other orientation b is [K,N] and vt_matmul reads
+// b[q*n + j] -- consecutive lanes already hit consecutive addresses, so that path
+// is ALREADY coalesced and this shape would make it strided and worse. The host
+// predicate refuses anything but MatmulBT for that reason, rather than treating
+// this as a universally better kernel.
+//
+// The four partials are combined pairwise, `(p0+p1)+(p2+p3)`, which is a fixed
+// order -- not associativity left to the compiler -- so this kernel's result is
+// reproducible run to run even though it differs from the scalar tactic's.
+//
+// ACCUMULATION ORDER CHANGES, AND THAT IS A REAL COST. vt_matmul keeps each
+// output element's whole K reduction on one lane specifically to share the CPU's
+// accumulation order rather than merely a tolerance. A tree reduction cannot: each
+// lane sums a strided subset and the partials merge pairwise, so results sit in
+// the NMSE tier against the CPU, exactly as the coopmat tactic already does. This
+// is why the tactic is gated on a token-exactness run and not on an NMSE bound
+// alone -- a decode GEMM feeds the sampler, where a changed low bit can change a
+// token.
+//
+// ------------------------------------------------------------------------------
+// TWO VARIANT AXES ON TOP OF THAT SHAPE (row BACKEND-VULKAN-GEMVROWS), both
+// specialization constants so every variant is the SAME committed module and can
+// be A/B'd inside ONE binary. A cross-build comparison is what produced a false
+// 1.2x reading for the subgroup tactic earlier in this campaign, so no variant
+// here is allowed to need a second build.
+//
+//   VT_MM_ROWS (1/2/4) -- OUTPUT ROWS PER WORKGROUP, ported from llama.cpp's
+//   NUM_ROWS (mul_mat_vec_base.glsl:90; ggml-vulkan.cpp:4749 creates the BF16
+//   mul_mat_vec pipeline with NUM_ROWS = 2). WHAT THIS CAN AND CANNOT BUY: the
+//   WEIGHT bytes are read exactly once per token either way, so DRAM traffic is
+//   UNCHANGED and this is not a traffic optimisation. What changes is (a) the
+//   activation vector, which every workgroup re-reads in full -- at k=5120,
+//   n=34816 that is 356 MB of L2 reads against 356 MB of weight reads, a 1:1
+//   request ratio that R rows cut to 1:R -- and (b) memory-level parallelism, R
+//   independent FMA chains per lane. The mechanism, if it shows, is LATENCY
+//   HIDING and L1/L2 request throughput, never bandwidth.
+//   ROWS > 1 IS BIT-IDENTICAL TO ROWS == 1: lane t still accumulates exactly the
+//   same strided subset of K for each output element, in the same order, and the
+//   halving tree below is the same shape as vt_tg_sum's. Only the ASSIGNMENT of
+//   output elements to workgroups changes. That is why it is worth trying first.
+//
+//   VT_MM_PACK (0/1/2) -- WIDE LOADS. llama.cpp reads its operands four at a time
+//   (`data_b_v4`, `dequantize4_2aligned`, dequant_funcs.glsl:54-61, which reads
+//   bf16 weights as two 32-bit words); we read one 2-byte element per lane per
+//   load. PACK 1 reads a 16-bit operand through the 32-bit view instead, two
+//   elements per load; PACK 2 reads four through a 64-bit view. Sectors per byte
+//   are unchanged (32 lanes x 4 B is still 128 contiguous bytes, x 8 B is 256), so
+//   again this cannot reduce DRAM traffic; it can only help if LSU / L1 request
+//   issue, not DRAM, is the binding constraint. It does: MEASURED on GB10 over the
+//   27B's own decode shapes, PACK 1 moved the kernel from 89.3% of the 273 GB/s
+//   roof to ~92%, which is the whole reason this axis shipped.
+//   PACK IS *NOT* BIT-IDENTICAL. Lane t accumulates {2t, 2t+1, 2t+2*VT_TG, ...}
+//   instead of {t, t+VT_TG, ...}, a different partition and therefore a different
+//   summation order -- so it is gated on the same token-exactness run as the
+//   tactic itself, not on an NMSE bound.
+//   PACK ASSUMES LITTLE-ENDIAN halves within the 32-bit word (element 2i in the
+//   low half). Every Vulkan implementation in existence is little-endian, and a
+//   violation is not subtle: the numeric checks in tests/vt/test_vulkan_backend.cpp
+//   and benchmarks/vulkan_gemv_ab.cpp would fail immediately, not drift.
+//   The host predicate refuses PACK unless BOTH operands are 16-bit, both byte
+//   offsets are 4-byte aligned and k is even; see GemvPackUsable in vulkan_ops.cpp.
+#extension GL_GOOGLE_include_directive : require
+// Requested HERE as well as in vt_common.glsl: glslang scopes an
+// #extension to the compilation unit that states it, and the subgroup
+// call added for VT_MM_REDUCE == 1 sits in this file, not the header.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "vt_common.glsl"
+
+
+layout(binding = 0) readonly buffer Ab32 { uint v[]; } A32;
+layout(binding = 1) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(binding = 2) readonly buffer Bb32 { uint v[]; } B32;
+layout(binding = 3) readonly buffer Bb16 { uint16_t v[]; } B16;
+layout(binding = 4) buffer Db32 { uint v[]; } D32;
+layout(binding = 5) buffer Db16 { uint16_t v[]; } D16;
+// A THIRD view of the two INPUT operands, as pairs of 32-bit words, for
+// VT_MM_PACK == 2: four 16-bit elements in one 8-byte load. The storage model
+// already binds each operand twice onto the same VkBuffer for exactly this reason
+// (vt_common.glsl § STORAGE MODEL) -- this is one more width of the same idea, and
+// it needs no new host allocation, only two more descriptor writes. Declared
+// unconditionally because a shader must declare every descriptor the host binds;
+// the variants that do not use them simply never read them.
+layout(binding = 6) readonly buffer Ab64 { uvec2 v[]; } A64;
+layout(binding = 7) readonly buffer Bb64 { uvec2 v[]; } B64;
+
+// Same dtype axes as vt_matmul, minus the orientation: this module is MatmulBT by
+// construction, so VT_MM_BT would only ever be 1 and is not a variant here.
+layout(constant_id = 0) const uint VT_MM_A_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_MM_B_DT = VT_DT_F32;
+layout(constant_id = 2) const uint VT_MM_OUT_DT = VT_DT_F32;
+// Unroll factor, 1 or 4. A specialization constant rather than a literal so the
+// unrolled and non-unrolled kernels are the SAME committed module and can be A/B'd
+// in one binary -- a cross-session comparison of two builds is what produced a
+// false 1.2x reading for the subgroup tactic earlier in this campaign.
+layout(constant_id = 3) const uint VT_MM_UNROLL = 4u;
+// Output elements per workgroup, 1, 2 or 4. See the header block.
+layout(constant_id = 4) const uint VT_MM_ROWS = 1u;
+// Load width for 16-bit operands: 0 = one element per load (2 B), 1 = two through
+// the 32-bit view (4 B), 2 = four through the 64-bit view (8 B). See the header.
+layout(constant_id = 5) const uint VT_MM_PACK = 0u;
+// Reduction tactic, 0 = shared-memory halving tree (default, bit-identical to
+// every earlier variant), 1 = subgroup.
+//
+// WHY IT IS BACK. The header records that "a cross-build comparison is what
+// produced a false 1.2x reading for the subgroup tactic earlier in this
+// campaign" -- so the tactic was measured invalidly and its real value was never
+// established, not that it was shown worthless. Meanwhile llama.cpp's
+// mul_mat_vec_bf16_f32_f32 reports 0 bytes of shared memory through
+// VK_KHR_pipeline_executable_properties, i.e. it reduces in the subgroup, and on
+// the same card at the same busy fraction (87%) it draws 292 W against this
+// backend's 165 W. The reduction is the one named structural difference between
+// the two kernels, so it gets a variant rather than an opinion.
+//
+// AS A SPECIALIZATION CONSTANT, for the reason the header gives: every variant
+// must live in the SAME committed module so the A/B needs no second build.
+//
+// NOT BIT-IDENTICAL, and that is the whole risk. subgroupAdd sums in an
+// implementation-defined order while the halving tree is fixed, so a low bit can
+// move; a decode GEMV feeds the sampler, where one changed bit can change a
+// token. Gate on a token-exactness run, never on speed alone.
+layout(constant_id = 6) const uint VT_MM_REDUCE = 0u;
+
+// VT_MM_BATCH -- THE DUAL OF VT_MM_ROWS, and the reason decode concurrency stalls.
+//
+// VT_MM_ROWS gives one workgroup several WEIGHT rows and reuses the ACTIVATION.
+// That helps at m == 1. At m > 1 the shape that matters is the other one: the
+// workgroup owns ONE weight row and several BATCH rows, so the weight bytes are
+// read ONCE and applied to every row in the block.
+//
+// WHY: measured 27B bf16, c=1 vs c=4, same binary. Dispatch count identical
+// (115584 vs 116724) and submit count identical (515 vs 520) -- batching works --
+// but vt_matmul_vec's ms/call went 0.0783 -> 0.2531, a 3.23x rise for 4x the
+// rows. Each workgroup owns one (batch row, weight row) pair, so at m == 4 the
+// SAME weight row is fetched four times. Decode matmul is bandwidth-bound, so the
+// weight traffic is the whole cost and it scales with m.
+//
+// DEFAULT 1 (off). At 1 every index below is identical to the old code.
+layout(constant_id = 7) const uint VT_MM_BATCH = 1u;
+
+// VT_MM_BROWS -- the SECOND tile axis, and the one the batch work was missing.
+//
+// Traffic per output is proportional to 1/R + 1/B for a workgroup owning R weight
+// rows and B batch rows: the weight rows are read once for all B, the activation
+// rows once for all R. Pushing only B leaves the activation side unamortised, and
+// once B is large the activations ARE the traffic -- at R=1,B=8 a workgroup reads
+// eight activation rows (80 KB at k=5120 bf16) to use one weight row (10 KB).
+//
+//     R=1 B=4   accumulators 4   traffic 1.250
+//     R=1 B=8   accumulators 8   traffic 1.125   <- what B-only reaches
+//     R=2 B=4   accumulators 8   traffic 0.750   <- same registers, 1.5x less
+//
+// The model was checked against the two arms already measured at c=8: it predicts
+// a 0.900 ratio between them and 0.799 was measured, so it is directionally right
+// and slightly conservative.
+//
+// The R*B accumulators reuse the same eight slots, indexed b*R + r.
+// DEFAULT 1, which is exactly the B-only path.
+layout(constant_id = 8) const uint VT_MM_BROWS = 1u;
+
+// Slots are the accumulator sets. The two axes are mutually exclusive: the host
+// picks ROWS for m == 1 and BATCH for m > 1, never both.
+// Slots are the accumulator sets, and the 2D tile uses BATCH * BROWS of them.
+// Getting this wrong is silent and total: the reduction folds only the first
+// NSLOT sets, so with NSLOT under-counted the remaining sets are never reduced
+// and the store reads whatever was left in shared memory. Measured symptom when
+// it was BATCH alone: 5 of 8 sequences produced garbage from the first token,
+// which is what distinguishes a structural bug from a float-order one -- a
+// changed association gives adjacent token ids and coherent text, not 79999.
+#define VT_MM_NSLOT (VT_MM_BROWS > 1u ? (VT_MM_BATCH * VT_MM_BROWS)                                                    : (VT_MM_BATCH > 1u ? VT_MM_BATCH                                                                   : VT_MM_ROWS))
+
+layout(push_constant) uniform Params {
+  uint m;
+  uint n;
+  uint k;
+  uint a_off;
+  uint b_off;
+  uint out_off;
+} p;
+
+// One lane-partial slot per (row, lane). Sized for the largest VT_MM_ROWS rather
+// than by the specialization constant: 4*128 floats is 2 KB, far below the point
+// where shared memory caps occupancy for a 128-thread workgroup, and a fixed
+// extent keeps the declaration independent of the variant.
+// Sized for the largest VT_MM_BATCH (8) rather than by the specialization
+// constant. 8*128 floats is 4 KB; the 4-slot version noted 2 KB was far below the
+// point where shared memory caps occupancy for a 128-thread workgroup, and 4 KB
+// still is on this part. A fixed extent keeps the declaration variant-independent.
+shared float vt_mmv_part[8u * VT_TG];
+
+#define VT_MMV_A(I) VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, (I))
+#define VT_MMV_B(I) VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, (I))
+// Packed access: `I` is the index of the FIRST of two consecutive 16-bit
+// elements and must be EVEN; the byte offset must be 4-byte aligned. Both are
+// host predicates, not shader assumptions.
+#define VT_MMV_A2(I) (A32.v[(p.a_off >> 2) + ((I) >> 1)])
+#define VT_MMV_B2(I) (B32.v[(p.b_off >> 2) + ((I) >> 1)])
+// Quad access: `I` must be a multiple of FOUR and the byte offset a multiple of
+// eight. Host predicates again, not shader assumptions.
+#define VT_MMV_A4(I) (A64.v[(p.a_off >> 3) + ((I) >> 2)])
+#define VT_MMV_B4(I) (B64.v[(p.b_off >> 3) + ((I) >> 2)])
+#define VT_LO(W, DT) vt_from16((W) & 0xFFFFu, (DT))
+#define VT_HI(W, DT) vt_from16((W) >> 16, (DT))
+
+// Four consecutive 16-bit elements out of one 8-byte word, and their dot product
+// with four activations. The pairwise bracketing is written out rather than left
+// to the compiler for the same reason the (p0+p1)+(p2+p3) merge below is: a fixed
+// order makes this kernel reproducible run to run.
+vec4 vt_mmv_unpack4(uvec2 w, uint dt) {
+  return vec4(VT_LO(w.x, dt), VT_HI(w.x, dt), VT_LO(w.y, dt), VT_HI(w.y, dt));
+}
+float vt_mmv_dot4(uvec2 w, vec4 a, uint dt) {
+  return (a.x * VT_LO(w.x, dt) + a.y * VT_HI(w.x, dt)) +
+         (a.z * VT_LO(w.y, dt) + a.w * VT_HI(w.y, dt));
+}
+
+// One row's four unrolled scalar products, at the original VT_TG stride.
+// The dual of VT_MMV_FMA4: the WEIGHT quad is hoisted into bq0..bq3 by the caller
+// and shared, while the activation row varies per slot.
+// One (weight-pair x batch-quad) step of the 2D tile, into partial slot P of each
+// of the eight accumulator sets. Slot (b, r) is r{b*2+r}; P selects which of that
+// set's four partials, matching the reference path's VT_TG-strided layout exactly.
+#define VT_MMV_2D_STEP(P, QI)                                                      {                                                                                  const uint off_ = (QI) << 2;                                                     uvec2 w0_ = VT_MMV_B4(b0 + off_);                                                uvec2 w1_ = VT_MMV_B4(b1 + off_);                                                vec4 a0_ = vt_mmv_unpack4(VT_MMV_A4(ar0 + off_), VT_MM_A_DT);                    VT_MMV_2D_PAIR(P, r0, r1, w0_, w1_, a0_)                                         if (i0 + 1u < p.m) {                                                               vec4 a1_ = vt_mmv_unpack4(VT_MMV_A4(ar1 + off_), VT_MM_A_DT);                    VT_MMV_2D_PAIR(P, r2, r3, w0_, w1_, a1_)                                       }                                                                                if (i0 + 2u < p.m) {                                                               vec4 a2_ = vt_mmv_unpack4(VT_MMV_A4(ar2 + off_), VT_MM_A_DT);                    VT_MMV_2D_PAIR(P, r4, r5, w0_, w1_, a2_)                                       }                                                                                if (i0 + 3u < p.m) {                                                               vec4 a3_ = vt_mmv_unpack4(VT_MMV_A4(ar3 + off_), VT_MM_A_DT);                    VT_MMV_2D_PAIR(P, r6, r7, w0_, w1_, a3_)                                       }                                                                              }
+
+#define VT_MMV_2D_PAIR(P, RA, RB, W0, W1, AV)                                      RA##p##P += vt_mmv_dot4(W0, AV, VT_MM_B_DT);                                     if (jb + 1u < p.n) { RB##p##P += vt_mmv_dot4(W1, AV, VT_MM_B_DT); }
+
+// Quad dual: the weight vec4s are hoisted by the caller; only the activation row
+// varies per slot.
+#define VT_MMV_BQ4(P0, P1, P2, P3, AROW)                                          P0 += vt_mmv_dot4(bw0, vt_mmv_unpack4(VT_MMV_A4((AROW) + (qi << 2)), VT_MM_A_DT), VT_MM_B_DT);   P1 += vt_mmv_dot4(bw1, vt_mmv_unpack4(VT_MMV_A4((AROW) + ((qi + VT_TG) << 2)), VT_MM_A_DT), VT_MM_B_DT);   P2 += vt_mmv_dot4(bw2, vt_mmv_unpack4(VT_MMV_A4((AROW) + ((qi + VT_TG * 2u) << 2)), VT_MM_A_DT), VT_MM_B_DT);   P3 += vt_mmv_dot4(bw3, vt_mmv_unpack4(VT_MMV_A4((AROW) + ((qi + VT_TG * 3u) << 2)), VT_MM_A_DT), VT_MM_B_DT)
+
+#define VT_MMV_BFMA4(P0, P1, P2, P3, AROW)              P0 += VT_MMV_A((AROW) + q) * bq0;                     P1 += VT_MMV_A((AROW) + q + VT_TG) * bq1;             P2 += VT_MMV_A((AROW) + q + VT_TG * 2u) * bq2;        P3 += VT_MMV_A((AROW) + q + VT_TG * 3u) * bq3
+
+#define VT_MMV_FMA4(P0, P1, P2, P3, BROW)             \
+  P0 += a0 * VT_MMV_B((BROW) + q);                    \
+  P1 += a1 * VT_MMV_B((BROW) + q + VT_TG);            \
+  P2 += a2 * VT_MMV_B((BROW) + q + VT_TG * 2u);       \
+  P3 += a3 * VT_MMV_B((BROW) + q + VT_TG * 3u)
+
+// One row's four unrolled PACKED products: eight elements, four loads.
+#define VT_MMV_PFMA4(P0, P1, P2, P3, BROW)                                     \
+  {                                                                            \
+    uint w0_ = VT_MMV_B2((BROW) + (pi << 1));                                  \
+    uint w1_ = VT_MMV_B2((BROW) + ((pi + VT_TG) << 1));                        \
+    uint w2_ = VT_MMV_B2((BROW) + ((pi + VT_TG * 2u) << 1));                   \
+    uint w3_ = VT_MMV_B2((BROW) + ((pi + VT_TG * 3u) << 1));                   \
+    P0 += a0lo * VT_LO(w0_, VT_MM_B_DT) + a0hi * VT_HI(w0_, VT_MM_B_DT);       \
+    P1 += a1lo * VT_LO(w1_, VT_MM_B_DT) + a1hi * VT_HI(w1_, VT_MM_B_DT);       \
+    P2 += a2lo * VT_LO(w2_, VT_MM_B_DT) + a2hi * VT_HI(w2_, VT_MM_B_DT);       \
+    P3 += a3lo * VT_LO(w3_, VT_MM_B_DT) + a3hi * VT_HI(w3_, VT_MM_B_DT);       \
+  }
+
+// One row's four unrolled QUAD products: sixteen elements, four 8-byte loads.
+#define VT_MMV_QFMA4(P0, P1, P2, P3, BROW)                                     \
+  {                                                                            \
+    uvec2 w0_ = VT_MMV_B4((BROW) + (qi << 2));                                 \
+    uvec2 w1_ = VT_MMV_B4((BROW) + ((qi + VT_TG) << 2));                       \
+    uvec2 w2_ = VT_MMV_B4((BROW) + ((qi + VT_TG * 2u) << 2));                  \
+    uvec2 w3_ = VT_MMV_B4((BROW) + ((qi + VT_TG * 3u) << 2));                  \
+    P0 += vt_mmv_dot4(w0_, a0v, VT_MM_B_DT);                                   \
+    P1 += vt_mmv_dot4(w1_, a1v, VT_MM_B_DT);                                   \
+    P2 += vt_mmv_dot4(w2_, a2v, VT_MM_B_DT);                                   \
+    P3 += vt_mmv_dot4(w3_, a3v, VT_MM_B_DT);                                   \
+  }
+
+void main() {
+  // WORKGROUP -> OUTPUT ELEMENTS. With VT_MM_ROWS == 1 this is exactly
+  // vt_matmul's flat gid, so the two tactics write the same element for the same
+  // index. With VT_MM_ROWS > 1 the workgroup owns VT_MM_ROWS CONSECUTIVE output
+  // elements; the host only selects that when m == 1 and n % VT_MM_ROWS == 0, so
+  // the block never straddles two output rows and there is no ragged tail to
+  // branch on inside the loop.
+  uint tid = gl_LocalInvocationID.x;
+  uint base = gl_WorkGroupID.x * VT_MM_ROWS;
+  if (base >= p.m * p.n) { return; }
+  uint i = base / p.n;   // output row
+  uint j0 = base % p.n;  // first output column owned by this workgroup
+
+  uint a_row = i * p.k;
+  uint b0 = j0 * p.k;  // MatmulBT: b is [N,K] row-major
+  uint b1 = b0 + p.k;
+  uint b2 = b1 + p.k;
+  uint b3 = b2 + p.k;
+
+  // BATCH MODE re-reads the same flat gid differently: the workgroup owns weight
+  // row (gid % n) and the batch block (gid / n). ar0..ar3 are the activation rows
+  // of that block; b0 stays the single weight row every slot shares.
+  uint ib = 0u, jb = 0u, i0 = 0u;
+  uint ar0 = 0u, ar1 = 0u, ar2 = 0u, ar3 = 0u;
+  uint ar4 = 0u, ar5 = 0u, ar6 = 0u, ar7 = 0u;
+  if (VT_MM_BATCH > 1u) {
+    jb = gl_WorkGroupID.x % p.n;
+    ib = gl_WorkGroupID.x / p.n;
+    i0 = ib * VT_MM_BATCH;
+    if (i0 >= p.m) { return; }
+    b0 = jb * p.k;
+    // 2D TILE: the workgroup owns VT_MM_BROWS consecutive weight rows starting at
+    // jb, and VT_MM_BATCH consecutive batch rows starting at i0. jb is already a
+    // BLOCK index in that case, so it is scaled here.
+    if (VT_MM_BROWS > 1u) {
+      const uint jblocks = (p.n + VT_MM_BROWS - 1u) / VT_MM_BROWS;
+      jb = (gl_WorkGroupID.x % jblocks) * VT_MM_BROWS;
+      ib = gl_WorkGroupID.x / jblocks;
+      i0 = ib * VT_MM_BATCH;
+      if (i0 >= p.m || jb >= p.n) { return; }
+      b0 = jb * p.k;
+      b1 = b0 + p.k;
+    }
+    ar0 = i0 * p.k;
+    ar1 = ar0 + p.k;
+    ar2 = ar1 + p.k;
+    ar3 = ar2 + p.k;
+    ar4 = ar3 + p.k;
+    ar5 = ar4 + p.k;
+    ar6 = ar5 + p.k;
+    ar7 = ar6 + p.k;
+  }
+
+  // Strided by VT_TG so adjacent lanes touch adjacent elements -- the whole point.
+  //
+  // FOUR-WAY UNROLL, for MEMORY-LEVEL PARALLELISM rather than fewer instructions.
+  // With one load per lane per iteration, each lane has a single outstanding read
+  // and the loop stalls on it; the memory system is idle most of the time, which
+  // is why this kernel sat at a third of the bandwidth roof. Four independent
+  // accumulators let four reads per lane be in flight at once, and nothing in the
+  // chain depends on the previous iteration.
+  //
+  // The strides stay VT_TG apart so every one of the four loads is still
+  // coalesced across the workgroup -- the unroll adds concurrency WITHOUT giving
+  // up the access pattern the tactic exists for.
+  //
+  // The accumulators are SPELLED OUT rather than held in a `float[4][4]` because
+  // an array indexed by a specialization constant is not guaranteed to stay in
+  // registers; a spill to scratch memory on the hottest kernel in decode would be
+  // silent and would swamp everything this row is trying to measure. The
+  // `VT_MM_ROWS >= r` guards fold away once the constant is specialized.
+  float r0p0 = 0.0, r0p1 = 0.0, r0p2 = 0.0, r0p3 = 0.0;
+  float r1p0 = 0.0, r1p1 = 0.0, r1p2 = 0.0, r1p3 = 0.0;
+  float r2p0 = 0.0, r2p1 = 0.0, r2p2 = 0.0, r2p3 = 0.0;
+  float r3p0 = 0.0, r3p1 = 0.0, r3p2 = 0.0, r3p3 = 0.0;
+  // Slots 4..7 exist only for VT_MM_BATCH == 8. Spelled out for the same reason
+  // as 0..3: an array indexed by a specialization constant is not guaranteed to
+  // stay in registers, and a spill on the hottest kernel in decode would be
+  // silent. The VT_MM_BATCH >= 8 guards fold away once the constant is set.
+  float r4p0 = 0.0, r4p1 = 0.0, r4p2 = 0.0, r4p3 = 0.0;
+  float r5p0 = 0.0, r5p1 = 0.0, r5p2 = 0.0, r5p3 = 0.0;
+  float r6p0 = 0.0, r6p1 = 0.0, r6p2 = 0.0, r6p3 = 0.0;
+  float r7p0 = 0.0, r7p1 = 0.0, r7p2 = 0.0, r7p3 = 0.0;
+
+  if (VT_MM_BATCH > 1u) {
+    // WEIGHT LOADED ONCE, applied to every batch row in the block. Deliberately
+    // the SCALAR access pattern regardless of VT_MM_PACK: correctness first, and
+    // the packing axis optimises ACTIVATION loads, while the cost this branch
+    // exists to remove is WEIGHT traffic. If this wins, packing it is a follow-up
+    // with its own A/B, not something to fold in unmeasured.
+    //
+    // Lane t still accumulates exactly the same strided subset of K for each
+    // output element, in the same order as VT_MM_ROWS == 1, so a slot's result is
+    // bit-identical to the single-row kernel's.
+    // QUAD variant of the batch branch, selected by the same VT_MM_PACK the
+    // single-row path uses. The weight QUAD is unpacked ONCE and reused by every
+    // batch row, so this keeps the whole point of the branch while moving the
+    // same bytes in a quarter as many load instructions.
+    //
+    // ⚠️ ACCUMULATION ORDER: a lane's unit here is four CONSECUTIVE elements,
+    // where the scalar body strides by VT_TG. That is a different partition of K,
+    // so bit-identity with the scalar batch body is NOT structural -- it is
+    // whatever the gate measures. Same situation the PACK axis already has for
+    // VT_MM_ROWS.
+    if (VT_MM_BROWS > 1u && VT_MM_PACK == 2u) {
+      // R=2 x B=4. Two weight quads and four activation quads per unrolled step
+      // feed eight accumulator sets; slot (b,r) is r{b*2+r}. Same eight sets the
+      // B=8 arm uses, so the register budget is unchanged and only the traffic
+      // moves.
+      // FOUR UNROLL SLOTS, and they are not an optimisation here -- they are the
+      // CORRECTNESS requirement. The reference path accumulates each output into
+      // rXp0..rXp3 strided by VT_TG and folds (p0+p1)+(p2+p3); collapsing that
+      // into one partial changes the association and the result. The first
+      // version of this branch did exactly that and the gate caught it: token ids
+      // differed at both concurrencies. Same class of mistake as reaching for
+      // GLSL dot() earlier -- the accumulation STRUCTURE changed without being
+      // noticed.
+      const uint quads = p.k >> 2;
+      const uint qstep = VT_TG * 4u;
+      uint qi = tid;
+      for (; qi + VT_TG * 3u < quads; qi += qstep) {
+        VT_MMV_2D_STEP(0, qi)
+        VT_MMV_2D_STEP(1, qi + VT_TG)
+        VT_MMV_2D_STEP(2, qi + VT_TG * 2u)
+        VT_MMV_2D_STEP(3, qi + VT_TG * 3u)
+      }
+      for (; qi < quads; qi += VT_TG) { VT_MMV_2D_STEP(0, qi) }
+    } else if (VT_MM_PACK == 2u) {
+      const uint quads = p.k >> 2;
+      const uint qstep = VT_TG * VT_MM_UNROLL;
+      uint qi = tid;
+      for (; VT_MM_UNROLL == 4u && qi + VT_TG * 3u < quads; qi += qstep) {
+        // Kept PACKED. vt_mmv_dot4 spells its pairing out --
+        // (a.x*w0 + a.y*w1) + (a.z*w2 + a.w*w3) -- precisely so the order is not
+        // left to the compiler; unpacking here and calling dot() threw that away
+        // and MEASURED a 0.13% token divergence against the single-row path.
+        uvec2 bw0 = VT_MMV_B4(b0 + (qi << 2));
+        uvec2 bw1 = VT_MMV_B4(b0 + ((qi + VT_TG) << 2));
+        uvec2 bw2 = VT_MMV_B4(b0 + ((qi + VT_TG * 2u) << 2));
+        uvec2 bw3 = VT_MMV_B4(b0 + ((qi + VT_TG * 3u) << 2));
+        VT_MMV_BQ4(r0p0, r0p1, r0p2, r0p3, ar0);
+        if (VT_MM_BATCH >= 2u && i0 + 1u < p.m) { VT_MMV_BQ4(r1p0, r1p1, r1p2, r1p3, ar1); }
+        if (VT_MM_BATCH >= 4u) {
+          if (i0 + 2u < p.m) { VT_MMV_BQ4(r2p0, r2p1, r2p2, r2p3, ar2); }
+          if (i0 + 3u < p.m) { VT_MMV_BQ4(r3p0, r3p1, r3p2, r3p3, ar3); }
+        }
+        if (VT_MM_BATCH >= 8u) {
+          if (i0 + 4u < p.m) { VT_MMV_BQ4(r4p0, r4p1, r4p2, r4p3, ar4); }
+          if (i0 + 5u < p.m) { VT_MMV_BQ4(r5p0, r5p1, r5p2, r5p3, ar5); }
+          if (i0 + 6u < p.m) { VT_MMV_BQ4(r6p0, r6p1, r6p2, r6p3, ar6); }
+          if (i0 + 7u < p.m) { VT_MMV_BQ4(r7p0, r7p1, r7p2, r7p3, ar7); }
+        }
+      }
+      for (; qi < quads; qi += VT_TG) {
+        uvec2 bw = VT_MMV_B4(b0 + (qi << 2));
+        r0p0 += vt_mmv_dot4(bw, vt_mmv_unpack4(VT_MMV_A4(ar0 + (qi << 2)), VT_MM_A_DT), VT_MM_B_DT);
+        if (VT_MM_BATCH >= 2u && i0 + 1u < p.m) {
+          r1p0 += vt_mmv_dot4(bw, vt_mmv_unpack4(VT_MMV_A4(ar1 + (qi << 2)), VT_MM_A_DT), VT_MM_B_DT);
+        }
+        if (VT_MM_BATCH >= 4u) {
+          if (i0 + 2u < p.m) { r2p0 += vt_mmv_dot4(bw, vt_mmv_unpack4(VT_MMV_A4(ar2 + (qi << 2)), VT_MM_A_DT), VT_MM_B_DT); }
+          if (i0 + 3u < p.m) { r3p0 += vt_mmv_dot4(bw, vt_mmv_unpack4(VT_MMV_A4(ar3 + (qi << 2)), VT_MM_A_DT), VT_MM_B_DT); }
+        }
+        if (VT_MM_BATCH >= 8u) {
+          if (i0 + 4u < p.m) { r4p0 += vt_mmv_dot4(bw, vt_mmv_unpack4(VT_MMV_A4(ar4 + (qi << 2)), VT_MM_A_DT), VT_MM_B_DT); }
+          if (i0 + 5u < p.m) { r5p0 += vt_mmv_dot4(bw, vt_mmv_unpack4(VT_MMV_A4(ar5 + (qi << 2)), VT_MM_A_DT), VT_MM_B_DT); }
+          if (i0 + 6u < p.m) { r6p0 += vt_mmv_dot4(bw, vt_mmv_unpack4(VT_MMV_A4(ar6 + (qi << 2)), VT_MM_A_DT), VT_MM_B_DT); }
+          if (i0 + 7u < p.m) { r7p0 += vt_mmv_dot4(bw, vt_mmv_unpack4(VT_MMV_A4(ar7 + (qi << 2)), VT_MM_A_DT), VT_MM_B_DT); }
+        }
+      }
+    } else {
+    const uint step = VT_TG * VT_MM_UNROLL;
+    uint q = tid;
+    for (; VT_MM_UNROLL == 4u && q + VT_TG * 3u < p.k; q += step) {
+      float bq0 = VT_MMV_B(b0 + q);
+      float bq1 = VT_MMV_B(b0 + q + VT_TG);
+      float bq2 = VT_MMV_B(b0 + q + VT_TG * 2u);
+      float bq3 = VT_MMV_B(b0 + q + VT_TG * 3u);
+      VT_MMV_BFMA4(r0p0, r0p1, r0p2, r0p3, ar0);
+      if (VT_MM_BATCH >= 2u && i0 + 1u < p.m) { VT_MMV_BFMA4(r1p0, r1p1, r1p2, r1p3, ar1); }
+      if (VT_MM_BATCH >= 4u) {
+        if (i0 + 2u < p.m) { VT_MMV_BFMA4(r2p0, r2p1, r2p2, r2p3, ar2); }
+        if (i0 + 3u < p.m) { VT_MMV_BFMA4(r3p0, r3p1, r3p2, r3p3, ar3); }
+      }
+      if (VT_MM_BATCH >= 8u) {
+        if (i0 + 4u < p.m) { VT_MMV_BFMA4(r4p0, r4p1, r4p2, r4p3, ar4); }
+        if (i0 + 5u < p.m) { VT_MMV_BFMA4(r5p0, r5p1, r5p2, r5p3, ar5); }
+        if (i0 + 6u < p.m) { VT_MMV_BFMA4(r6p0, r6p1, r6p2, r6p3, ar6); }
+        if (i0 + 7u < p.m) { VT_MMV_BFMA4(r7p0, r7p1, r7p2, r7p3, ar7); }
+      }
+    }
+    for (; q < p.k; q += VT_TG) {
+      float bq = VT_MMV_B(b0 + q);
+      r0p0 += VT_MMV_A(ar0 + q) * bq;
+      if (VT_MM_BATCH >= 2u && i0 + 1u < p.m) { r1p0 += VT_MMV_A(ar1 + q) * bq; }
+      if (VT_MM_BATCH >= 4u) {
+        if (i0 + 2u < p.m) { r2p0 += VT_MMV_A(ar2 + q) * bq; }
+        if (i0 + 3u < p.m) { r3p0 += VT_MMV_A(ar3 + q) * bq; }
+      }
+      if (VT_MM_BATCH >= 8u) {
+        if (i0 + 4u < p.m) { r4p0 += VT_MMV_A(ar4 + q) * bq; }
+        if (i0 + 5u < p.m) { r5p0 += VT_MMV_A(ar5 + q) * bq; }
+        if (i0 + 6u < p.m) { r6p0 += VT_MMV_A(ar6 + q) * bq; }
+        if (i0 + 7u < p.m) { r7p0 += VT_MMV_A(ar7 + q) * bq; }
+      }
+    }
+    }
+  } else if (VT_MM_PACK == 2u) {
+    // QUAD: the lane's unit of work is FOUR consecutive elements in one 8-byte
+    // load. k % 4 == 0 by host predicate, so the quad count is exact and there is
+    // no ragged element left over. Across a 32-lane subgroup one load instruction
+    // still covers 256 CONSECUTIVE bytes, so the coalescing the tactic exists for
+    // is untouched; what changes is that a quarter as many load instructions move
+    // the same bytes.
+    const uint quads = p.k >> 2;
+    const uint qstep = VT_TG * VT_MM_UNROLL;
+    uint qi = tid;
+    for (; VT_MM_UNROLL == 4u && qi + VT_TG * 3u < quads; qi += qstep) {
+      vec4 a0v = vt_mmv_unpack4(VT_MMV_A4(a_row + (qi << 2)), VT_MM_A_DT);
+      vec4 a1v = vt_mmv_unpack4(VT_MMV_A4(a_row + ((qi + VT_TG) << 2)), VT_MM_A_DT);
+      vec4 a2v = vt_mmv_unpack4(VT_MMV_A4(a_row + ((qi + VT_TG * 2u) << 2)), VT_MM_A_DT);
+      vec4 a3v = vt_mmv_unpack4(VT_MMV_A4(a_row + ((qi + VT_TG * 3u) << 2)), VT_MM_A_DT);
+      VT_MMV_QFMA4(r0p0, r0p1, r0p2, r0p3, b0)
+      if (VT_MM_ROWS >= 2u) VT_MMV_QFMA4(r1p0, r1p1, r1p2, r1p3, b1)
+      if (VT_MM_NSLOT >= 4u) {
+        VT_MMV_QFMA4(r2p0, r2p1, r2p2, r2p3, b2)
+        VT_MMV_QFMA4(r3p0, r3p1, r3p2, r3p3, b3)
+      }
+    }
+    for (; qi < quads; qi += VT_TG) {
+      vec4 a0v = vt_mmv_unpack4(VT_MMV_A4(a_row + (qi << 2)), VT_MM_A_DT);
+      r0p0 += vt_mmv_dot4(VT_MMV_B4(b0 + (qi << 2)), a0v, VT_MM_B_DT);
+      if (VT_MM_NSLOT >= 2u) {
+        r1p0 += vt_mmv_dot4(VT_MMV_B4(b1 + (qi << 2)), a0v, VT_MM_B_DT);
+      }
+      if (VT_MM_NSLOT >= 4u) {
+        r2p0 += vt_mmv_dot4(VT_MMV_B4(b2 + (qi << 2)), a0v, VT_MM_B_DT);
+        r3p0 += vt_mmv_dot4(VT_MMV_B4(b3 + (qi << 2)), a0v, VT_MM_B_DT);
+      }
+    }
+  } else if (VT_MM_PACK == 0u) {
+    const uint step = VT_TG * VT_MM_UNROLL;
+    uint q = tid;
+    for (; VT_MM_UNROLL == 4u && q + VT_TG * 3u < p.k; q += step) {
+      // The activation element is loaded ONCE per lane per unrolled slot and
+      // reused by every row this workgroup owns -- the whole point of VT_MM_ROWS.
+      float a0 = VT_MMV_A(a_row + q);
+      float a1 = VT_MMV_A(a_row + q + VT_TG);
+      float a2 = VT_MMV_A(a_row + q + VT_TG * 2u);
+      float a3 = VT_MMV_A(a_row + q + VT_TG * 3u);
+      VT_MMV_FMA4(r0p0, r0p1, r0p2, r0p3, b0);
+      if (VT_MM_NSLOT >= 2u) { VT_MMV_FMA4(r1p0, r1p1, r1p2, r1p3, b1); }
+      if (VT_MM_NSLOT >= 4u) {
+        VT_MMV_FMA4(r2p0, r2p1, r2p2, r2p3, b2);
+        VT_MMV_FMA4(r3p0, r3p1, r3p2, r3p3, b3);
+      }
+    }
+    // Tail: whatever the unrolled body could not cover, at the original stride. K is
+    // not required to be a multiple of 4*VT_TG, and truncating it would silently
+    // drop dot-product terms.
+    for (; q < p.k; q += VT_TG) {
+      float a0 = VT_MMV_A(a_row + q);
+      r0p0 += a0 * VT_MMV_B(b0 + q);
+      if (VT_MM_NSLOT >= 2u) { r1p0 += a0 * VT_MMV_B(b1 + q); }
+      if (VT_MM_NSLOT >= 4u) {
+        r2p0 += a0 * VT_MMV_B(b2 + q);
+        r3p0 += a0 * VT_MMV_B(b3 + q);
+      }
+    }
+  } else {
+    // PACKED: the lane's unit of work is a PAIR of consecutive elements, so the
+    // loop counts pairs. k is even by host predicate, so there is no odd element
+    // left over and the pair count is exact.
+    const uint pairs = p.k >> 1;
+    const uint pstep = VT_TG * VT_MM_UNROLL;
+    uint pi = tid;
+    for (; VT_MM_UNROLL == 4u && pi + VT_TG * 3u < pairs; pi += pstep) {
+      uint av0 = VT_MMV_A2(a_row + (pi << 1));
+      uint av1 = VT_MMV_A2(a_row + ((pi + VT_TG) << 1));
+      uint av2 = VT_MMV_A2(a_row + ((pi + VT_TG * 2u) << 1));
+      uint av3 = VT_MMV_A2(a_row + ((pi + VT_TG * 3u) << 1));
+      float a0lo = VT_LO(av0, VT_MM_A_DT), a0hi = VT_HI(av0, VT_MM_A_DT);
+      float a1lo = VT_LO(av1, VT_MM_A_DT), a1hi = VT_HI(av1, VT_MM_A_DT);
+      float a2lo = VT_LO(av2, VT_MM_A_DT), a2hi = VT_HI(av2, VT_MM_A_DT);
+      float a3lo = VT_LO(av3, VT_MM_A_DT), a3hi = VT_HI(av3, VT_MM_A_DT);
+      VT_MMV_PFMA4(r0p0, r0p1, r0p2, r0p3, b0)
+      if (VT_MM_ROWS >= 2u) VT_MMV_PFMA4(r1p0, r1p1, r1p2, r1p3, b1)
+      if (VT_MM_NSLOT >= 4u) {
+        VT_MMV_PFMA4(r2p0, r2p1, r2p2, r2p3, b2)
+        VT_MMV_PFMA4(r3p0, r3p1, r3p2, r3p3, b3)
+      }
+    }
+    for (; pi < pairs; pi += VT_TG) {
+      uint av0 = VT_MMV_A2(a_row + (pi << 1));
+      float alo = VT_LO(av0, VT_MM_A_DT), ahi = VT_HI(av0, VT_MM_A_DT);
+      uint w0 = VT_MMV_B2(b0 + (pi << 1));
+      r0p0 += alo * VT_LO(w0, VT_MM_B_DT) + ahi * VT_HI(w0, VT_MM_B_DT);
+      if (VT_MM_NSLOT >= 2u) {
+        uint w1 = VT_MMV_B2(b1 + (pi << 1));
+        r1p0 += alo * VT_LO(w1, VT_MM_B_DT) + ahi * VT_HI(w1, VT_MM_B_DT);
+      }
+      if (VT_MM_NSLOT >= 4u) {
+        uint w2 = VT_MMV_B2(b2 + (pi << 1));
+        uint w3 = VT_MMV_B2(b3 + (pi << 1));
+        r2p0 += alo * VT_LO(w2, VT_MM_B_DT) + ahi * VT_HI(w2, VT_MM_B_DT);
+        r3p0 += alo * VT_LO(w3, VT_MM_B_DT) + ahi * VT_HI(w3, VT_MM_B_DT);
+      }
+    }
+  }
+
+  // VT_MM_ROWS INDEPENDENT halving trees, interleaved so the whole block costs
+  // log2(VT_TG) barriers rather than VT_MM_ROWS times that. The per-tree
+  // arithmetic is the same shape and the same order as vt_common.glsl's
+  // vt_tg_sum -- leading barrier, store, barrier, halve -- which is what makes
+  // VT_MM_ROWS > 1 bit-identical to VT_MM_ROWS == 1 rather than merely close.
+  // vt_tg_sum itself cannot be reused: it owns a single VT_TG-wide array and
+  // would serialise the trees.
+  const float lane0 = (r0p0 + r0p1) + (r0p2 + r0p3);
+  const float lane1 = VT_MM_NSLOT >= 2u ? (r1p0 + r1p1) + (r1p2 + r1p3) : 0.0;
+  const float lane2 = VT_MM_NSLOT >= 4u ? (r2p0 + r2p1) + (r2p2 + r2p3) : 0.0;
+  const float lane3 = VT_MM_NSLOT >= 4u ? (r3p0 + r3p1) + (r3p2 + r3p3) : 0.0;
+  const float lane4 = VT_MM_NSLOT >= 8u ? (r4p0 + r4p1) + (r4p2 + r4p3) : 0.0;
+  const float lane5 = VT_MM_NSLOT >= 8u ? (r5p0 + r5p1) + (r5p2 + r5p3) : 0.0;
+  const float lane6 = VT_MM_NSLOT >= 8u ? (r6p0 + r6p1) + (r6p2 + r6p3) : 0.0;
+  const float lane7 = VT_MM_NSLOT >= 8u ? (r7p0 + r7p1) + (r7p2 + r7p3) : 0.0;
+
+  if (VT_MM_REDUCE == 1u) {
+    // SUBGROUP TACTIC. Each subgroup folds its own lanes with subgroupAdd, which
+    // costs no shared memory and no barrier; only the cross-subgroup step needs
+    // shared state, so the whole reduction is TWO barriers instead of the tree's
+    // log2(VT_TG) + 2. Slots are laid out [row][subgroup] in the same array, so
+    // the shared allocation does not grow.
+    const float g0 = subgroupAdd(lane0);
+    const float g1 = subgroupAdd(lane1);
+    const float g2 = subgroupAdd(lane2);
+    const float g3 = subgroupAdd(lane3);
+    const float g4 = subgroupAdd(lane4);
+    const float g5 = subgroupAdd(lane5);
+    const float g6 = subgroupAdd(lane6);
+    const float g7 = subgroupAdd(lane7);
+    barrier();
+    if (subgroupElect()) {
+      vt_mmv_part[gl_SubgroupID] = g0;
+      if (VT_MM_NSLOT >= 2u) { vt_mmv_part[VT_TG + gl_SubgroupID] = g1; }
+      if (VT_MM_NSLOT >= 4u) {
+        vt_mmv_part[VT_TG * 2u + gl_SubgroupID] = g2;
+        vt_mmv_part[VT_TG * 3u + gl_SubgroupID] = g3;
+      }
+      if (VT_MM_NSLOT >= 8u) {
+        vt_mmv_part[VT_TG * 4u + gl_SubgroupID] = g4;
+        vt_mmv_part[VT_TG * 5u + gl_SubgroupID] = g5;
+        vt_mmv_part[VT_TG * 6u + gl_SubgroupID] = g6;
+        vt_mmv_part[VT_TG * 7u + gl_SubgroupID] = g7;
+      }
+    }
+    barrier();
+    if (tid == 0u) {
+      // ★ SLOTS 4..7 WERE WRITTEN AND NEVER FOLDED. The block above stores all
+      // eight partials per subgroup under `VT_MM_NSLOT >= 8u`, but this
+      // cross-subgroup fold declared four accumulators and stopped at
+      // `>= 4u` -- so with the shipped default BATCH=8 (NSLOT=8) batch rows 4..7
+      // read ONE subgroup's partial instead of the sum over all of them. At 128
+      // threads and 32-lane subgroups that is four subgroups, so those four rows
+      // came out roughly 4x too small.
+      //
+      // It measured NMSE 0.22-0.65 against the shared-memory tree under teacher
+      // forcing, and that reading was written up as "the subgroup variant is
+      // unusable, pure risk at zero gain". It was a four-line omission, and the
+      // variant it condemned is the one named structural difference from
+      // llama.cpp's Vulkan GEMV, which reduces in the subgroup and reports zero
+      // bytes of shared memory.
+      //
+      // Found by an independent reviewer reading this function; the campaign that
+      // produced the NMSE never opened it, because a distance metric answers "is
+      // it different" and only the source answers "why".
+      float t0 = 0.0, t1 = 0.0, t2 = 0.0, t3 = 0.0;
+      float t4 = 0.0, t5 = 0.0, t6 = 0.0, t7 = 0.0;
+      for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+        t0 += vt_mmv_part[i];
+        if (VT_MM_NSLOT >= 2u) { t1 += vt_mmv_part[VT_TG + i]; }
+        if (VT_MM_NSLOT >= 4u) {
+          t2 += vt_mmv_part[VT_TG * 2u + i];
+          t3 += vt_mmv_part[VT_TG * 3u + i];
+        }
+        if (VT_MM_NSLOT >= 8u) {
+          t4 += vt_mmv_part[VT_TG * 4u + i];
+          t5 += vt_mmv_part[VT_TG * 5u + i];
+          t6 += vt_mmv_part[VT_TG * 6u + i];
+          t7 += vt_mmv_part[VT_TG * 7u + i];
+        }
+      }
+      vt_mmv_part[0] = t0;
+      if (VT_MM_NSLOT >= 2u) { vt_mmv_part[VT_TG] = t1; }
+      if (VT_MM_NSLOT >= 4u) {
+        vt_mmv_part[VT_TG * 2u] = t2;
+        vt_mmv_part[VT_TG * 3u] = t3;
+      }
+      if (VT_MM_NSLOT >= 8u) {
+        vt_mmv_part[VT_TG * 4u] = t4;
+        vt_mmv_part[VT_TG * 5u] = t5;
+        vt_mmv_part[VT_TG * 6u] = t6;
+        vt_mmv_part[VT_TG * 7u] = t7;
+      }
+    }
+  } else {
+  barrier();
+  vt_mmv_part[tid] = lane0;
+  if (VT_MM_NSLOT >= 2u) { vt_mmv_part[VT_TG + tid] = lane1; }
+  if (VT_MM_NSLOT >= 4u) {
+    vt_mmv_part[VT_TG * 2u + tid] = lane2;
+    vt_mmv_part[VT_TG * 3u + tid] = lane3;
+  }
+  if (VT_MM_NSLOT >= 8u) {
+    vt_mmv_part[VT_TG * 4u + tid] = lane4;
+    vt_mmv_part[VT_TG * 5u + tid] = lane5;
+    vt_mmv_part[VT_TG * 6u + tid] = lane6;
+    vt_mmv_part[VT_TG * 7u + tid] = lane7;
+  }
+  barrier();
+  for (uint s = VT_TG / 2u; s > 0u; s >>= 1) {
+    if (tid < s) {
+      vt_mmv_part[tid] += vt_mmv_part[tid + s];
+      if (VT_MM_NSLOT >= 2u) { vt_mmv_part[VT_TG + tid] += vt_mmv_part[VT_TG + tid + s]; }
+      if (VT_MM_NSLOT >= 4u) {
+        vt_mmv_part[VT_TG * 2u + tid] += vt_mmv_part[VT_TG * 2u + tid + s];
+        vt_mmv_part[VT_TG * 3u + tid] += vt_mmv_part[VT_TG * 3u + tid + s];
+      }
+      if (VT_MM_NSLOT >= 8u) {
+        vt_mmv_part[VT_TG * 4u + tid] += vt_mmv_part[VT_TG * 4u + tid + s];
+        vt_mmv_part[VT_TG * 5u + tid] += vt_mmv_part[VT_TG * 5u + tid + s];
+        vt_mmv_part[VT_TG * 6u + tid] += vt_mmv_part[VT_TG * 6u + tid + s];
+        vt_mmv_part[VT_TG * 7u + tid] += vt_mmv_part[VT_TG * 7u + tid + s];
+      }
+    }
+    barrier();
+  }
+  }
+  if (tid != 0u) { return; }
+  // OUTPUT INDEX. ROWS mode owns consecutive flat elements, so base + r is right.
+  // BATCH mode owns one COLUMN across several rows, and those are n apart -- and
+  // the last block may be ragged, so every slot past the first is guarded against
+  // m. Writing base + r here would silently scribble into the neighbouring
+  // column.
+  // 2D TILE STORE. Slot (b, r) is accumulator b*R + r and lands at
+  // (i0 + b) * n + (jb + r). Handled before the 1D paths because its stride is
+  // neither 1 (consecutive outputs) nor n (a column across rows) -- it is both,
+  // and reusing either would scatter results into the wrong cells silently.
+  if (VT_MM_BROWS > 1u) {
+    if (tid == 0u) {
+      for (uint b = 0u; b < VT_MM_BATCH; ++b) {
+        if (i0 + b >= p.m) { break; }
+        for (uint r = 0u; r < VT_MM_BROWS; ++r) {
+          if (jb + r >= p.n) { break; }
+          const uint slot = b * VT_MM_BROWS + r;
+          VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, (i0 + b) * p.n + jb + r,
+                   vt_mmv_part[VT_TG * slot]);
+        }
+      }
+    }
+    return;
+  }
+  const uint o0 = (VT_MM_BATCH > 1u) ? (i0 * p.n + jb) : base;
+  const uint ostep = (VT_MM_BATCH > 1u) ? p.n : 1u;
+  VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, o0, vt_mmv_part[0]);
+  if (VT_MM_NSLOT >= 2u && (VT_MM_BATCH == 1u || i0 + 1u < p.m)) {
+    VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, o0 + ostep, vt_mmv_part[VT_TG]);
+  }
+  if (VT_MM_NSLOT >= 4u) {
+    if (VT_MM_BATCH == 1u || i0 + 2u < p.m) {
+      VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, o0 + ostep * 2u, vt_mmv_part[VT_TG * 2u]);
+    }
+    if (VT_MM_BATCH == 1u || i0 + 3u < p.m) {
+      VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, o0 + ostep * 3u, vt_mmv_part[VT_TG * 3u]);
+    }
+  }
+  if (VT_MM_NSLOT >= 8u) {
+    if (i0 + 4u < p.m) {
+      VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, o0 + ostep * 4u, vt_mmv_part[VT_TG * 4u]);
+    }
+    if (i0 + 5u < p.m) {
+      VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, o0 + ostep * 5u, vt_mmv_part[VT_TG * 5u]);
+    }
+    if (i0 + 6u < p.m) {
+      VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, o0 + ostep * 6u, vt_mmv_part[VT_TG * 6u]);
+    }
+    if (i0 + 7u < p.m) {
+      VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, o0 + ostep * 7u, vt_mmv_part[VT_TG * 7u]);
+    }
+  }
+}

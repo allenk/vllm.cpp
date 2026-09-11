@@ -1,0 +1,17 @@
+#version 450
+// vt::MatmulBT at DECODE, the GEMV tactic -- the TWO-SUBGROUP module.
+//
+// Same body as the other two widths (vt_matmul_vec_body.glsl). It exists to put
+// a third point on the width curve rather than to be a candidate default: 128 is
+// four subgroups and 32 is one, and if the cost that width buys back is the
+// cross-subgroup fold then 64 must land between them. A two-point result cannot
+// tell a monotone effect from a threshold one, and the mechanism claim depends on
+// which it is.
+//
+// 64 IS TWO SUBGROUPS ON THIS PART, where subgroup_size is 32. The host selects
+// by name and only where that holds; on a 64-wide part this module would be one
+// subgroup and would mean something different.
+#extension GL_GOOGLE_include_directive : require
+#define VT_TG 64u
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#include "vt_matmul_vec_body.glsl"
