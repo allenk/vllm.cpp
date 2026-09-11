@@ -123,6 +123,34 @@ void Bt16Avx512(const float* af, const void* bv, int64_t k, float* acc) {
   }
 }
 
+// Attention's per-key dot (ElemDotRows16Fn). Bt16Avx512 with its 16 weight rows
+// replaced by 16 key rows from a paged cache: the rows arrive as pointers rather
+// than one contiguous stride, and after the transpose r[j] holds element e+j
+// across the 16 keys. Lane l accumulates q[e] * K_l[e] over e in strict
+// increasing order, mul then add -- the scalar pass-1 loop of
+// cpu_paged_attn.cpp for one key, sixteen keys at a time.
+template <ElemKind K>
+void DotRows16Avx512(const float* q, const void* const* rows, int64_t d, float* out) {
+  using T = typename ElemZ<K>::T;
+  __m512 A = _mm512_setzero_ps();
+  int64_t e = 0;
+  for (; e + 16 <= d; e += 16) {
+    __m512 r[16];
+    for (int l = 0; l < 16; ++l) r[l] = LoadX16<K>(static_cast<const T*>(rows[l]) + e);
+    Transpose16(r);
+    for (int j = 0; j < 16; ++j) {
+      A = _mm512_add_ps(A, _mm512_mul_ps(r[j], _mm512_set1_ps(q[e + j])));
+    }
+  }
+  _mm512_storeu_ps(out, A);
+  for (; e < d; ++e) {
+    const float qv = q[e];
+    for (int l = 0; l < kElemLanes; ++l) {
+      out[l] += qv * ElemZ<K>::Cvt(static_cast<const T*>(rows[l])[e]);
+    }
+  }
+}
+
 // [K,N] orientation: the 16 outputs are already contiguous per p, no transpose.
 template <ElemKind K>
 void Nk16Avx512(const float* af, const void* bv, int64_t k, int64_t n, float* acc) {
@@ -216,6 +244,9 @@ void FillAvx512Tier(ElemGemmTierTable* t) {
   t->nkm[kF32i] = &NkM6Avx512<ElemKind::kF32>;
   t->nkm[kF16i] = &NkM6Avx512<ElemKind::kF16>;
   t->nkm[kBF16i] = &NkM6Avx512<ElemKind::kBF16>;
+  t->dot16[kF32i] = &DotRows16Avx512<ElemKind::kF32>;
+  t->dot16[kF16i] = &DotRows16Avx512<ElemKind::kF16>;
+  t->dot16[kBF16i] = &DotRows16Avx512<ElemKind::kBF16>;
   t->mr = kMrAvx512;
   t->name = "avx512";
 }

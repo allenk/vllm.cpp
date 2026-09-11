@@ -75,11 +75,23 @@ using ElemBtMFn = void (*)(const float* af, int64_t a_stride, const void* b, int
 using ElemNkMFn = void (*)(const float* af, int64_t a_stride, const void* b, int64_t k,
                            int64_t n, float* acc);
 
+// Attention's per-key dot product, vectorized ACROSS KEYS:
+//   out[l] = sum_e q[e] * K_l[e]    for 16 key rows
+// The same invariant as ElemBt16Fn with keys in the role of weight rows: lane l
+// is key l and accumulates over e in strict increasing order, mul then add, so
+// every output equals the scalar loop's bit for bit. The rows arrive as element
+// pointers because a paged K/V cache does not store consecutive positions at
+// one contiguous stride. Only the float cache encodings have one.
+using ElemDotRows16Fn = void (*)(const float* q, const void* const* rows, int64_t d,
+                                 float* out);
+
 struct ElemGemmTierTable {
   ElemBt16Fn bt[static_cast<int>(ElemKind::kCount)];
   ElemNk16Fn nk[static_cast<int>(ElemKind::kCount)];
   ElemBtMFn btm[static_cast<int>(ElemKind::kCount)];
   ElemNkMFn nkm[static_cast<int>(ElemKind::kCount)];
+  // Null on tiers that do not provide it; the caller keeps its scalar loop.
+  ElemDotRows16Fn dot16[static_cast<int>(ElemKind::kCount)];
   int mr;  // activation rows per btm/nkm call (1 = no M blocking)
   const char* name;
 };

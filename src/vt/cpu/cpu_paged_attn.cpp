@@ -173,6 +173,23 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   const void* k_base = k_cache.data;
   const void* v_base = v_cache.data;
   const KvKind kv_kind = kv_fp8 ? KvKind::kFp8 : KvKindOf(k_cache.dtype);
+  // PASS 1 ACROSS KEYS. Profiled at prefill (1024-token prompts, c=8, bf16 cache)
+  // this kernel took 50.1% of all CPU samples, and 60.3% of its own samples sat
+  // in the scalar dot below: one bf16 element widened, multiplied and added at a
+  // time, because a strictly ordered reduction is not something the compiler may
+  // reorder. The order is what makes it bit-identical, so it stays. What moves is
+  // the WIDTH: sixteen keys run side by side, each still summing e = 0..d-1 in
+  // order (ElemDotRows16Fn, the matmul tiers' own lane invariant). Resolved once
+  // per call. Null keeps the scalar loop: tiers without the kernel,
+  // VT_CPU_MATMUL_TIER=ref, and the fp8 cache.
+  ElemDotRows16Fn dot16 = nullptr;
+  if (!ElemGemmUseRef() && kv_kind != KvKind::kFp8) {
+    const ElemKind ek = kv_kind == KvKind::kF32   ? ElemKind::kF32
+                        : kv_kind == KvKind::kF16 ? ElemKind::kF16
+                                                  : ElemKind::kBF16;
+    dot16 = ElemGemmTier().dot16[static_cast<int>(ek)];
+  }
+  const size_t kv_esize = SizeOf(k_cache.dtype);
   // Query rows are widened with the shared `WidenRowToF32`; its byte cursor and
   // element size are the flat element indexing the per-element load did. An f32
   // query is already its own widened form — `WidenRowToF32` would `memcpy` it
@@ -240,7 +257,29 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
           const float* q = qtok + h * d;  // == &query[(t*hq+h)*d], as f32
           // Pass 1: scores + running max.
           float m = -std::numeric_limits<float>::infinity();
-          for (int64_t j = jmin; j <= jmax; ++j) {
+          int64_t j1 = jmin;  // pass-1 cursor: key groups advance it, the scalar tail resumes from it
+          if (dot16 != nullptr) {
+            const void* rows[kElemLanes];
+            float dots[kElemLanes];
+            for (; j1 + kElemLanes - 1 <= jmax; j1 += kElemLanes) {
+              for (int l = 0; l < kElemLanes; ++l) {
+                const int64_t jl = j1 + l;
+                const int64_t blk = btab[r * bt_row + (jl / block_size) * bt_col];
+                const int64_t kbase = blk * kc_blk + (jl % block_size) * kc_pg + g * kc_hd;
+                rows[l] = static_cast<const uint8_t*>(k_base) + static_cast<size_t>(kbase) * kv_esize;
+              }
+              dot16(q, rows, d, dots);
+              // Scale, cap and running max in j order, as the scalar loop does.
+              for (int l = 0; l < kElemLanes; ++l) {
+                float dot = dots[l];
+                dot *= scale;
+                if (softcap > 0.0f) dot = softcap * std::tanh(dot / softcap);
+                probs[static_cast<size_t>(j1 + l - jmin)] = dot;
+                if (dot > m) m = dot;
+              }
+            }
+          }
+          for (int64_t j = j1; j <= jmax; ++j) {
             const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
             const int64_t off = j % block_size;
             const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;

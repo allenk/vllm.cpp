@@ -198,8 +198,16 @@ uint32_t NextRand(uint32_t& s) {  // xorshift32; no <random> implementation drif
   return s;
 }
 
+// FULL-MANTISSA operands in [-1, 1). This used to be `NextRand(s) % 2048u` / 1024
+// - 1: multiples of 1/1024, eleven significant bits. The product of two such
+// values is EXACT in f32, so a kernel that fuses mul+add into FMA rounds exactly
+// like one that does not, and this gate could not see the one trade the lane
+// invariant forbids: an across-keys pass 1 sabotaged to use FMA passed all 244
+// assertions. 24 random mantissa bits make f32 x f32 products inexact, so the
+// rounding of each product is part of what memcmp compares.
 float RandUnit(uint32_t& s) {
-  return static_cast<float>(NextRand(s) % 2048u) / 1024.0f - 1.0f;  // [-1, 1)
+  const float u = static_cast<float>(NextRand(s) >> 8) / 16777216.0f;  // [0, 1), 24 bits
+  return 2.0f * u - 1.0f;
 }
 
 // Storage bytes for `src` at `dt`. f32/f16/bf16 round-trip the value; kI8 is
@@ -374,6 +382,45 @@ std::vector<Case> Cases() {
   softcap.args = PagedAttentionArgs{0.35f, true};
   softcap.args.logits_soft_cap = 50.0f;
   cs.push_back(softcap);
+
+  // THE ACROSS-KEYS PASS 1 NEEDS SHAPES THE CASES ABOVE NEVER REACH. It runs
+  // sixteen keys per call and sixteen elements per vector, and every case above
+  // has d <= 16 and at most 12 keys, so none of them enters its vector loop more
+  // than trivially and none of them reaches either tail. d = 40 is two full
+  // element blocks plus an 8-element tail; 37 keys is two key groups plus a
+  // 5-key tail; block_size 5 puts every group across block boundaries.
+  Case wide;
+  wide.name = "wide head d=40, 37 keys across blocks";
+  wide.qsl = {0, 37};
+  wide.seq_lens = {37};
+  wide.d = 40;
+  wide.block_size = 5;
+  wide.max_blocks = 8;
+  wide.args = PagedAttentionArgs{0.35f, true};
+  cs.push_back(wide);
+
+  Case wide_varlen;  // a 20-token prefill and a decode at seq_len 35, same width
+  wide_varlen.name = "wide varlen batch (prefill 20 + decode at 35)";
+  wide_varlen.num_reqs = 2;
+  wide_varlen.qsl = {0, 20, 21};
+  wide_varlen.seq_lens = {20, 35};
+  wide_varlen.d = 40;
+  wide_varlen.block_size = 5;
+  wide_varlen.max_blocks = 7;
+  wide_varlen.args = PagedAttentionArgs{0.35f, true};
+  cs.push_back(wide_varlen);
+
+  Case wide_window;  // a 19-key band: one key group plus a tail, with the cap on
+  wide_window.name = "wide window left=18 with logits_soft_cap 50";
+  wide_window.qsl = {0, 37};
+  wide_window.seq_lens = {37};
+  wide_window.d = 40;
+  wide_window.block_size = 5;
+  wide_window.max_blocks = 8;
+  wide_window.args = PagedAttentionArgs{0.35f, true};
+  wide_window.args.window_size = AttentionWindow{18, 0};
+  wide_window.args.logits_soft_cap = 50.0f;
+  cs.push_back(wide_window);
 
   return cs;
 }
