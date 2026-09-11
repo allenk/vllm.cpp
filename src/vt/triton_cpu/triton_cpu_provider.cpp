@@ -756,6 +756,36 @@ class ScopedOpTimer {
 //     i8mm interleave, `q8_0_aligned` for the CUDA layout, `elem_kn_repacked` for a
 //     [N,K]-shaped tensor whose bytes are [K,N]). A kernel that reads the shape and
 //     ignores those flags reads the right extents out of the wrong bytes.
+// ⭐ THE M CEILING, AND WHY IT IS A KNOB RATHER THAN A CONSTANT.
+//
+// This kernel is a GEMV: BM is 1, one grid cell computes one output row, and the
+// weight tile it walks is re-walked for every row. The handwritten AVX-512 path is
+// M-blocked at MR=8 and shares one 16x16 register transpose across eight rows, so
+// as M grows it amortises what this kernel cannot.
+//
+// Measured, matrix axis vs a decode-heavy axis, same two configurations:
+//   1024 in / 128 out   0.814 -> 1.031 CPU-s/token   +30%
+//    128 in / 512 out   0.574 -> 0.586               +2%, inside noise
+// So the whole cost of enabling this op lives on the large-M (prefill) calls, and
+// at M=1 it is a peer of the handwritten path.
+//
+// Default is unlimited, which is exactly today's behaviour: turning this into a
+// shipping default would change every published CPU figure, so the value has to be
+// swept first and chosen deliberately. MR=8 makes 8 the obvious candidate and
+// "obvious" is not a measurement.
+std::int64_t MmMaxM() {
+  static const std::int64_t v = [] {
+    const char* e = std::getenv("VLLM_CPP_TRITON_CPU_MM_MAX_M");
+    if (e == nullptr || e[0] == '\0') return static_cast<std::int64_t>(INT64_MAX);
+    char* end = nullptr;
+    const long long n = std::strtoll(e, &end, 10);
+    if (end == e || n <= 0) return static_cast<std::int64_t>(INT64_MAX);
+    std::fprintf(stderr, "[triton-cpu] MatmulBT M ceiling: %lld\n", n);
+    return static_cast<std::int64_t>(n);
+  }();
+  return v;
+}
+
 bool MatmulBTGateOk(const Tensor& out, const Tensor& a, const Tensor& b) {
   if (a.repacked || a.q8_0_aligned || a.elem_kn_repacked) return false;
   if (b.repacked || b.q8_0_aligned || b.elem_kn_repacked) return false;
@@ -766,6 +796,7 @@ bool MatmulBTGateOk(const Tensor& out, const Tensor& a, const Tensor& b) {
   const std::int64_t M = a.shape[0], K = a.shape[1];
   const std::int64_t N = b.shape[0];
   if (M <= 0 || N <= 0 || K <= 0) return false;
+  if (M > MmMaxM()) return false;                          // see MmMaxM()
   if (out.shape[0] != M || out.shape[1] != N || b.shape[1] != K) return false;
   if (N % 16 != 0 || K % 16 != 0) return false;             // see (1)
   if (M > INT32_MAX || N > INT32_MAX || K > INT32_MAX) return false;
