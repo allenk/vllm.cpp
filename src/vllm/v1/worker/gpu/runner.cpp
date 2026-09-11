@@ -5556,7 +5556,22 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   void* dev_ids = slot->device_sampled_ids;
   vt::Tensor dev_ids_t = vt::Tensor::Contiguous(
       dev_ids, vt::DType::kI64, dev, {static_cast<int64_t>(num_reqs)});
-  (void)sampler_.forward(queue_, logits, sm, &dev_ids_t);
+  // ⚠️ The return value is NOT discardable, and discarding it was a silent
+  // defect: the sampler gathers logprobs here exactly as the synchronous leg
+  // does, and dropping SamplerOutput dropped them. Async scheduling is DEFAULT
+  // ON (async_runner_flag.h, the 2026-07-17 flip), so this leg -- not the
+  // synchronous one at sample_tokens -- is the production path, and
+  // /v1/completions answered every logprobs request with arrays of the right
+  // length whose values were all null. Prompt logprobs kept working throughout
+  // because they are collected into `skeleton` above, which is why the symptom
+  // looked like a serialization bug rather than a dropped output.
+  //
+  // Only the logprobs are taken: the sampled IDS stay device-resident on this
+  // leg by design (the async output owns the single D2H), so `sampled_token_ids`
+  // here is intentionally empty and must not be copied into the skeleton.
+  SamplerOutput async_sampler_output =
+      sampler_.forward(queue_, logits, sm, &dev_ids_t);
+  skeleton.logprobs = std::move(async_sampler_output.logprobs_tensors);
 
   // post_update (input_batch.py:457-543 post_update / states.py): record this
   // step's last sampled id per req_state so the NEXT step's
