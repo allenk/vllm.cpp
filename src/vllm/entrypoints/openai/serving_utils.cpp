@@ -20,8 +20,72 @@ namespace {
 // `token_id:N` placeholder when detokenization was disabled (decoded_token is
 // None) — our serving layer holds no tokenizer, so this stands in for the
 // `tokenizer.decode([token_id])` branch (recorded deviation).
+// A single token decoded ON ITS OWN is not necessarily valid UTF-8: a byte-level
+// BPE vocabulary contains tokens that are FRAGMENTS of a multi-byte character,
+// and decoding one in isolation yields a partial sequence. Measured on
+// Qwen3.6-27B: the second-ranked candidate at one position decoded to the two
+// bytes e2 80, the lead of a three-byte sequence.
+//
+// That is fatal downstream, and it was fatal in the least visible way. The
+// completions payload uses the decoded token as a JSON OBJECT KEY, the JSON
+// writer refuses invalid UTF-8, and the throw happens while the response is
+// being serialized -- OUTSIDE the endpoint's own try/catch. The caller saw HTTP
+// 500 with an EMPTY body and the server logged nothing at all.
+//
+// Upstream's semantics are `errors="replace"` (Utf8Bytes below already says so
+// in its own comment), so replacing each invalid byte with U+FFFD is the port of
+// the existing behaviour rather than a new policy. The header's note that "the
+// U+FFFD byte-fallback stitching is not ported" is this gap.
+std::string SanitizeUtf8(const std::string& in) {
+  static const char kRepl[] = "\xEF\xBF\xBD";  // U+FFFD
+  std::string out;
+  out.reserve(in.size());
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(in.data());
+  const std::size_t n = in.size();
+  std::size_t i = 0;
+  while (i < n) {
+    const unsigned char c = p[i];
+    int len = 0;
+    std::uint32_t cp = 0;
+    if (c < 0x80) {
+      len = 1; cp = c;
+    } else if ((c & 0xE0) == 0xC0) {
+      len = 2; cp = c & 0x1Fu;
+    } else if ((c & 0xF0) == 0xE0) {
+      len = 3; cp = c & 0x0Fu;
+    } else if ((c & 0xF8) == 0xF0) {
+      len = 4; cp = c & 0x07u;
+    } else {
+      out += kRepl; ++i; continue;          // stray continuation or 0xF8+
+    }
+    if (i + static_cast<std::size_t>(len) > n) {
+      out += kRepl; ++i; continue;          // truncated at the end of the string
+    }
+    bool ok = true;
+    for (int k = 1; k < len; ++k) {
+      const unsigned char cc = p[i + static_cast<std::size_t>(k)];
+      if ((cc & 0xC0) != 0x80) { ok = false; break; }
+      cp = (cp << 6) | (cc & 0x3Fu);
+    }
+    // Reject overlongs, surrogates and out-of-range: an encoder that accepts
+    // them produces strings other UTF-8 readers reject, which is the same class
+    // of bug one layer down.
+    if (ok) {
+      if (len == 2 && cp < 0x80) ok = false;
+      else if (len == 3 && cp < 0x800) ok = false;
+      else if (len == 4 && cp < 0x10000) ok = false;
+      else if (cp > 0x10FFFF) ok = false;
+      else if (cp >= 0xD800 && cp <= 0xDFFF) ok = false;
+    }
+    if (!ok) { out += kRepl; ++i; continue; }
+    out.append(in, i, static_cast<std::size_t>(len));
+    i += static_cast<std::size_t>(len);
+  }
+  return out;
+}
+
 std::string DecodedToken(const vllm::Logprob& lp, int32_t token_id) {
-  if (lp.decoded_token.has_value()) return *lp.decoded_token;
+  if (lp.decoded_token.has_value()) return SanitizeUtf8(*lp.decoded_token);
   return "token_id:" + std::to_string(token_id);
 }
 
