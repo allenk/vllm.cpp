@@ -301,9 +301,12 @@ void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, in
           // is discarded here.
           const int rows_here = static_cast<int>(std::min<int64_t>(mr, i_hi - i));
           for (int r = 0; r < rows_here; ++r) {
-            for (int64_t j = iir0; j < j_hi; ++j) {
-              StoreF32(out, (i + r) * n + j, accm[r * kElemLanes + (j - iir0)]);
-            }
+            // One row store instead of one call per element: NarrowRowFromF32 applies
+            // StoreF32's rounding (see the note above), so the bytes are identical.
+            // `out` is row-major with stride n and `accm` holds this row's columns
+            // contiguously, so both sides are the same contiguous run.
+            NarrowRowFromF32(out.dtype, ElemMutPtr(out, (i + r) * n + iir0), j_hi - iir0,
+                             accm + r * kElemLanes);
           }
         }
       }
@@ -326,9 +329,7 @@ void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, in
             acc[j - iir0] = s;
           }
         }
-        for (int64_t j = iir0; j < j_hi; ++j) {
-          StoreF32(out, i * n + j, acc[j - iir0]);
-        }
+        NarrowRowFromF32(out.dtype, ElemMutPtr(out, i * n + iir0), j_hi - iir0, acc);
       }
     }
   }
