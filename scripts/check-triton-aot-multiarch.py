@@ -17,6 +17,12 @@ TREE_FLAGS = {
     "sm_89": 0x00590559,
     "sm_90a": 0x005A0D5A,
     "sm_100a": 0x0600640A,
+    # FORK: this fork vendors an sm_120a tree (Blackwell, the arch
+    # build-windows-release.ps1 names as VLLM_CPP_CUDA_ARCHITECTURES=120a).
+    # Upstream has six trees and no sm_120a, so the tree was added here without
+    # this table, and the audit failed on the SET before it ever checked a flag.
+    # Value read off the vendored cubins, not chosen: all 20 carry 0x06007802.
+    "sm_120a": 0x06007802,
     "sm_121a": 0x0600790A,
 }
 CUBIN_ARRAY_RE = re.compile(
@@ -139,7 +145,10 @@ def main() -> int:
         for error in errors:
             print(f"  - {error}", file=sys.stderr)
         return 1
-    print("Triton AOT multi-arch audit: six exact trees and namespaces OK")
+    print(
+        f"Triton AOT multi-arch audit: {len(TREE_FLAGS)} exact trees "
+        "and namespaces OK"
+    )
     return 0
 
 
