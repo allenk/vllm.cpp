@@ -31,6 +31,10 @@ PRIMARY_ARTIFACT_FORMATS = {
     "linux-x86_64-glibc-vulkan": "tar.gz",
     "windows-x86_64-msvc-cpu": "zip",
     "windows-x86_64-msvc-vulkan": "zip",
+    # FORK: cuda_windows is this fork's job -- upstream has no Windows CUDA lane.
+    # It is wired into build.needs and its triplet is downloaded into release-assets,
+    # so collate() would raise "not declared by the matrix" without this entry.
+    "windows-x86_64-msvc-cuda": "zip",
 }
 RELEASE_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?")
 SEMANTIC_VERSION = re.compile(
