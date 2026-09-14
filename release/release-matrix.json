@@ -1,15 +1,71 @@
 {
   "artifacts": [
-    {"archive_format": "tar.gz", "channel": "stable", "id": "linux-x86_64-glibc-cpu", "required": true},
-    {"archive_format": "tar.gz", "channel": "stable", "id": "linux-aarch64-glibc-cpu", "required": true},
-    {"archive_format": "tar.gz", "channel": "experimental-preview", "id": "linux-x86_64-musl-cpu-static", "required": true},
-    {"archive_format": "tar.gz", "channel": "preview", "id": "linux-x86_64-glibc-cuda", "required": true},
-    {"archive_format": "tar.gz", "channel": "preview", "id": "linux-aarch64-glibc-cuda", "required": true},
-    {"archive_format": "tar.gz", "channel": "stable", "id": "macos-arm64-metal", "required": true},
-    {"archive_format": "tar.gz", "channel": "preview", "id": "macos-arm64-metal-mlx", "required": true},
-    {"archive_format": "tar.gz", "channel": "preview", "id": "linux-x86_64-glibc-vulkan", "required": true},
-    {"archive_format": "zip", "channel": "preview", "id": "windows-x86_64-msvc-cpu", "required": true},
-    {"archive_format": "zip", "channel": "preview", "id": "windows-x86_64-msvc-vulkan", "required": true}
+    {
+      "archive_format": "tar.gz",
+      "channel": "stable",
+      "id": "linux-x86_64-glibc-cpu",
+      "required": true
+    },
+    {
+      "archive_format": "tar.gz",
+      "channel": "stable",
+      "id": "linux-aarch64-glibc-cpu",
+      "required": true
+    },
+    {
+      "archive_format": "tar.gz",
+      "channel": "experimental-preview",
+      "id": "linux-x86_64-musl-cpu-static",
+      "required": true
+    },
+    {
+      "archive_format": "tar.gz",
+      "channel": "preview",
+      "id": "linux-x86_64-glibc-cuda",
+      "required": true
+    },
+    {
+      "archive_format": "tar.gz",
+      "channel": "preview",
+      "id": "linux-aarch64-glibc-cuda",
+      "required": true
+    },
+    {
+      "archive_format": "tar.gz",
+      "channel": "stable",
+      "id": "macos-arm64-metal",
+      "required": true
+    },
+    {
+      "archive_format": "tar.gz",
+      "channel": "preview",
+      "id": "macos-arm64-metal-mlx",
+      "required": true
+    },
+    {
+      "archive_format": "tar.gz",
+      "channel": "preview",
+      "id": "linux-x86_64-glibc-vulkan",
+      "required": true
+    },
+    {
+      "archive_format": "zip",
+      "channel": "preview",
+      "id": "windows-x86_64-msvc-cpu",
+      "required": true
+    },
+    {
+      "archive_format": "zip",
+      "channel": "preview",
+      "id": "windows-x86_64-msvc-vulkan",
+      "required": true
+    },
+    {
+      "archive_format": "zip",
+      "channel": "preview",
+      "id": "windows-x86_64-msvc-cuda",
+      "required": true
+    }
   ],
   "release_ready": true,
   "retention": {

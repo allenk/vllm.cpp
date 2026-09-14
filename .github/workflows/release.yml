@@ -14,6 +14,10 @@ concurrency:
 
 jobs:
   plan:
+    # FORK GUARD: this pipeline publishes under a fork-specific name and
+    # version. Refuse to run anywhere else, so a clone of this repository
+    # cannot emit artifacts that look like either fork's official build.
+    if: github.repository == 'allenk/vllm.cpp'
     permissions:
       contents: read
     runs-on: ubuntu-latest

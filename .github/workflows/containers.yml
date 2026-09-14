@@ -52,7 +52,10 @@ permissions:
   contents: read
 
 env:
-  REGISTRY_PACKAGE: ghcr.io/mudler/vllm.cpp
+  # FORK: upstream publishes ghcr.io/mudler/vllm.cpp. This fork cannot push there
+  # and must not appear to: the package name carries the fork, and the version
+  # string (0.0.3-vk.1) already makes every tag distinct from an upstream tag.
+  REGISTRY_PACKAGE: ghcr.io/allenk/vllm.cpp-vk
 
 # 2026-08-15 (#822): this workflow had NO concurrency policy at all and was
 # named as the largest source of superseded queued runs -- 32 obsolete runs were
@@ -68,6 +71,10 @@ concurrency:
 
 jobs:
   plan:
+    # FORK GUARD: this pipeline publishes under a fork-specific name and
+    # version. Refuse to run anywhere else, so a clone of this repository
+    # cannot emit artifacts that look like either fork's official build.
+    if: github.repository == 'allenk/vllm.cpp'
     permissions:
       contents: read
     runs-on: ubuntu-latest

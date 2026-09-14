@@ -2,6 +2,6 @@
   "prerelease": true,
   "project_version": "0.0.3",
   "schema": "vllm.cpp.release-version.v1",
-  "tag": "v0.0.3-pre.1",
-  "version": "0.0.3-pre.1"
+  "tag": "v0.0.3-vk.1",
+  "version": "0.0.3-vk.1"
 }
