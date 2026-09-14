@@ -60,10 +60,14 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  // 28 + 8: the coopmat2 GEMM pair, the matrix-form prefill attention, the
+  // 28 + 10: the coopmat2 GEMM pair, the matrix-form prefill attention, the
   // split/merge decode attention pair, the register-state GDN prefill, the
-  // causal conv1d forward, and the two-operand SwiGLU.
-  CHECK(n == 36);
+  // causal conv1d forward, the two-operand SwiGLU, AND the two decode-GEMV
+  // subgroup widths (vt_matmul_vec_sg, vt_matmul_vec_sg2) that
+  // "build the decode GEMV at three workgroup widths" added. Those two landed
+  // without this count, which is what made both Vulkan lanes red: the SET check
+  // here fires first and every later module assertion then reads a shifted row.
+  CHECK(n == 38);
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
