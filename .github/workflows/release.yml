@@ -399,6 +399,11 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
+      # dumpbin is an MSVC tool and is only on PATH inside a Developer Command
+      # Prompt. Invoke-CrtAudit calls it bare (build-windows-release.ps1:856 and
+      # four more), which works on a developer box and not on a bare runner.
+      - name: Enter the MSVC developer environment so dumpbin resolves
+        uses: ilammy/msvc-dev-cmd@v1
       - name: Prove Windows PowerShell and CRT rejection contracts
         env:
           EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -440,6 +445,11 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
+      # dumpbin is an MSVC tool and is only on PATH inside a Developer Command
+      # Prompt. Invoke-CrtAudit calls it bare (build-windows-release.ps1:856 and
+      # four more), which works on a developer box and not on a bare runner.
+      - name: Enter the MSVC developer environment so dumpbin resolves
+        uses: ilammy/msvc-dev-cmd@v1
       - name: Prove Windows PowerShell and CRT rejection contracts
         env:
           EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -491,6 +501,21 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
+      # dumpbin is an MSVC tool and is only on PATH inside a Developer Command
+      # Prompt. Invoke-CrtAudit calls it bare (build-windows-release.ps1:856 and
+      # four more), which works on a developer box and not on a bare runner.
+      - name: Enter the MSVC developer environment so dumpbin resolves
+        uses: ilammy/msvc-dev-cmd@v1
+      # Linux gets nvcc from `container: nvidia/cuda:...-devel`. GitHub refuses
+      # container jobs on Windows, so this lane installs the toolkit instead.
+      # nvcc plus the VS integration only: the full toolkit is several GB and the
+      # runner has neither the disk nor the minutes to spare.
+      - name: Install the CUDA toolkit this lane compiles against
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.3.0'
+          sub-packages: '["nvcc", "visual_studio_integration", "cudart", "nvrtc"]'
+          method: 'network'
       - name: Prove Windows PowerShell and CRT rejection contracts
         env:
           EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
