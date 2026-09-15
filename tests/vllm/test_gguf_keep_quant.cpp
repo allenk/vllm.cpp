@@ -3196,13 +3196,20 @@ std::vector<float> ReorderVRowsRef(const std::vector<float>& in,
                                    int64_t num_k, int64_t num_v_per_k,
                                    int64_t head_rows) {
   const int64_t cs = head_rows * cols;
+  // row_off counts ROWS; cs counts one HEAD, which is head_rows rows. So the
+  // base offset is row_off * cols and the head index scales cs -- writing
+  // (row_off + g) * cs silently multiplies row_off by head_rows, which reads
+  // past the end whenever head_rows != 1. ReorderVRows (the implementation
+  // this is the reference FOR) has always had it right: it takes
+  // base = buf.data() + row_off * cols and only then adds t * head_stride.
+  const int64_t base = row_off * cols;
   std::vector<float> out = in;
   for (int64_t k = 0; k < num_k; ++k) {
     for (int64_t r = 0; r < num_v_per_k; ++r) {
       const int64_t g = k * num_v_per_k + r;
       const int64_t t = r * num_k + k;
-      std::memcpy(out.data() + (row_off + g) * cs,
-                  in.data() + (row_off + t) * cs,
+      std::memcpy(out.data() + base + g * cs,
+                  in.data() + base + t * cs,
                   static_cast<size_t>(cs) * sizeof(float));
     }
   }
