@@ -4,13 +4,19 @@ get_filename_component(_here "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
 include("${_here}/TritonAOTMultiArch.cmake")
 
 vt_triton_aot_available_arches(_arches)
-if(NOT _arches STREQUAL "sm_80;sm_86;sm_89;sm_90a;sm_100a;sm_121a")
+# SEVEN trees, not upstream's six: sm_120a is this fork's, vendored for the
+# RTX PRO 6000 Blackwell (consumer sm_120). It sorts between sm_100a and
+# sm_121a. Every count and every list in this file had to learn about it --
+# and this file is the SECOND gate that needed teaching, after
+# scripts/check-triton-aot-multiarch.py. One grep for the tree name would
+# have found both; one gate was fixed and the other was not.
+if(NOT _arches STREQUAL "sm_80;sm_86;sm_89;sm_90a;sm_100a;sm_120a;sm_121a")
   message(FATAL_ERROR "unexpected W2 AOT tree order: [${_arches}]")
 endif()
 
 foreach(_case IN ITEMS
     "80=sm_80" "86=sm_86" "89=sm_89" "90a=sm_90a"
-    "100a=sm_100a" "121a=sm_121a")
+    "100a=sm_100a" "120a=sm_120a" "121a=sm_121a")
   string(REPLACE "=" ";" _parts "${_case}")
   list(GET _parts 0 _arch)
   list(GET _parts 1 _expected)
@@ -20,7 +26,9 @@ foreach(_case IN ITEMS
   endif()
 endforeach()
 
-foreach(_arch IN ITEMS 87 103a 110 120a)
+# 120a left this list when the tree landed. Leaving it here asserted that the
+# AOT fast path is OFF on the only card this fork develops on.
+foreach(_arch IN ITEMS 87 103a 110)
   vt_triton_aot_arch_tree(_actual "${_arch}")
   if(_actual)
     message(FATAL_ERROR "${_arch}: unavailable tree must select fallback")
@@ -62,8 +70,13 @@ foreach(_decl IN LISTS _declarations)
 endforeach()
 file(STRINGS "${_generated}" _generated_lines)
 list(LENGTH _generated_lines _generated_count)
-if(NOT _generated_count EQUAL 6)
-  message(FATAL_ERROR "expected six declarations, got ${_generated_count}")
+# COMPUTED from the arch list, not written out. The literal 6 here is exactly
+# the shape that made this file fail when a seventh tree arrived; a count that
+# derives itself cannot go stale for the eighth.
+list(LENGTH _arches _arch_count)
+if(NOT _generated_count EQUAL _arch_count)
+  message(FATAL_ERROR
+    "expected ${_arch_count} declarations, got ${_generated_count}")
 endif()
 foreach(_line IN LISTS _generated_lines)
   if(NOT _line MATCHES ";$")
