@@ -125,6 +125,41 @@ this file
 
 ---
 
+## 3b. Merging upstream: three outcomes, and how to tell them apart
+
+Measured on the first big merge: 248 upstream commits, three conflicts.
+
+```
+upstream made the SAME fix     take upstream wholesale, drop ours. TWO of the
+                               three were this. Ours was not wasted -- it shipped
+                               while upstream had none -- it is merely redundant
+                               now, and keeping it would be a delta in a shared
+                               file for nothing.
+upstream made a BETTER fix     also take upstream. speech_engine.h: we deleted
+                               the copy pair, upstream deleted copy AND move,
+                               which is the more consistent version because
+                               std::mutex is not movable either.
+upstream UNDID something only  the only case that needs real work: take
+WE need                        upstream's change and re-apply ours on top of it.
+```
+
+The third is the dangerous one, because it looks like a clean take.
+
+`src/vt/cuda/cuda_qwen4_exp.cu`: upstream rewrote the kernel (one block per group
+instead of one thread, f32 with a warp-shuffle tree instead of a serial double)
+AND renamed a parameter back to `hyper`. That name is a Windows build break --
+CCCL, reached through `<cub/cub.cuh>`, defines `hyper` as a macro expanding to
+`__int64`, so any `.cu` including both cub and `vt/ops.h` fails with
+"expected a )". Upstream does not build on Windows and cannot see it.
+
+Resolved as upstream's algorithm plus our rename: 20 bare `hyper` identifiers in
+code became `hyper_state`, and prose comments about the hyper-connection concept
+were left alone.
+
+> **Before taking a conflicted hunk wholesale, ask what OUR side of it was FOR.**
+> If the answer is a platform upstream does not build, then upstream cannot have
+> preserved it, and "theirs" silently reintroduces the bug it fixed.
+
 ## 4. The failure mode this fork keeps hitting
 
 Four separate times, the same shape:
