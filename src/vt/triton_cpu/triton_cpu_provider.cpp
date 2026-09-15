@@ -203,7 +203,11 @@ using RmsNormResidKernelFn = void (*)(void* out, const void* x, const void* w, v
 // kernels take n/d at run time, but they were COMPILED at these values, and Triton
 // turns "divisible by 16" into a specialization on arguments it saw that way.
 // Accepting a size the kernel never saw would be a silent wrong answer, not a crash.
-constexpr std::int32_t kSiluD = 3072;    // intermediate_size
+// kSiluD (3072, intermediate_size) used to sit here. The gate that read it was
+// removed -- see the SIZE USED TO BE ONE OF THOSE ASSUMPTIONS note below -- and
+// the constant outlived it, unused on every platform. GCC says nothing about an
+// unused namespace-scope constexpr; clang does, so the macOS lane is where it
+// finally surfaced.
 constexpr std::int32_t kSiluBlock = 1024;
 constexpr std::int32_t kRmsN = 1024;     // hidden_size
 
@@ -362,7 +366,10 @@ using MatmulBTKernelFn = void (*)(void* out, const void* a, const void* b,
 // prefill, and at that shape a BM of 16 would turn the op from memory-bound
 // (311 MB of weights, ~3.1 ms) into compute-bound (5.0 GFLOP, ~10 ms). Fitting the
 // shape is worth real time here, not neatness.
-constexpr std::int32_t kMmBM = 1;
+// The BM above is stated, not declared: build_kernels.py is what actually bakes
+// it into the artifact, and that script does NOT live in this repository, so a
+// constexpr copy here was a second source of truth that nothing checked and
+// nothing read. The reasoning is the part worth keeping, so it stays as prose.
 constexpr std::int32_t kMmBNDefault = 64;
 
 MatmulBTKernelFn MatmulBTKernel() {
@@ -567,7 +574,7 @@ bool Aligned(const void* p, std::uintptr_t n) {
 // alignment.
 //
 // ⭐ THE SIZE USED TO BE ONE OF THOSE ASSUMPTIONS, AND IT NO LONGER IS. This gate
-// once required `d == kSiluD` (3072). That looked like it was protecting the kernel,
+// once required `d == 3072`. That looked like it was protecting the kernel,
 // but the kernel never needed it: it is written in the blocked form and builds its
 // own mask from the runtime `d`. What actually required 3072 was the LAUNCHER below,
 // which fed the constant in place of the tensor's own extent. Fixing that turned the
@@ -1345,7 +1352,7 @@ void SiluAndMul(Queue& q, Tensor& out, const Tensor& x) {
   ScopedOpTimer timer(g_silu, ProbeEnabled());
 
   const std::int32_t rows = static_cast<std::int32_t>(out.shape[0]);
-  // ⭐ Both of these used to be `kSiluD`. The kernel takes `d` at run time and masks
+  // ⭐ Both of these used to be a pinned 3072. The kernel takes `d` at run time and masks
   // with it; feeding the constant made a general kernel behave like a pinned one.
   const std::int32_t d = static_cast<std::int32_t>(out.shape[1]);
   // SiluAndMul is the one op that exists in BOTH styles, so it is the one that has to
