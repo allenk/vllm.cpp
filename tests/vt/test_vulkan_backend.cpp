@@ -117,79 +117,88 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   }
 }
 
-TEST_CASE("the committed SPIR-V table records each module's WRITABLE bindings") {
-  // Device-independent: a property of the checked-in artifact.
-  //
-  // WHY THIS IS THE MOST LOAD-BEARING ASSERTION IN THE FILE
-  // (BACKEND-VULKAN-BARRIERS). writable_mask is what lets the dispatch path skip
-  // a pipeline barrier, and its DANGEROUS failure mode is silent: a mask that
-  // came back all-zero would describe every binding as read-only, no dispatch
-  // would ever appear to write anything, no hazard would ever be detected, and
-  // every barrier in the batch would be dropped. That produces no error and no
-  // crash -- only wrong numbers, on real hardware, in a way a software
-  // rasterizer's effectively serial execution hides. So the mask is asserted as a
-  // STRUCTURE here rather than trusted because the numbers came out right.
-  for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
-    const auto& m = vt::vulkan::kSpirvModules[mi];
-    CAPTURE(m.name);
-    // Every compute shader in this backend produces an output. A module with NO
-    // writable binding is a reflection failure, not a legitimate shader.
-    CHECK(m.writable_mask != 0u);
-    REQUIRE(m.binding_count >= 1u);
-    // One bit per binding, and the dispatch path's stack arrays are 32 wide.
-    CHECK(m.binding_count <= 32u);
-    // No bit may be set above the declared binding count, or the mask and the
-    // dispatch's buffer array have drifted out of alignment.
-    const uint32_t above =
-        m.binding_count >= 32u ? 0u : (m.writable_mask >> m.binding_count);
-    CHECK(above == 0u);
-    // Not EVERY binding writable either: each of these shaders reads at least one
-    // operand, so an all-ones mask is the other reflection failure (it would cost
-    // barriers rather than correctness, but it would mean nothing was parsed).
-    const uint32_t all = m.binding_count >= 32u
-                             ? 0xffffffffu
-                             : ((1u << m.binding_count) - 1u);
-    CHECK(m.writable_mask != all);
-  }
-  // Spot checks against the GLSL, read directly from src/vt/vulkan/shaders. These
-  // pin the reflection to specific known-correct answers, so a generator change
-  // that starts reporting plausible-but-wrong masks fails here.
-  struct Expect { const char* name; uint32_t bindings; uint32_t mask; };
-  // vt_add.comp: A at 0/1 readonly, B at 2/3 readonly, D (out) at 4/5 writable.
-  // vt_silu_and_mul.comp: x at 0/1 readonly, out at 2/3 writable.
-  // vt_greedy_argmax.comp: logits at 0 readonly, out at 1 writable.
-  // vt_rms_norm.comp: x/weight readonly at 0..3, out at 4/5 and the in-place
-  //   residual stream at 6/7 both writable.
-  // vt_matmul_vec.comp: a/b at 0..3, out at 4/5, and the two 64-bit ALIASES of a
-  //   and b at 6/7 -- aliases of READ operands, so still read-only.
-  const Expect kExpect[] = {
-      {"vt_add", 6u, 0x30u},
-      {"vt_silu_and_mul", 4u, 0x0cu},
-      {"vt_greedy_argmax", 2u, 0x02u},
-      {"vt_rms_norm", 8u, 0xf0u},
-      {"vt_matmul_vec", 8u, 0x30u},
-      // vt_exl3_had.comp: in at 0/1 readonly, out at 2/3 writable, and the two
-      // OPTIONAL fp16 scale vectors at 4 and 5 -- single 16-bit views, because
-      // both are fp16 by contract on every arm, and both read-only.
-      {"vt_exl3_had", 6u, 0x0cu},
-      // vt_exl3_gemm.comp: the f32 `raw` staging buffer at 0 WRITABLE, a_had at 1
-      // and the trellis at 2 read-only. THREE bindings and not six: each operand
-      // is bound through the ONE view it uses, so there is no unused 32-bit view
-      // for glslang to strip into a binding hole.
-      {"vt_exl3_gemm", 3u, 0x01u},
+// Every module's declared specialization-constant IDs, listed EXACTLY, with what
+// each ID selects taken from the shader's own constant name.
+//
+// A COUNT plus "the IDs are 0..count-1" was the previous shape and it cannot
+// express this table: vt_gdn_prefill/decode declare {0, 1, 7} and
+// vt_matmul_coopmat_wg declares {0..5, 9..12}. Both are legal -- an ID is a key
+// the host binds by, not an index -- so the contradiction was in the check, not
+// in the shaders. It had also drifted: four surviving entries carried the wrong
+// count (vt_paged_attn 4 vs 6, vt_matmul 5 vs 7, vt_matmul_coopmat 2 vs 7,
+// vt_matmul_vec 6 vs 9) and nine modules had no entry at all, so they fell to
+// the else arm and were asserted to declare NONE.
+//
+// Fail-closed is the point: a module with no row here must declare no constants,
+// so ADDING a specialization axis without saying so fails rather than silently
+// binding by position.
+struct SpecContract {
+  const char* name;
+  std::vector<uint32_t> ids;
+  const char* axes;
+};
+
+inline const std::vector<SpecContract>& SpecContracts() {
+  static const std::vector<SpecContract> kContracts = {
+      {"vt_cast", {0, 1}, "src dtype, dst dtype -- the backend's FIRST variant axis"},
+      {"vt_qkv_split", {0, 1}, "src dtype, dst dtype"},
+      {"vt_embedding", {0, 1, 2}, "table dtype, out dtype, id width (i32 vs i64)"},
+      {"vt_rope_from_cache", {0, 1, 2, 3, 4},
+       "q/k/cache dtype, NeoX-vs-GPT-J, position width"},
+      {"vt_attn_qk_norm_rope_gate", {0, 1, 2},
+       "qgate/kf dtype, q_out/k_out dtype, gate dtype"},
+      {"vt_exl3_had", {0, 1}, "in width, out width -- INDEPENDENT bits, not one enum"},
+      // A single WIDTH selector, not a dtype code: this op moves bytes and
+      // converts nothing, so 32-bit and 16-bit are the only two paths.
+      {"vt_reshape_and_cache", {0}, "width selector"},
+      // ONE axis, and the count is the assertion: the gate is f32 and the output
+      // bf16 by the op contract (src/vt/ops.cpp:3327-3334).
+      {"vt_sigmoid_gate_bf16", {0}, "attention operand dtype"},
+      {"vt_causal_conv1d_fwd", {0}, "VT_CONV_BLOCKS"},
+      // GDN. The state, g and beta are f32 by contract, so they are not axes.
+      // ID 7 is VT_GDN_BV, a TILE WIDTH and not a dtype -- which is exactly what
+      // the count-plus-contiguity check could not express.
+      {"vt_gdn_prefill", {0, 1, 7}, "VT_PC_QKV_DT, VT_PC_OUT_DT, VT_GDN_BV"},
+      {"vt_gdn_decode", {0, 1, 7}, "VT_PC_QKV_DT, VT_PC_OUT_DT, VT_GDN_BV"},
+      {"vt_gdn_prefill_reg", {0, 1, 2}, "VT_PC_QKV_DT, VT_PC_OUT_DT, VT_GDN_RPL"},
+      {"vt_gdn_post_conv", {0, 1, 2}, "VT_PC_CONV_DT, VT_PC_QKV_DT, VT_PC_AB_DT"},
+      // Paged attention.
+      {"vt_paged_attn", {0, 1, 2, 3, 4, 5},
+       "VT_PA_{Q,K,V,OUT}_DT, VT_PA_ACC_SLOTS, VT_PA_SPLITS"},
+      {"vt_paged_attn_split", {0, 1, 2, 3, 4, 5},
+       "VT_PA_{Q,K,V}_DT, VT_PAS_WG, VT_PAS_ACC_SLOTS, VT_PAS_SPLITS"},
+      {"vt_paged_attn_merge", {0, 1}, "VT_PAM_OUT_DT, VT_PAS_WG"},
+      {"vt_paged_attn_cm2", {0, 1, 2}, "VT_FA_BR, VT_FA_BC, VT_FA_D"},
+      // Matmul. Correctness axes plus tuning axes, all on ONE committed module --
+      // the argument for specialization constants over a module per #define, in
+      // miniature.
+      {"vt_matmul", {0, 1, 2, 3, 4, 5, 6},
+       "VT_MM_{A,B,OUT}_DT, VT_MM_BT, VT_MM_NCOLS, VT_MM_KUNROLL, VT_MM_MROWS"},
+      {"vt_matmul_coopmat", {0, 1, 2, 3, 4, 5, 6},
+       "VT_MM_BT, VT_MM_OUT_DT, VT_MM_CM_{MR,NR}, VT_CM_{M,N,K}"},
+      {"vt_matmul_coopmat_tiled", {0, 1}, "VT_MM_BT, VT_MM_OUT_DT"},
+      // ID 9 is not a constant_id declaration at all: this module ALONE writes
+      // layout(local_size_x_id = 9), so the WORKGROUP SIZE rides a specialization
+      // constant here. vt_common.glsl records a MEASURED reason not to do that at
+      // this backend's vulkan1.1 target -- glslang emits LocalSize 1 1 1 plus the
+      // legacy WorkgroupSize vector, the literal 1 wins, and every group runs ONE
+      // thread while the host still dispatches ceil(n/width) of them. Recorded
+      // here rather than asserted away: whether THIS module is affected is a
+      // measurement nobody has taken, and this row is what keeps the question
+      // visible instead of buried in a shader.
+      {"vt_matmul_coopmat_wg", {0, 1, 2, 3, 4, 5, 9, 10, 11, 12},
+       "VT_MM_BT, VT_MM_OUT_DT, VT_WG_{M,N,K}, VT_WG_SPILL, local_size_x_id, "
+       "VT_WG_DIRECT_STORE, VT_WG_GROUP_M, VT_WG_KUNROLL"},
+      // The three decode-GEMV widths share one axis list BY CONSTRUCTION: _sg and
+      // _sg2 are the same shader body at different workgroup widths, so a
+      // divergence between these three rows would itself be the bug.
+      {"vt_matmul_vec", {0, 1, 2, 3, 4, 5, 6, 7, 8},
+       "VT_MM_{A,B,OUT}_DT, VT_MM_UNROLL, VT_MM_ROWS, VT_MM_PACK, VT_MM_REDUCE, "
+       "VT_MM_BATCH, VT_MM_BROWS"},
+      {"vt_matmul_vec_sg", {0, 1, 2, 3, 4, 5, 6, 7, 8}, "same axes as vt_matmul_vec"},
+      {"vt_matmul_vec_sg2", {0, 1, 2, 3, 4, 5, 6, 7, 8}, "same axes as vt_matmul_vec"},
   };
-  for (const auto& e : kExpect) {
-    CAPTURE(e.name);
-    bool found = false;
-    for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
-      const auto& m = vt::vulkan::kSpirvModules[mi];
-      if (std::strcmp(m.name, e.name) != 0) continue;
-      found = true;
-      CHECK(m.binding_count == e.bindings);
-      CHECK(m.writable_mask == e.mask);
-    }
-    CHECK(found);
-  }
+  return kContracts;
 }
 
 TEST_CASE("the committed SPIR-V table records each module's specialization constants") {
@@ -202,111 +211,36 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
   // declared IDs alongside each blob is what lets GetPipeline check it.
   for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
-    CAPTURE(m.name);
+    // std::string, not the bare pointer: doctest stringifies a const char* member
+    // through its generic path and printed `1`, so every failure in this case
+    // named no module at all and the reader had to go read vulkan_spirv.cpp to
+    // find out which one broke.
+    CAPTURE(std::string(m.name));
     // Structural: the pointer and the count agree, and the IDs are sorted with no
-    // duplicates — GetPipeline builds VkSpecializationMapEntry positionally from
+    // duplicates -- GetPipeline builds VkSpecializationMapEntry positionally from
     // this array, so an unsorted or duplicated ID would bind the wrong value.
     CHECK((m.spec_ids == nullptr) == (m.spec_id_count == 0));
     for (size_t i = 1; i < m.spec_id_count; ++i) {
       CHECK(m.spec_ids[i - 1] < m.spec_ids[i]);
     }
-    // vt_cast is the backend's FIRST variant axis: constants 0 and 1 are its
-    // source and destination dtype, so one module serves every (src, dst) pair
-    // instead of a module per pair. Every other W0 shader still declares none.
-    //
-    // The workgroup size is deliberately NOT such a constant — see the measured
-    // reason in src/vt/vulkan/shaders/vt_common.glsl (local_size_x_id emits
-    // LocalSize 1 1 1 at the vulkan1.1 target and computes ~1/128 of the tensor).
-    if (std::strcmp(m.name, "vt_cast") == 0) {
-      REQUIRE(m.spec_id_count == 2);  // src dtype, dst dtype
-      CHECK(m.spec_ids[0] == 0u);
-      CHECK(m.spec_ids[1] == 1u);
-    } else if (std::strcmp(m.name, "vt_embedding") == 0) {
-      // table dtype, out dtype, id width (i32 vs i64).
-      REQUIRE(m.spec_id_count == 3);
-      for (uint32_t want = 0; want < 3; ++want) CHECK(m.spec_ids[want] == want);
-    } else if (std::strcmp(m.name, "vt_rope_from_cache") == 0) {
-      // q / k / cache dtype, the NeoX-vs-GPT-J pairing, and the position width.
-      REQUIRE(m.spec_id_count == 5);
-      for (uint32_t want = 0; want < 5; ++want) CHECK(m.spec_ids[want] == want);
-    } else if (std::strcmp(m.name, "vt_qkv_split") == 0) {
-      // source dtype, destination dtype.
-      REQUIRE(m.spec_id_count == 2);
-      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
-    } else if (std::strcmp(m.name, "vt_reshape_and_cache") == 0) {
-      // A single WIDTH selector, not a dtype code: this op moves bytes and
-      // converts nothing, so 32-bit and 16-bit are the only two paths.
-      REQUIRE(m.spec_id_count == 1);
-      CHECK(m.spec_ids[0] == 0u);
-    } else if (std::strcmp(m.name, "vt_paged_attn") == 0) {
-      // query / k-cache / v-cache / out dtype.
-      REQUIRE(m.spec_id_count == 4);
-      for (uint32_t want = 0; want < 4; ++want) CHECK(m.spec_ids[want] == want);
-    } else if (std::strcmp(m.name, "vt_matmul_coopmat") == 0) {
-      // Only the b orientation and the output dtype: A and B are bf16 by the
-      // hardware configuration this shader is written to, so they are not axes.
-      REQUIRE(m.spec_id_count == 2);
-      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
-    } else if (std::strcmp(m.name, "vt_matmul_vec") == 0) {
-      // a dtype, b dtype, out dtype, the UNROLL factor, the rows-per-workgroup
-      // count and the packed-load flag -- but NOT the orientation. This module is
-      // MatmulBT by construction: the whole reason it exists is that b's [N,K]
-      // layout makes lane-strided K reads contiguous, and the other orientation is
-      // already coalesced in vt_matmul and would be made worse here. Every tuning
-      // axis rides a spec constant so all the arms are ONE committed module and an
-      // A/B never needs a second build.
-      REQUIRE(m.spec_id_count == 6);
-      for (uint32_t want = 0; want < 6; ++want) CHECK(m.spec_ids[want] == want);
-    } else if (std::strcmp(m.name, "vt_matmul") == 0) {
-      // a dtype, b dtype, out dtype, orientation and the COLUMN-BLOCK factor:
-      // 3*3*3*2*3 = 162 variants served by ONE committed module, which is the
-      // argument for specialization constants over llama.cpp's module-per-#define
-      // in miniature. The block factor is the only PERFORMANCE axis here; the other
-      // four are correctness axes, which is why the gate below has to look at the
-      // specialization VALUES and not just at the module name.
-      REQUIRE(m.spec_id_count == 5);
-      for (uint32_t want = 0; want < 5; ++want) CHECK(m.spec_ids[want] == want);
-    } else if (std::strcmp(m.name, "vt_sigmoid_gate_bf16") == 0) {
-      // ONE axis, and the count is the assertion: the gate is f32 and the output
-      // bf16 by the op contract (src/vt/ops.cpp:3327-3334), so only the attention
-      // operand varies. A second constant appearing here would mean someone
-      // widened the shader past what the op actually promises.
-      REQUIRE(m.spec_id_count == 1);
-      CHECK(m.spec_ids[0] == 0u);
-    } else if (std::strcmp(m.name, "vt_gdn_post_conv") == 0) {
-      // conv dtype, the shared q/k/v dtype, the shared araw/braw dtype. g/beta,
-      // a_log and dt_bias are f32 by contract and are therefore NOT axes.
-      REQUIRE(m.spec_id_count == 3);
-      for (uint32_t want = 0; want < 3; ++want) CHECK(m.spec_ids[want] == want);
-    } else if (std::strcmp(m.name, "vt_gdn_prefill") == 0 ||
-               std::strcmp(m.name, "vt_gdn_decode") == 0) {
-      // The shared q/k/v dtype and the out dtype. TWO, not four: g, beta and the
-      // state are f32 by contract (a compressed state is CUDA-only,
-      // src/vt/ops.cpp:1631-1638) and the host DECLINES a call whose q/k/v
-      // disagree, so a third dtype constant here would mean the shader had grown
-      // past what the op promises. Both modules assert the same list because they
-      // share one step body (vt_gdn_recurrence.glsl) and must stay in lockstep.
-      REQUIRE(m.spec_id_count == 2);
-      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
-    } else if (std::strcmp(m.name, "vt_attn_qk_norm_rope_gate") == 0) {
-      // The shared qgate/kf dtype, the shared q_out/k_out dtype, and the gate
-      // dtype. THREE, and the third one is the assertion: the gate is a separate
-      // axis only because the op contract admits an f32 gate alongside bf16 q/k
-      // (the FA-2 prefill combo, src/vt/ops.cpp:1530-1536). q_norm, k_norm and
-      // the cos/sin cache are f32 by contract and are therefore NOT axes.
-      REQUIRE(m.spec_id_count == 3);
-      for (uint32_t want = 0; want < 3; ++want) CHECK(m.spec_ids[want] == want);
-    } else if (std::strcmp(m.name, "vt_exl3_had") == 0) {
-      // The input width and the output width, which are INDEPENDENT bits and not
-      // one enum: upstream's three inners are (half,half), (float,float) and
-      // (float,half), and Exl3GemmKernelCpu selects between exactly those off
-      // `c.dtype`. TWO, and a third would mean the shader had grown an axis the
-      // op does not promise -- the scale vectors are fp16 BY CONTRACT on every
-      // arm (hadamard_inner.cuh:109/:171) and are therefore not axes.
-      REQUIRE(m.spec_id_count == 2);
-      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
-    } else {
+
+    const SpecContract* want = nullptr;
+    for (const SpecContract& c : SpecContracts()) {
+      if (std::strcmp(m.name, c.name) == 0) {
+        want = &c;
+        break;
+      }
+    }
+    if (want == nullptr) {
+      // No row => declares none. The fail-closed arm: a new axis without a row
+      // lands here and fails, rather than being bound by position.
       CHECK(m.spec_id_count == 0);
+      continue;
+    }
+    CAPTURE(want->axes);
+    REQUIRE(m.spec_id_count == want->ids.size());
+    for (size_t i = 0; i < want->ids.size(); ++i) {
+      CHECK(m.spec_ids[i] == want->ids[i]);
     }
   }
 }
