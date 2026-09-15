@@ -9665,7 +9665,7 @@ Carried openly under option B (§6.4), not waived:
   gated** ([#2193](https://github.com/mudler/vllm.cpp/issues/2193), W5 fresh
   review F1). W5 first shipped `Dots3NoteMoePtrsFor` as a process-lifetime
   `static std::map<const Dots3NoteMoeWeights*, Dots3NoteMoePtrs>`, which is the
-  shape #237 removed from `qwen3_5.cpp` in `ce2349dee`, and cited that repair as
+  shape ISSUE-GH-237 removed from `qwen3_5.cpp` in `ce2349dee`, and cited that repair as
   its warrant. It is repaired here — `Dots3NoteMoeWeights` owns a
   `ResidentSlot resident_moe` and the accessor builds into it under a mutex,
   the `laguna.cpp:497-507` shape — and
@@ -9679,7 +9679,7 @@ Carried openly under option B (§6.4), not waived:
   address); a mutation that reverts the accessor BODY while leaving the member
   in place is not observable from the CPU and rides the same device run this
   arm already owes. `deepseek_v2.cpp`'s `MoePtrs` (`04f5c01e7`, 2026-07-22)
-  still carries the pre-#237 shape; it is a SACRED path, is deliberately NOT
+  still carries the pre-ISSUE-GH-237 shape; it is a SACRED path, is deliberately NOT
   touched here, and is owed under #2193 until a row picks it up.
 - **The quantization refusal keys on `weight_block_size` alone**
   ([#2190](https://github.com/mudler/vllm.cpp/issues/2190), W5 fresh review F5).

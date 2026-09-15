@@ -971,34 +971,11 @@ nothing moved. The gate now refuses that case by name.
 
 ## Owed
 
-- **`qwen4_exp` is WIRED to the seam and now REACHED.** The entry below recorded
-  it as unreached, which was accurate until this gate ran: the wiring is
-  `qwen4_exp_forward.cpp` routing its MoE step through `RunMoePlacedPair` with
-  the `qwen3_moe.cpp` adapter verbatim, and the `cpu_moe` arm above executes it
-  on a real checkpoint at 5.239e-06. What made that possible was three CUDA fixes
-  landing meanwhile — `#2449` (inject-weight residency), `a4ced1b13` (rmsnorm
-  widened gamma) and `a578705e9` (device-aware `quant_repack`) — after which the
-  `cudaMemcpyAsync: illegal memory access` seen earlier did not recur, so it was
-  a symptom of those rather than a fourth defect.
-
-  What is NOT proven is that anything reaches it. The forward needs a
-  `qwen4_exp` GGUF, and the only one available is `Qwen3.8-2.4T-A95B UD-Q1_0` at
-  369 GiB, which fits no host this project reaches. So the deletion mutation
-  `reachability.md` asks for cannot be run, and no gate here holds the call site
-  in either direction.
-
-  This is the same position `scripts/runner-routing-allowlist.txt` records for
-  Nemotron-H, and it is recorded the same way rather than being dressed up: a
-  seam checker never proved reachability and was never meant to. The wiring is
-  correct BY CONSTRUCTION (shape match, compile), which is weaker than reached
-  and is not claimed as more.
-
-  It also unblocks something: `--fit` has no device gate because every GGUF on
-  the NAS is either off the seam (`laguna`), has no reachable MoE forward
-  (`glm5next`), or does not fit. A runnable `qwen4_exp` GGUF would be the first
-  checkpoint that is both GGUF and seam-wired, which is what a `--fit` NMSE gate
-  needs.
-
+- **ISSUE-GH-2424 is CLOSED and completed.** This specification retains stable
+  ownership of the migrated record. Commit `1444c4fb8` wired `qwen4_exp` to the
+  placement seam, and commit `85bd19578` records the device gate that reached
+  it. This entry records completed history only; it does not reopen or restore
+  any work.
 
 - W5, the speed floor against llama.cpp `-ncmoe` at `b10451`. Blocked on a
   discrete-GPU rig, tracked by [#3013](https://github.com/mudler/vllm.cpp/issues/3013).

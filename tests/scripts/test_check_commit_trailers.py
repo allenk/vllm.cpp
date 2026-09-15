@@ -126,6 +126,17 @@ class CommitMessageContract(unittest.TestCase):
                     "malformed Assisted-by",
                 )
 
+    def test_assisted_by_accepts_slash_in_model_name(self) -> None:
+        """A provider/model identifier such as regolo/glm5.2 uses ``/`` as
+        the separator, and the TOOL slot of the same regex already allows it.
+        The MODEL slot must too, or commits land with a mangled name (#3132)."""
+        message = STRICT_MESSAGE.replace(
+            "Codex:GPT-5 [Codex]", "AGENT:regolo/glm5.2 [maki]"
+        )
+        self.assertEqual(
+            self.checker.validate_commit_message(message, strict=True), []
+        )
+
     def test_human_only_declaration_rejects_assistance_attribution(self) -> None:
         message = STRICT_MESSAGE.replace("AI-Assisted: true", "AI-Assisted: false")
         self.assertInvalid(message, "must omit Assisted-by")
@@ -963,10 +974,11 @@ class AttributionIsEnforcedOnce(unittest.TestCase):
         self.assertIn("documentation-checkpoint", governed)
         self.assertNotIn("commit-protocol-tag", governed)
         self.assertTrue(
-            floor.rstrip().endswith("e1b5df1a6b5b30555639e0a0459f79a467544579"),
+            floor.rstrip().endswith("96c5e4719dcb1f859cb9e59573309f16c026b523"),
             "the floor VALUE moves only by a reviewed advance that re-pins this "
-            "assertion; #2322 narrowed its scope and did not move it, and #2743 "
-            "advanced it to e1b5df1a6 without widening the scope back",
+            "assertion; #2322 narrowed its scope and did not move it, #2743 "
+            "advanced it to e1b5df1a6, and #3135 advanced it to 96c5e4719 "
+            "without widening the scope back",
         )
 
 

@@ -197,20 +197,14 @@ class SpeechEngine {
   virtual SpeechResult SynthesizeLocked(const SpeechGenParams& params) = 0;
 
   SpeechEngine() = default;
-  // DELETED deliberately and BY NAME: an engine is held through a `unique_ptr` or
-  // a `shared_ptr` everywhere in this tree, and a future copy would be a second
-  // engine sharing one lock's worth of nothing. A compile error at the seam is the
-  // right place to learn that.
-  //
-  // Written `= delete` rather than `= default`. The mutex member deletes them
-  // either way, so the semantics are identical -- but clang rejects a defaulted
-  // function that is implicitly deleted under
-  // `-Werror,-Wdefaulted-function-deleted`, and gcc does not have that warning at
-  // all, so the macOS lanes were the only place in CI this could surface.
+  // Defined as DELETED by the mutex member, deliberately and by name: an engine
+  // is held through a `unique_ptr` or a `shared_ptr` everywhere in this tree, and
+  // a future copy would be a second engine sharing one lock's worth of nothing.
+  // A compile error at the seam is the right place to learn that.
   SpeechEngine(const SpeechEngine&) = delete;
   SpeechEngine& operator=(const SpeechEngine&) = delete;
-  SpeechEngine(SpeechEngine&&) = default;
-  SpeechEngine& operator=(SpeechEngine&&) = default;
+  SpeechEngine(SpeechEngine&&) = delete;
+  SpeechEngine& operator=(SpeechEngine&&) = delete;
 
  private:
   std::mutex synthesize_mutex_;

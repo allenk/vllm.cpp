@@ -8,6 +8,7 @@
 
 #include "vllm/config/weight_residency.h"
 #include "vllm/model_executor/device_placement.h"
+#include "vllm/platforms/interface.h"
 #include "vt/ops.h"
 #include "vt/quant.h"
 
@@ -98,6 +99,20 @@ bool QuantRepackForDevice(bool keep_quant, bool cpu_ref,
          dev == vt::DeviceType::kCPU;
 }
 
+// See the header. The ORDER of the terms is the contract: an explicit knob is
+// answered before the device is consulted, so the same-binary A/B still reaches
+// a staging device.
+bool GgufPrefaultForDevice(vt::DeviceType dev) {
+  if (!ResolveGgufPrefault()) return false;
+  if (GgufPrefaultIsExplicit()) return true;
+  if (dev == vt::DeviceType::kCPU) return true;
+  // A device with no registered platform cannot be asked, and this function is
+  // not the place to refuse a load. Answering ON leaves such a caller with
+  // exactly the behaviour it had before this term existed.
+  if (!vllm::platforms::HasPlatform(dev)) return true;
+  return vllm::platforms::GetPlatform(dev).host_memory_is_device_addressable();
+}
+
 const char* Name(GgufTensorRole role) {
   switch (role) {
     case GgufTensorRole::kMatmulWeight: return "matmul_weight";
@@ -136,11 +151,27 @@ bool KeepNvfp4DType(uint32_t ggml_type) { return ggml_type == 40; }
 bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
   switch (dev) {
     case vt::DeviceType::kROCM:
-      // src/vt/rocm/rocm_grouped_gemm.hip implements exactly these on both the
-      // grouped and non-grouped arms; Q4_0/Q2_K/Q3_K/IQ2_*/IQ3_*/MXFP4 are
-      // owed (recorded in .agents/specs/rocm-gg-keep-quant.md).
-      return dt == vt::DType::kQ8_0 || dt == vt::DType::kQ4_K ||
-             dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K;
+      // rocm_grouped_gemm.hip implements Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K, while
+      // rocm_quant_dot.hip adds the seven Q8_K-activation formats below on
+      // both grouped and non-grouped arms. IQ4_XS remains with #3029 and is
+      // not admitted by this row; Q4_0/Q5_0/IQ2_XS/IQ3_S/IQ4_XS/MXFP4 stay
+      // on the named expand-or-refuse path.
+      //
+      // IQ4_NL is admitted on BOTH arms or neither. It is the only entry here
+      // whose activation encoding is Q8_0 rather than Q8_K, and it is served by
+      // DotIQ4_NL through IQ4NLGemmK (single) and GroupedIQ4NLK (expert
+      // towers). The grouped arm is the one that matters for the shipped
+      // Qwen3.8-Flash-Next checkpoints, whose 48 ffn_down_exps are IQ4_NL;
+      // admitting the encoding with only the single-matrix arm would throw at
+      // the first expert forward with the model already resident, which is the
+      // exact failure this predicate exists to prevent.
+      return dt == vt::DType::kQ8_0 || dt == vt::DType::kIQ4_NL ||
+             dt == vt::DType::kQ4_K ||
+             dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K ||
+             dt == vt::DType::kIQ2_XXS || dt == vt::DType::kIQ3_XXS ||
+             dt == vt::DType::kQ2_K || dt == vt::DType::kQ3_K ||
+             dt == vt::DType::kIQ2_S || dt == vt::DType::kIQ1_S ||
+             dt == vt::DType::kIQ1_XXXS;
     case vt::DeviceType::kTENSTORRENT:
       // KEEPQUANT W3: the P150 is discrete with no CPU fallback tier, so this
       // arm admits exactly what src/vt/tenstorrent/tenstorrent_ops.cpp has a
@@ -164,11 +195,14 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
   }
 }
 
-// keep-f16 needs an f16-capable MatmulBT on the running device; the ROCm
-// kernel accepts bf16/bf16 and f32/f32 only, so an F16 file weight must
-// expand there rather than be kept and refused at first forward (same review).
-bool DeviceKeepF16Supported(vt::DeviceType dev) {
-  return dev != vt::DeviceType::kROCM;
+// ROCm retention additionally requires the accepting loader's model dtype.
+// This predicate also prevents an unwired loader admitting raw F16 model values.
+bool RequiresF16ValueDType(vt::DeviceType dev) {
+  return dev == vt::DeviceType::kROCM;
+}
+
+bool SupportedF16ValueDType(std::optional<vt::DType> dtype) {
+  return dtype == vt::DType::kBF16 || dtype == vt::DType::kF32;
 }
 
 // The GATHER's admission rule; see the header. A block dtype with a row decoder
@@ -197,7 +231,7 @@ bool KeepQuantGatherDType(uint32_t ggml_type, vt::DType* out) {
 // CUDA backend (cuda_ops.cu, through cuda_quant_dequant.cuh) -- named in prose
 // rather than as the enumerator on purpose, because the leakage checker greps
 // the token in comments too, and rightly so: a prose mention is how the next
-// hand-kept device list starts. METAL, VULKAN, ROCM and
+// hand-kept device list starts. METAL, VULKAN and
 // TENSTORRENT register only `kEmbedding`, whose kernels each assert a float
 // table by name, so they answer false here and keep their pre-existing
 // expand-bf16 residency -- and their gather arms are owed.
@@ -215,8 +249,8 @@ bool DeviceQuantGatherSupported(vt::DeviceType dev) {
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
   vt::DType dt = vt::DType::kF32;
   if (!vt::BlockDTypeFromGgmlTypeId(ggml_type, &dt)) return false;
-  // Q8_K is the K-quants' ACTIVATION encoding; it never appears as a file
-  // weight type and has no vec_dot, so it is not keep-quant capable.
+  // Q8_K is the K-quants' ACTIVATION encoding and has no weight-side vec_dot, so
+  // it is not keep-quant capable, although a file CAN carry it (reader case 15).
   if (!vt::cpu::HasQuantDotKernel(dt)) return false;
   if (out != nullptr) *out = dt;
   return true;
@@ -226,7 +260,8 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
                               bool cpu_ref, GgufTensorRole role,
                               uint32_t ggml_type,
                               const std::vector<int64_t>& shape,
-                              vt::DeviceType dev) {
+                              vt::DeviceType dev,
+                              std::optional<vt::DType> weight_value_dtype) {
   // The oracle switch wins over everything (spec gate 2).
   if (cpu_ref) return GgufResidency::kExpandBf16;
 
@@ -275,7 +310,11 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
   // 2. Keep-f16 (an F16 file weight in a verbatim role, incl. the gather table).
   // Independent of keep_quant: F16 is not a block encoding, so a weight is never
   // eligible for both. No block-alignment constraint — f16 is per-element.
-  if (keep_f16 && KeepF16DType(ggml_type) &&
+  const bool f16_consumer = !RequiresF16ValueDType(dev) ||
+      (SupportedF16ValueDType(weight_value_dtype) &&
+       (role == GgufTensorRole::kMatmulWeight ||
+        role == GgufTensorRole::kEmbeddingTable));
+  if (keep_f16 && f16_consumer && KeepF16DType(ggml_type) &&
       KeepF16KDim(role, shape) > 0) {
     return GgufResidency::kKeepF16;
   }
@@ -283,11 +322,17 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
   return GgufResidency::kExpandBf16;
 }
 
-GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
+GgufLoadPolicy GgufLoadPolicy::FromEnv(
+    vt::DeviceType dev, std::optional<vt::DType> model_dtype) {
   GgufLoadPolicy p;
   // FIRST, because every device-dependent flag below reads it. It is the
   // ENGINE's resolved device, not `CurrentPlatform()`: see the field comment.
   p.device = dev;
+  if (RequiresF16ValueDType(dev) && model_dtype) {
+    VT_CHECK(SupportedF16ValueDType(model_dtype),
+             "GGUF retained F16 weights require resolved BF16 or F32 model values");
+    p.weight_value_dtype = model_dtype;
+  }
   p.cpu_ref = EnvOn("VT_CPU_REF");
   // CIQ G4 flipped this default: keep-quant is ON wherever the running device
   // can execute the quantized GEMM. VT_GGUF_KEEP_QUANT is the two-way
@@ -355,10 +400,11 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
   //     revisiting it is QUANT-GGUF-KEEPQ-LOADER's decision and needs the re-take
   //     first. See .agents/specs/oracle-llamacpp-repin-stock.md, row 12.
   //
-  // VT_GGUF_KEEP_F16=0 is the opt-out; rides expand_nk so it is CPU-only and off
-  // under VT_CPU_REF regardless (the oracle load stays byte-identical).
-  p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", p.expand_nk) && p.expand_nk &&
-               DeviceKeepF16Supported(dev);
+  // VT_GGUF_KEEP_F16=0 opts out. ROCm requires explicit model values; other
+  // backends retain their expand_nk prerequisite. VT_CPU_REF always expands.
+  const bool f16_available = RequiresF16ValueDType(dev)
+      ? p.weight_value_dtype.has_value() && !p.cpu_ref : p.expand_nk;
+  p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", f16_available) && f16_available;
   // `QUANT-GGUF-NVFP4` column C. Same shape as the keep-quant default: ON
   // wherever the running device can execute the NVFP4 GEMM (CUDA today; a CPU
   // build keeps expanding, which is correct but unquantized), with
@@ -379,8 +425,9 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
   // variable, and it applies the same whole-value polarity `EnvOnOr` did, so an
   // environment-only run resolves byte-for-byte as before. `VT_CPU_REF` still wins
   // over both: the oracle switch is not a residency preference.
-  p.mmap_residency = ResolveGgufMmap(p.keep_quant) && !p.cpu_ref;
-  p.share_tied_head = EnvOnOr("VT_GGUF_SHARE_TIED_HEAD", p.expand_nk) && p.expand_nk;
+  p.mmap_residency = ResolveGgufMmap(p.keep_quant || p.keep_f16) && !p.cpu_ref;
+  const bool share_available = p.expand_nk || p.keep_f16;
+  p.share_tied_head = EnvOnOr("VT_GGUF_SHARE_TIED_HEAD", share_available) && share_available;
   // GDN split-projection orientation. Rides expand_nk (so VT_CPU_REF=1
   // reproduces the historical transpose); VT_GGUF_GDN_NK=0 is the narrow
   // same-binary A/B that reverts only the GDN projections to [K, N].
@@ -399,6 +446,11 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
   // rather than called there.
   p.quant_repack = QuantRepackForDevice(p.keep_quant, p.cpu_ref,
                                         vt::cpu::QuantRepackActive(), dev);
+  // The load-time prefault, with the SAME device term and for a reason of the
+  // same shape: the transform is worth paying for only where the forward reads
+  // the borrowed pages. See `GgufPrefaultForDevice`. `VT_GGUF_PREFAULT` and
+  // `vllm_cpp.mmap.prefault` still win over the device.
+  p.prefault = GgufPrefaultForDevice(dev);
   // KERNEL-GEMM-CPU-TILED lever 2, elementwise [N,K] -> [K,N] repack-at-load.
   // OPT-IN ONLY (default false) because the repacked bytes are transposed and
   // only the CPU MatmulBTKernel honours Tensor.elem_kn_repacked today; see the
@@ -426,13 +478,12 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
 // this GEMM have a `vec_dot` for this encoding", so for a PLACED routed-expert
 // tower it is a question about the placement device, not about the engine.
 //
-// Measured, on GLM-5.3 `UD-IQ1_S` on `strix:gpu0`: `DeviceKeepQuantSupported`
-// serves {Q8_0, Q4_K, Q5_K, Q6_K} on ROCm, so all 228 IQ1_S/IQ3_XXS/IQ2_XXS/
-// IQ4_XS/Q2_K/Q3_K towers routed `kExpandBf16` and `LoadStackedExperts` refused
-// the load by name -- for towers whose bytes never reach the GPU at all (that
-// model reads a tower only through `GlmExpertSlice`, never through
-// `ResidentWeight`) and which the installed plan had already sent to the CPU,
-// whose `vec_dot` table covers every one of those six encodings.
+// On GLM-5.3 `UD-IQ1_S`, five of the six expert formats now stay quantized on
+// ROCm: IQ1_S/IQ3_XXS/IQ2_XXS/Q2_K/Q3_K. IQ4_XS still routes
+// `kExpandBf16`, so `LoadStackedExperts` can refuse a load for a tower whose
+// bytes never reach the GPU (the model reads a tower only through
+// `GlmExpertSlice`, never through `ResidentWeight`) and which the installed
+// plan has already sent to the CPU. The CPU `vec_dot` table covers all six.
 //
 // THIS IS #1136 AND #2406 ONE SEAM FURTHER ALONG. Both were the same shape: a
 // residency decision resolved against a device other than the one that would
@@ -460,7 +511,7 @@ GgufResidency GgufLoadPolicy::Route(const GgufTensorInfo& tensor,
                                     GgufTensorRole role) const {
   const GgufResidency r = RouteGgufTensor(
       keep_quant, keep_f16, nvfp4_fp4, cpu_ref, role, tensor.ggml_type,
-      tensor.shape, ComputeDeviceFor(tensor.name, role));
+      tensor.shape, ComputeDeviceFor(tensor.name, role), weight_value_dtype);
   if (audit) audit(tensor.name, role, r);
   return r;
 }
@@ -481,7 +532,8 @@ GgufResidency PeekRoute(const GgufLoadPolicy& policy, const GgufTensorInfo& tens
   // one file, which is the defect #1378 records.
   return RouteGgufTensor(policy.keep_quant, policy.keep_f16, policy.nvfp4_fp4,
                          policy.cpu_ref, role, tensor.ggml_type, tensor.shape,
-                         policy.ComputeDeviceFor(tensor.name, role));
+                         policy.ComputeDeviceFor(tensor.name, role),
+                         policy.weight_value_dtype);
 }
 
 }  // namespace vllm
