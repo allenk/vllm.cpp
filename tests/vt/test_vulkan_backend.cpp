@@ -992,11 +992,24 @@ TEST_CASE("vt_matmul_vec selects its load width and row count from the shape") {
     return std::make_pair(key, after);
   };
 
-  // "<module>|<a dt>,<b dt>,<out dt>,<unroll>,<rows>,<pack>" -- bf16 = 2, f32 = 0,
-  // unroll 4 by default.
-  auto expect = [](uint32_t a_dt, uint32_t rows, uint32_t pack) {
+  // "<module>|<a dt>,<b dt>,<out dt>,<unroll>,<rows>,<pack>,<reduce>,<batch>,
+  //  <brows>" -- bf16 = 2, f32 = 0, unroll 4 by default.
+  //
+  // NINE fields, not six. The host passes nine specialization values
+  // (vulkan_ops.cpp:1951 `const uint32_t spec[9]`) and vulkan_context.cpp:1638
+  // writes one key field per value, so a six-field string matches NOTHING and
+  // every subcase here failed on a variant the backend had selected correctly.
+  // The prefix was right the whole time; the tail is what the reduce / batch /
+  // brows axes added. Verified against the keys the cache actually holds:
+  //
+  //   vt_matmul_vec|2,2,0,4,1,2,0,1,1     vt_matmul_vec|2,2,0,4,1,1,0,1,1
+  //   vt_matmul_vec|2,2,0,4,1,0,0,1,1     vt_matmul_vec|0,2,0,4,1,0,0,1,1
+  //
+  // reduce and brows are constant across every shape this case builds; batch is
+  // a parameter so a batched shape does not silently match a single-row key.
+  auto expect = [](uint32_t a_dt, uint32_t rows, uint32_t pack, uint32_t batch = 1) {
     return "vt_matmul_vec|" + std::to_string(a_dt) + ",2,0,4," + std::to_string(rows) + "," +
-           std::to_string(pack);
+           std::to_string(pack) + ",0," + std::to_string(batch) + ",1";
   };
   auto has = [](const std::vector<std::string>& v, const std::string& want) {
     for (const std::string& s : v) {
@@ -1177,13 +1190,20 @@ TEST_CASE("the scalar matmul takes the COLUMN-BLOCKED variant and it is bit-iden
   // specialization VALUES are the only place the mechanism is visible, which is
   // why PipelineKeys() exists.
   //
-  // Key layout is "<module>|<a dtype>,<b dtype>,<out dtype>,<bt>,<ncols>";
-  // bf16 = 2, f32 = 0 (DtypeCode, src/vt/vulkan/vulkan_ops.cpp), bt = 0 here.
+  // Key layout is "<module>|<a dtype>,<b dtype>,<out dtype>,<bt>,<ncols>,
+  // <kunroll>,<mrows>"; bf16 = 2, f32 = 0 (DtypeCode,
+  // src/vt/vulkan/vulkan_ops.cpp), bt = 0 here.
+  //
+  // SEVEN fields, not five -- vt_matmul grew the KUNROLL and MROWS axes, and a
+  // five-field string matches nothing. Same drift as the vt_matmul_vec case
+  // above and the spec-constant table before it: the prefix was always right.
+  // The keys the cache actually holds here are
+  //   vt_matmul|2,2,0,0,4,1,1  (blocked)   vt_matmul|2,2,0,0,1,1,1  (flat)
   const std::vector<std::string> keys = ctx.PipelineKeys();
   const bool has_blocked =
-      std::find(keys.begin(), keys.end(), std::string("vt_matmul|2,2,0,0,4")) != keys.end();
+      std::find(keys.begin(), keys.end(), std::string("vt_matmul|2,2,0,0,4,1,1")) != keys.end();
   const bool has_flat =
-      std::find(keys.begin(), keys.end(), std::string("vt_matmul|2,2,0,0,1")) != keys.end();
+      std::find(keys.begin(), keys.end(), std::string("vt_matmul|2,2,0,0,1,1,1")) != keys.end();
   std::string joined;
   for (const std::string& k : keys) { joined += k; joined += " "; }
   CAPTURE(joined);
