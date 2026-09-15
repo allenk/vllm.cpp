@@ -1,6 +1,12 @@
-// Exact runtime selector for the six vendored Triton AOT CUDA trees shipped in
-// the release fat binary. The other four release SMs use the portable CUDA
+// Exact runtime selector for the vendored Triton AOT CUDA trees shipped in the
+// release fat binary. The remaining release SMs use the portable CUDA
 // implementation; a cubin is never tried on a merely similar architecture.
+//
+// This fork ships SEVEN trees where upstream ships six: sm_120 (12.0) is ours,
+// for the RTX PRO 6000 Blackwell this project develops on. The count is named
+// ONCE below and every array arity derives from it, because the arity being
+// written out by hand is exactly how upstream's own dispatch test arrived
+// asserting six on a tree that has seven.
 #pragma once
 
 #include <array>
@@ -8,6 +14,9 @@
 #include <utility>
 
 namespace vt::cuda {
+
+// The number of vendored trees. TritonAotTreeIndex returns [0, kTritonAotTreeCount).
+inline constexpr std::size_t kTritonAotTreeCount = 7;
 
 inline constexpr int TritonAotTreeIndex(int major, int minor) {
   if (major == 8 && minor == 0) return 0;
@@ -28,7 +37,7 @@ inline constexpr int TritonAotTreeIndex(int major, int minor) {
 
 template <typename Result, typename Function, typename... Args>
 Result DispatchTritonAot(int major, int minor, Result fallback,
-                         const std::array<Function, 7>& trees,
+                         const std::array<Function, kTritonAotTreeCount>& trees,
                          Args&&... args) {
   const int index = TritonAotTreeIndex(major, minor);
   if (index < 0) return fallback;
@@ -38,7 +47,7 @@ Result DispatchTritonAot(int major, int minor, Result fallback,
 
 template <typename Function, typename... Args>
 bool DispatchTritonAotVoid(int major, int minor,
-                           const std::array<Function, 7>& trees,
+                           const std::array<Function, kTritonAotTreeCount>& trees,
                            Args&&... args) {
   const int index = TritonAotTreeIndex(major, minor);
   if (index < 0) return false;
