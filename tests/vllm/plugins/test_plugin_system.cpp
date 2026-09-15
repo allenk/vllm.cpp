@@ -22,6 +22,7 @@
 #include <string_view>
 #include <vector>
 
+#include "support/test_env.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/plugins/plugins.h"
 
@@ -55,11 +56,10 @@ bool ToyArchRegistered() {
 // all). Always followed by ResetLoadedForTesting so the next LoadGeneralPlugins
 // re-reads the env under a cleared load-once latch.
 void SetAllowlist(const char* value) {
-  if (value == nullptr) {
-    ::unsetenv("VLLM_PLUGINS");
-  } else {
-    ::setenv("VLLM_PLUGINS", value, /*overwrite=*/1);
-  }
+  // vllm_test::SetEnv maps a null-or-empty value to a DELETE on both platforms,
+  // which is exactly the nullptr arm here. The shim exists (issue #603) so this
+  // does not grow a fifth private _putenv_s branch.
+  vllm_test::SetEnv("VLLM_PLUGINS", value);
   vllm::plugins::ResetLoadedForTesting();
 }
 

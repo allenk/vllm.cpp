@@ -54,7 +54,12 @@
 // CI NEVER RUNS THIS. It is an executable and no test, like its sibling
 // `tools/bench/music3_vocoder_conv_ab.cpp`; the build compiles it so the one
 // file a reader has to compile to reproduce the measurement cannot rot.
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <sys/resource.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -92,10 +97,26 @@ std::vector<float> Fill(Lcg& rng, size_t n) {
 }
 
 double UserSeconds() {
+#ifdef _WIN32
+  // GetProcessTimes reports kernel+user time summed over EVERY thread of the
+  // process, which is what getrusage(RUSAGE_SELF) reports on POSIX. That total
+  // is the point: failure mode 4 above ("THE THREADS ARE NOT RUNNING") is
+  // detected by CPU time exceeding wall time, so a per-thread clock
+  // (GetThreadTimes, clock()) would silently disarm the check. FILETIME counts
+  // 100-ns ticks.
+  FILETIME created{}, exited{}, kernel{}, user{};
+  if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user) == 0) return 0.0;
+  const auto seconds = [](const FILETIME& f) {
+    return 1e-7 * static_cast<double>((static_cast<uint64_t>(f.dwHighDateTime) << 32) |
+                                      static_cast<uint64_t>(f.dwLowDateTime));
+  };
+  return seconds(user) + seconds(kernel);
+#else
   rusage ru{};
   getrusage(RUSAGE_SELF, &ru);
   return static_cast<double>(ru.ru_utime.tv_sec) + 1e-6 * static_cast<double>(ru.ru_utime.tv_usec) +
          static_cast<double>(ru.ru_stime.tv_sec) + 1e-6 * static_cast<double>(ru.ru_stime.tv_usec);
+#endif
 }
 
 double Now() {

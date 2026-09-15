@@ -68,7 +68,17 @@ vllm_cpp_add_test(test_generation_config vllm/config/test_generation_config.cpp)
 # so it is not behind VLLM_CPP_SERVER; the fake-hub half is, below.
 vllm_cpp_add_test(test_hf_cache vllm/transformers_utils/test_hf_cache.cpp)
 vllm_cpp_add_test(test_safetensors vllm/test_safetensors.cpp)
-vllm_cpp_add_test(test_load_direct_upload vllm/test_load_direct_upload.cpp)
+# Linux-only by SUBJECT, not merely by API. Its observable is that
+# madvise(MADV_DONTNEED) on a private anonymous mapping DISCARDS the pages, so a
+# later read returns zeroes -- the file's own PLATFORM NOTE says the BSDs and
+# macOS leave the contents intact and that a port "owes this section a residency
+# observation with different semantics, not a tolerance widening". Windows is
+# the same case: VirtualAlloc/VirtualFree would compile and the suite would go
+# green while asserting a behaviour this platform does not have, which is worse
+# than not running it. The production release it pins is Linux-gated too.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  vllm_cpp_add_test(test_load_direct_upload vllm/test_load_direct_upload.cpp)
+endif()
 vllm_cpp_add_test(test_gguf vllm/test_gguf.cpp)
 vllm_cpp_add_test(test_nvfp4_dequant vllm/test_nvfp4_dequant.cpp)
 vllm_cpp_add_test(test_awq_gptq_dequant vllm/test_awq_gptq_dequant.cpp)
