@@ -3225,8 +3225,17 @@ TEST_CASE("packed V-row reorder equals the element-level reorder (W4d W4)") {
     const char* name;
     uint32_t ggml_type;
     int64_t block_bytes;
+    // Byte offsets of the f16 fields INSIDE the block, -1 for absent. They are
+    // not at 0/2 for every encoding, and a random f16 in a scale slot is the
+    // NaN this test set out to avoid:
+    //   q4_K { f16 d@0; f16 dmin@2; u8 scales[12]@4; u8 qs[128]@16 }
+    //   q6_K { u8 ql[128]@0; u8 qh[64]@128; i8 scales[16]@192; f16 d@208 }
+    // (cpu_quant_dequant.cpp DequantQ4_K / DequantQ6_K.) q6_K's int8 scales
+    // need no pinning -- an int8 cannot be NaN.
+    int64_t d_off;
+    int64_t min_off;
   };
-  const Enc encs[] = {{"q6_K", 14, 210}, {"q4_K", 12, 144}};
+  const Enc encs[] = {{"q6_K", 14, 210, 208, -1}, {"q4_K", 12, 144, 0, 2}};
   const int64_t K = 512, row_off = 3, num_k = 2, rpk = 3, head_rows = 2;
   const int64_t rows = row_off + num_k * rpk * head_rows;  // 15
 
@@ -3235,14 +3244,19 @@ TEST_CASE("packed V-row reorder equals the element-level reorder (W4d W4)") {
     const int64_t row_bytes = K / 256 * e.block_bytes;
     std::vector<uint8_t> packed(static_cast<size_t>(rows * row_bytes));
     for (size_t b = 0; b < packed.size(); b += e.block_bytes) {
-      // pin the block's scale/min bits to valid f16 payloads; randomize the
-      // quant elements (a random f16 scale can be inf/NaN and NaN != NaN).
+      // Randomize the whole block FIRST, then pin the f16 scale fields at
+      // their real offsets. Writing the scales first and randomizing from
+      // byte 4 assumes every encoding puts them at 0/2, which q6_K does not:
+      // its f16 d is the LAST two bytes, so it stayed random, and a random
+      // f16 scale is inf/NaN -- and NaN != NaN makes the CHECK below
+      // unconditionally false. That was invisible until the reference
+      // reorder stopped crashing before reaching it.
+      for (int64_t i = 0; i < e.block_bytes; ++i)
+        packed[b + i] = static_cast<uint8_t>(rng() & 0xFF);
       const uint16_t d = vt::F32ToF16(0.05f + 0.01f * static_cast<float>(b % 97));
       const uint16_t s = vt::F32ToF16(0.004f + 0.001f * static_cast<float>(b % 31));
-      std::memcpy(packed.data() + b, &d, 2);
-      if (e.block_bytes > 2) std::memcpy(packed.data() + b + 2, &s, 2);
-      for (int64_t i = 4; i < e.block_bytes; ++i)
-        packed[b + i] = static_cast<uint8_t>(rng() & 0xFF);
+      std::memcpy(packed.data() + b + e.d_off, &d, 2);
+      if (e.min_off >= 0) std::memcpy(packed.data() + b + e.min_off, &s, 2);
     }
 
     // candidate: reorder the packed bytes, then dequant per row
