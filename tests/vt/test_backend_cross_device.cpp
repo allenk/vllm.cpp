@@ -202,7 +202,7 @@ Tensor TI64(void* p, Device d, int64_t n) {
 // ---------------------------------------------------------------------------
 TEST_CASE("device Copy/Memset are BIT-EXACT against the host bytes") {
   for (DeviceType dt : RegisteredDevices()) {
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
 
@@ -451,7 +451,7 @@ TEST_CASE("rmsnorm accepts a bf16 weight beside an f32 activation, on every devi
 
   for (DeviceType dt : RegisteredDevices()) {
     if (dt == DeviceType::kCPU) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     if (!OpAvailable(vt::OpId::kRmsNorm, dt)) continue;
     ++exercised;
     vt::Backend& dev = vt::GetBackend(dt);
@@ -522,7 +522,7 @@ TEST_CASE("bf16<->f32 casts are BIT-EXACT against the CPU codec") {
 
   for (DeviceType dt : RegisteredDevices()) {
     if (!OpAvailable(vt::OpId::kCastBf16, dt) || !OpAvailable(vt::OpId::kCastF32, dt)) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d{dt, 0};
@@ -601,7 +601,7 @@ TEST_CASE("elementwise ops match the CPU oracle within NMSE <= 5e-4") {
   }
 
   for (DeviceType dt : RegisteredDevices()) {
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d{dt, 0};
@@ -677,7 +677,7 @@ TEST_CASE("RopeFromCache matches the CPU oracle within NMSE <= 5e-4, both styles
 
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kRopeFromCache, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -743,7 +743,7 @@ TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
 
   for (DeviceType dt : RegisteredDevices()) {
     if (!OpAvailable(vt::OpId::kReshapeAndCache, dt)) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d{dt, 0};
@@ -821,7 +821,7 @@ TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
 
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kReshapeAndCache, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       CAPTURE("unbind");
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
@@ -923,7 +923,7 @@ TEST_CASE("paged attention matches the CPU oracle within NMSE <= 5e-4") {
 
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kPagedAttention, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -991,7 +991,7 @@ TEST_CASE("paged attention matches the CPU oracle within NMSE <= 5e-4") {
 
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kPagedAttention, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       CAPTURE("decode");
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
@@ -1072,7 +1072,7 @@ TEST_CASE("Embedding gather and greedy argmax match the CPU oracle EXACTLY") {
   REQUIRE(ref_tok[0] == 2);  // the oracle itself must honour the tie-break
 
   for (DeviceType dt : RegisteredDevices()) {
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d{dt, 0};
@@ -1153,7 +1153,7 @@ TEST_CASE("GEMM matches the CPU oracle within NMSE <= 5e-4, both orientations") 
   }
 
   for (DeviceType dt : RegisteredDevices()) {
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d{dt, 0};
@@ -1218,7 +1218,7 @@ TEST_CASE("row-reducing ops match the CPU oracle within NMSE <= 5e-4") {
     cpu.DestroyQueue(cq);
 
     for (DeviceType dt : RegisteredDevices()) {
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -1301,7 +1301,7 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
 
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kFusedChain, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -1461,7 +1461,7 @@ TEST_CASE("paged attention at Qwen3 geometry (bf16, GQA 2, head_dim 128) matches
 
   for (DeviceType dt : RegisteredDevices()) {
     if (!OpAvailable(vt::OpId::kPagedAttention, dt)) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d{dt, 0};
@@ -1571,7 +1571,7 @@ TEST_CASE("GDN state gather/scatter are BIT-EXACT against the CPU oracle") {
           if (!OpAvailable(vt::OpId::kGdnStateGather, dt) ||
               !OpAvailable(vt::OpId::kGdnStateScatter, dt))
             continue;
-          CAPTURE(DeviceName(dt));
+          CAPTURE(std::string(DeviceName(dt)));
           vt::Backend& dev = vt::GetBackend(dt);
           Queue q = dev.CreateQueue();
           const Device d{dt, 0};
@@ -1648,7 +1648,7 @@ TEST_CASE("causal conv1d fwd/update match the CPU oracle") {
 
   for (DeviceType dt : RegisteredDevices()) {
     if (!OpAvailable(vt::OpId::kCausalConv1dFwd, dt)) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d{dt, 0};
@@ -1726,7 +1726,7 @@ TEST_CASE("causal conv1d fwd/update match the CPU oracle") {
     }
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kCausalConv1dUpdate, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -1801,7 +1801,7 @@ TEST_CASE("GdnPostConv matches the CPU oracle within NMSE <= 5e-4") {
   }
   for (DeviceType dt : RegisteredDevices()) {
     if (!OpAvailable(vt::OpId::kGdnPostConv, dt)) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d{dt, 0};
@@ -1882,7 +1882,7 @@ TEST_CASE("GDN prefill/decode recurrence matches the CPU oracle within NMSE <= 5
   }
   for (DeviceType dt : RegisteredDevices()) {
     if (!OpAvailable(vt::OpId::kGdnPrefill, dt)) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d{dt, 0};
@@ -1947,7 +1947,7 @@ TEST_CASE("GDN prefill/decode recurrence matches the CPU oracle within NMSE <= 5
     }
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kGdnDecode, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -2037,7 +2037,7 @@ TEST_CASE("KDA per-K-channel-decay recurrence matches the CPU oracle within NMSE
 
   for (DeviceType dt : RegisteredDevices()) {
     if (!OpAvailable(vt::OpId::kKdaGatedDeltaRule, dt)) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d{dt, 0};
@@ -2112,7 +2112,7 @@ TEST_CASE("RmsNormGated and SigmoidGate match the CPU oracle") {
       }
       for (DeviceType dt : RegisteredDevices()) {
         if (!OpAvailable(vt::OpId::kRmsNormGated, dt)) continue;
-        CAPTURE(DeviceName(dt));
+        CAPTURE(std::string(DeviceName(dt)));
         vt::Backend& dev = vt::GetBackend(dt);
         Queue q = dev.CreateQueue();
         const Device d{dt, 0};
@@ -2159,7 +2159,7 @@ TEST_CASE("RmsNormGated and SigmoidGate match the CPU oracle") {
     }
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kSigmoidGateBf16, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -2250,7 +2250,7 @@ TEST_CASE("FusedNormRope matches the CPU oracle within NMSE <= 5e-4, both styles
 
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kFusedNormRope, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -2332,7 +2332,7 @@ TEST_CASE("AttnQkNormRopeGate matches the CPU oracle within NMSE <= 5e-4") {
       }
       for (DeviceType dt : RegisteredDevices()) {
         if (!OpAvailable(vt::OpId::kAttnQkNormRopeGate, dt)) continue;
-        CAPTURE(DeviceName(dt));
+        CAPTURE(std::string(DeviceName(dt)));
         vt::Backend& dev = vt::GetBackend(dt);
         Queue q = dev.CreateQueue();
         const Device d{dt, 0};
@@ -2396,7 +2396,7 @@ TEST_CASE("AttnQkNormRopeGate matches the CPU oracle within NMSE <= 5e-4") {
     }
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kAttnQkNormRopeGate, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -2456,7 +2456,7 @@ TEST_CASE("AttnQkNormRopeGate matches the CPU oracle within NMSE <= 5e-4") {
     }
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kAttnQkNormRopeGate, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -2586,7 +2586,7 @@ TEST_CASE("MoeRouterTopK matches the CPU oracle (f32 and bf16 logits)") {
       }
       for (DeviceType dt : RegisteredDevices()) {
         if (!OpAvailable(vt::OpId::kMoeRouterTopK, dt)) continue;
-        CAPTURE(DeviceName(dt));
+        CAPTURE(std::string(DeviceName(dt)));
         vt::Backend& dev = vt::GetBackend(dt);
         Queue q = dev.CreateQueue();
         const Device d{dt, 0};
@@ -2671,7 +2671,7 @@ TEST_CASE("decode-skinny MatmulBT (wvSplitK path) matches the CPU oracle") {
       }
       for (DeviceType dt : RegisteredDevices()) {
         if (!OpAvailable(vt::OpId::kMatmulBT, dt)) continue;
-        CAPTURE(DeviceName(dt));
+        CAPTURE(std::string(DeviceName(dt)));
         vt::Backend& dev = vt::GetBackend(dt);
         Queue q = dev.CreateQueue();
         const Device d{dt, 0};
@@ -2775,7 +2775,7 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
     }
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kMatmulBTQuant, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -2880,7 +2880,7 @@ TEST_CASE("IQ4_NL keeps upstream's association order d*(s1+s2), bit for bit") {
 
   for (DeviceType dt : RegisteredDevices()) {
     if (!OpAvailable(vt::OpId::kMatmulBTQuant, dt)) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d_id{dt, 0};
@@ -2987,7 +2987,7 @@ TEST_CASE("keep-quant Q6_K GEMM runs at the production launch geometry") {
     // MACs on every CI run for that non-result.
     if (dt == DeviceType::kCPU) continue;
     if (!OpAvailable(vt::OpId::kMatmulBTQuant, dt)) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d{dt, 0};
@@ -4156,7 +4156,7 @@ TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
     }
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kMatmulBTQuantGrouped, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -4318,7 +4318,7 @@ TEST_CASE("fused MoE gate+up+SwiGLU grouped GEMM matches the CPU oracle and is N
 
       for (DeviceType dt : RegisteredDevices()) {
         if (!OpAvailable(vt::OpId::kMoeGateUpSwiGLUGrouped, dt)) continue;
-        CAPTURE(DeviceName(dt));
+        CAPTURE(std::string(DeviceName(dt)));
         vt::Backend& dev = vt::GetBackend(dt);
         Queue q = dev.CreateQueue();
         const Device d{dt, 0};
@@ -4406,7 +4406,7 @@ TEST_CASE("ReshapeAndCache->PagedAttention composition matches CPU (real dims, s
   }
   for (DeviceType dt : RegisteredDevices()) {
     if (!OpAvailable(vt::OpId::kPagedAttention, dt) || !OpAvailable(vt::OpId::kReshapeAndCache, dt)) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q_ = dev.CreateQueue();
     const Device d{dt, 0};
@@ -4613,7 +4613,7 @@ TEST_CASE("reference tier: an op with no native kernel matches the CPU oracle (u
     // Only meaningful where the device LACKS a native kernel for the op; where it
     // has one, the native path is already covered by the NMSE cases above.
     if (vt::OpRegistered(vt::OpId::kRelu, dt)) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
 
     const unsigned long long hits_before = vt::GetReferenceTierHits();
     vt::Backend& dev = vt::GetBackend(dt);
@@ -4745,7 +4745,7 @@ TEST_CASE("ConcatAndCacheMla writes the concatenated MLA entry BIT-EXACTLY") {
 
   for (DeviceType dt : RegisteredDevices()) {
     if (!OpAvailable(vt::OpId::kConcatAndCacheMla, dt)) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(std::string(DeviceName(dt)));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d{dt, 0};
@@ -4817,7 +4817,7 @@ TEST_CASE("ConcatMlaNopeRope concatenates BIT-EXACTLY, broadcast rope head and p
 
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kConcatMlaNopeRope, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -4889,7 +4889,7 @@ TEST_CASE("GatherMlaCache gathers through the block table BIT-EXACTLY, with and 
 
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kGatherMlaCache, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -4972,7 +4972,7 @@ TEST_CASE("BatchedMatmul matches the CPU oracle within NMSE <= 5e-4, dense and s
 
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kBatchedMatmul, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -5130,7 +5130,7 @@ TEST_CASE("MlaPrefillAttention matches the CPU oracle: causal, non-causal, windo
 
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kMlaPrefillAttention, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -5246,7 +5246,7 @@ TEST_CASE("MlaDecodeAttention matches the CPU oracle: dense, windowed, selected,
 
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kMlaDecodeAttention, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
