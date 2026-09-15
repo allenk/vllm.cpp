@@ -162,7 +162,7 @@ were left alone.
 
 ## 4. The failure mode this fork keeps hitting
 
-Four separate times, the same shape:
+Five separate times, the same shape:
 
 ```
 this fork ADDS a capability      and the gate that COUNTS it stays at upstream's number
@@ -170,7 +170,19 @@ this fork ADDS a capability      and the gate that COUNTS it stays at upstream's
   two decode-GEMV shaders        test_vulkan_backend.cpp asserted 36 modules, disk had 38
   the Windows CUDA lane          release-matrix.json never declared the id it downloads
   the cuda_windows job itself    PRIMARY_ARTIFACT_FORMATS never learned it either
+  the sm_120 dispatch tree       upstream's NEW test asserted six trees, header had seven
 ```
+
+The fifth one arrived from the opposite direction and is worth separating: we
+did not forget a counter, the 248-commit merge DELIVERED one. Upstream wrote a
+dispatch test encoding its own six-tree table, and on this tree it did not even
+compile -- and three of its assertions were wrong rather than merely mis-sized,
+including one that would have asserted the AOT fast path is OFF on the only card
+this project develops on.
+
+=> **Every merge from upstream can import a gate that counts something this fork
+has more of.** A merge that compiles is not evidence of this; that one happened
+not to.
 
 Upstream does not have these capabilities, so upstream's counters never grow on
 their own, and every one of them failed CLOSED — loudly, at release time, on a
