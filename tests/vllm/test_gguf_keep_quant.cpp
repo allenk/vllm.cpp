@@ -416,10 +416,10 @@ TEST_CASE("quant_repack is decided WITH the resolved device (#2406)") {
   // any host. With it, on an aarch64 i8mm box (dgx, thor, orin — every box
   // where the defect was reachable) the old expression answers `true` and this
   // case reds. The truth table above is what gates the rule everywhere else.
-  vllm_test::SetEnv("VT_GGUF_KEEP_QUANT", "1");
+  ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
   CHECK(!GgufLoadPolicy::FromEnv(vt::DeviceType::kCUDA).quant_repack);
   CHECK(!GgufLoadPolicy::FromEnv(vt::DeviceType::kROCM).quant_repack);
-  vllm_test::UnsetEnv("VT_GGUF_KEEP_QUANT");
+  ::unsetenv("VT_GGUF_KEEP_QUANT");
   // On the CPU the flag is exactly what the host ISA says, which is the
   // property that makes this a device gate and not a disablement. On an i8mm
   // box this reads `true`, which is the same answer the loader gave before
@@ -1020,8 +1020,8 @@ TEST_CASE("the gather's DEVICE gate is the OP TABLE, not a hand-kept device list
 }
 
 TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
-  vllm_test::UnsetEnv("VT_CPU_REF");
-  vllm_test::UnsetEnv("VT_GGUF_KEEP_QUANT");
+  ::unsetenv("VT_CPU_REF");
+  ::unsetenv("VT_GGUF_KEEP_QUANT");
   // keep_f16 additionally requires an f16-capable MatmulBT on the running
   // device (review #523): the ROCm kernel accepts bf16/f32 only, so keep_f16
   // is OFF on ROCm regardless of expand_nk.
@@ -1064,7 +1064,7 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
     CHECK(p.keep_f16 == (vllm::GgufQuantComputeAvailable(vt::DeviceType::kCPU) && f16_device_ok));
     CHECK_FALSE(p.cpu_ref);
   }
-  vllm_test::SetEnv("VT_GGUF_KEEP_QUANT", "1");
+  ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
   CHECK(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).keep_quant);
   CHECK(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).expand_nk);
   // L7: keep-f16 defaults to expand_nk (true here, keep-quant is env-forced ON).
@@ -1074,12 +1074,12 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
   CHECK(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).keep_f16 ==
         keep_f16_expected(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU)));
   // The opt-out must work after the default flip.
-  vllm_test::SetEnv("VT_GGUF_KEEP_F16", "0");
+  ::setenv("VT_GGUF_KEEP_F16", "0", 1);
   CHECK_FALSE(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).keep_f16);
-  vllm_test::UnsetEnv("VT_GGUF_KEEP_F16");
+  ::unsetenv("VT_GGUF_KEEP_F16");
   // The OPT-OUT the spec promised must survive the default flip.
   for (const char* off : {"0", "false", "off", ""}) {
-    vllm_test::SetEnv("VT_GGUF_KEEP_QUANT", off);
+    ::setenv("VT_GGUF_KEEP_QUANT", off, 1);
     CAPTURE(off);
     CHECK_FALSE(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).keep_quant);
     CHECK_FALSE(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).expand_nk);
@@ -1087,36 +1087,36 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
   }
   // VT_GGUF_KEEP_F16=1 opts IN, but ONLY where expand_nk holds (CPU, not oracle);
   // it is inert with keep-quant off (nothing to keep) or under VT_CPU_REF.
-  vllm_test::SetEnv("VT_GGUF_KEEP_QUANT", "1");
-  vllm_test::SetEnv("VT_GGUF_KEEP_F16", "1");
+  ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
+  ::setenv("VT_GGUF_KEEP_F16", "1", 1);
   CHECK(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).keep_f16 ==
         keep_f16_expected(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU)));
   for (const char* on : {"1", "true", "on"}) {
-    vllm_test::SetEnv("VT_GGUF_KEEP_F16", on);
+    ::setenv("VT_GGUF_KEEP_F16", on, 1);
     CAPTURE(on);
     CHECK(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).keep_f16 ==
         keep_f16_expected(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU)));
   }
-  vllm_test::UnsetEnv("VT_GGUF_KEEP_F16");
-  vllm_test::SetEnv("VT_GGUF_KEEP_QUANT", "1");
-  vllm_test::SetEnv("VT_CPU_REF", "1");
+  ::unsetenv("VT_GGUF_KEEP_F16");
+  ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
+  ::setenv("VT_CPU_REF", "1", 1);
   {
     // The oracle switch: keep-quant requested, oracle wins — and it takes the
     // orientation and keep-f16 with it, so VT_CPU_REF=1 is the FULL historical
     // load.
-    vllm_test::SetEnv("VT_GGUF_KEEP_F16", "1");
+    ::setenv("VT_GGUF_KEEP_F16", "1", 1);
     const GgufLoadPolicy p = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
     CHECK(p.keep_quant);
     CHECK(p.cpu_ref);
     CHECK_FALSE(p.expand_nk);
     CHECK_FALSE(p.keep_f16);
-    vllm_test::UnsetEnv("VT_GGUF_KEEP_F16");
+    ::unsetenv("VT_GGUF_KEEP_F16");
     CHECK(p.Route(vllm::GgufTensorInfo{"w", {8, 256}, kQ4_K, nullptr, 0},
                   GgufTensorRole::kMatmulWeight) ==
           GgufResidency::kExpandBf16);
   }
-  vllm_test::UnsetEnv("VT_CPU_REF");
-  vllm_test::UnsetEnv("VT_GGUF_KEEP_QUANT");
+  ::unsetenv("VT_CPU_REF");
+  ::unsetenv("VT_GGUF_KEEP_QUANT");
 }
 
 // The default is only correct if it means "a block weight has a consumer". On
@@ -1582,8 +1582,8 @@ TEST_CASE("loader keep-quant experts load as a lossless stacked tower (A3)") {
 // device can run the quantized GEMM, an env-driven load must equal a load
 // under an explicitly-ON policy, block dtypes and orientation included.
 TEST_CASE("production default is keep-quant wherever the quant GEMM exists") {
-  vllm_test::UnsetEnv("VT_CPU_REF");
-  vllm_test::UnsetEnv("VT_GGUF_KEEP_QUANT");
+  ::unsetenv("VT_CPU_REF");
+  ::unsetenv("VT_GGUF_KEEP_QUANT");
   const DenseDims d;
   const TempFile f(BuildDenseQ8Gguf(d));
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
@@ -1978,10 +1978,10 @@ TEST_CASE("the oracle path shares NOTHING and borrows NOTHING") {
 }
 
 TEST_CASE("FromEnv derives both L5 switches, and VT_CPU_REF overrides them") {
-  vllm_test::UnsetEnv("VT_CPU_REF");
-  vllm_test::UnsetEnv("VT_GGUF_MMAP");
-  vllm_test::UnsetEnv("VT_GGUF_SHARE_TIED_HEAD");
-  vllm_test::SetEnv("VT_GGUF_KEEP_QUANT", "1");
+  ::unsetenv("VT_CPU_REF");
+  ::unsetenv("VT_GGUF_MMAP");
+  ::unsetenv("VT_GGUF_SHARE_TIED_HEAD");
+  ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
   {
     const GgufLoadPolicy p = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
     CHECK(p.keep_quant);
@@ -1993,8 +1993,8 @@ TEST_CASE("FromEnv derives both L5 switches, and VT_CPU_REF overrides them") {
   // A/B-able against the production default.
   for (const char* off : {"0", "false", "off", ""}) {
     CAPTURE(off);
-    vllm_test::SetEnv("VT_GGUF_MMAP", off);
-    vllm_test::SetEnv("VT_GGUF_SHARE_TIED_HEAD", off);
+    ::setenv("VT_GGUF_MMAP", off, 1);
+    ::setenv("VT_GGUF_SHARE_TIED_HEAD", off, 1);
     const GgufLoadPolicy p = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
     CHECK(p.keep_quant);
     CHECK_FALSE(p.mmap_residency);
@@ -2002,19 +2002,19 @@ TEST_CASE("FromEnv derives both L5 switches, and VT_CPU_REF overrides them") {
   }
   // Turning keep-quant off takes both with it: there is nothing to borrow when
   // every weight expands, and the head is transposed again.
-  vllm_test::UnsetEnv("VT_GGUF_MMAP");
-  vllm_test::UnsetEnv("VT_GGUF_SHARE_TIED_HEAD");
-  vllm_test::SetEnv("VT_GGUF_KEEP_QUANT", "0");
+  ::unsetenv("VT_GGUF_MMAP");
+  ::unsetenv("VT_GGUF_SHARE_TIED_HEAD");
+  ::setenv("VT_GGUF_KEEP_QUANT", "0", 1);
   {
     const GgufLoadPolicy p = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
     CHECK_FALSE(p.mmap_residency);
     CHECK_FALSE(p.share_tied_head);
   }
   // The oracle switch wins over both, even when they are asked for explicitly.
-  vllm_test::SetEnv("VT_GGUF_KEEP_QUANT", "1");
-  vllm_test::SetEnv("VT_GGUF_MMAP", "1");
-  vllm_test::SetEnv("VT_GGUF_SHARE_TIED_HEAD", "1");
-  vllm_test::SetEnv("VT_CPU_REF", "1");
+  ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
+  ::setenv("VT_GGUF_MMAP", "1", 1);
+  ::setenv("VT_GGUF_SHARE_TIED_HEAD", "1", 1);
+  ::setenv("VT_CPU_REF", "1", 1);
   {
     const GgufLoadPolicy p = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
     CHECK(p.cpu_ref);
@@ -2022,10 +2022,10 @@ TEST_CASE("FromEnv derives both L5 switches, and VT_CPU_REF overrides them") {
     CHECK_FALSE(p.mmap_residency);
     CHECK_FALSE(p.share_tied_head);
   }
-  vllm_test::UnsetEnv("VT_CPU_REF");
-  vllm_test::UnsetEnv("VT_GGUF_MMAP");
-  vllm_test::UnsetEnv("VT_GGUF_SHARE_TIED_HEAD");
-  vllm_test::UnsetEnv("VT_GGUF_KEEP_QUANT");
+  ::unsetenv("VT_CPU_REF");
+  ::unsetenv("VT_GGUF_MMAP");
+  ::unsetenv("VT_GGUF_SHARE_TIED_HEAD");
+  ::unsetenv("VT_GGUF_KEEP_QUANT");
 }
 
 TEST_CASE("OwnedBytes refuses to MUTATE a borrowed buffer") {
@@ -2412,18 +2412,18 @@ TEST_CASE("L7 load-time prefault is byte-transparent on a borrowed F16 weight") 
   GgufLoadPolicy mmap = KeepF16On();
   mmap.mmap_residency = true;
 
-  vllm_test::SetEnv("VT_GGUF_PREFAULT", "0");
+  ::setenv("VT_GGUF_PREFAULT", "0", 1);
   vllm::ResetGgufPrefaultedSpanCountForTesting();
   const vllm::Qwen3_5DenseWeights woff =
       vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
   const uint64_t spans_off = vllm::GgufPrefaultedSpanCount();
 
-  vllm_test::SetEnv("VT_GGUF_PREFAULT", "1");
+  ::setenv("VT_GGUF_PREFAULT", "1", 1);
   vllm::ResetGgufPrefaultedSpanCountForTesting();
   const vllm::Qwen3_5DenseWeights won =
       vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
   const uint64_t spans_on = vllm::GgufPrefaultedSpanCount();
-  vllm_test::UnsetEnv("VT_GGUF_PREFAULT");
+  ::unsetenv("VT_GGUF_PREFAULT");
 
   CHECK(won.lm_head.bytes.borrowed());        // still an in-place borrow
   CHECK(won.lm_head.bytes.data() == oh.data);
@@ -2469,7 +2469,7 @@ TEST_CASE("LOAD-IO the prefault reports the BYTES it paged in, not just spans") 
   GgufLoadPolicy mmap = KeepF16On();
   mmap.mmap_residency = true;
 
-  vllm_test::SetEnv("VT_GGUF_PREFAULT", "0");
+  ::setenv("VT_GGUF_PREFAULT", "0", 1);
   vllm::ResetGgufPrefaultedSpanCountForTesting();
   { const vllm::Qwen3_5DenseWeights woff = vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap); (void)woff; }
   // OFF means zero in BOTH units. A bytes counter incremented outside the
@@ -2477,7 +2477,7 @@ TEST_CASE("LOAD-IO the prefault reports the BYTES it paged in, not just spans") 
   CHECK(vllm::GgufPrefaultedBytes() == 0);
   CHECK(vllm::GgufPrefaultSeconds() == 0.0);
 
-  vllm_test::SetEnv("VT_GGUF_PREFAULT", "1");
+  ::setenv("VT_GGUF_PREFAULT", "1", 1);
   vllm::ResetGgufPrefaultedSpanCountForTesting();
   const vllm::Qwen3_5DenseWeights won =
       vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
@@ -2507,7 +2507,7 @@ TEST_CASE("LOAD-IO the prefault reports the BYTES it paged in, not just spans") 
   (void)wtwice;
   CHECK(vllm::GgufPrefaultedBytes() == 2 * bytes);
   CHECK(vllm::GgufPrefaultedSpanCount() == 2 * spans);
-  vllm_test::UnsetEnv("VT_GGUF_PREFAULT");
+  ::unsetenv("VT_GGUF_PREFAULT");
 }
 
 TEST_CASE("a borrowed F16 weight OUTLIVES the GgufFile and the file") {
@@ -2856,7 +2856,7 @@ class ScopedF16Env {
       vllm_test::SetEnv(name_, old_value_);
 #else
       // Preserve an empty POSIX value as distinct from an absent variable.
-      vllm_test::SetEnv(name_, old_value_);  // throws instead of terminating
+      if (::setenv(name_, old_value_.c_str(), 1) != 0) std::terminate();
 #endif
     }
   }

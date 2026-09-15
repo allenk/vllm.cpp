@@ -20,7 +20,6 @@
 #include <utility>
 #include <vector>
 
-#include "support/test_env.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5.h"
@@ -41,13 +40,13 @@ class ScopedEnv {
       had_old_ = true;
       old_ = old;
     }
-    vllm_test::SetEnv(name, value);
+    setenv(name, value, 1);
   }
   ~ScopedEnv() {
     if (had_old_) {
-      vllm_test::SetEnv(name_.c_str(), old_.c_str());
+      setenv(name_.c_str(), old_.c_str(), 1);
     } else {
-      vllm_test::UnsetEnv(name_.c_str());
+      unsetenv(name_.c_str());
     }
   }
   ScopedEnv(const ScopedEnv&) = delete;

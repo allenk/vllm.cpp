@@ -56,10 +56,26 @@ bool ToyArchRegistered() {
 // all). Always followed by ResetLoadedForTesting so the next LoadGeneralPlugins
 // re-reads the env under a cleared load-once latch.
 void SetAllowlist(const char* value) {
-  // vllm_test::SetEnv maps a null-or-empty value to a DELETE on both platforms,
-  // which is exactly the nullptr arm here. The shim exists (issue #603) so this
-  // does not grow a fifth private _putenv_s branch.
-  vllm_test::SetEnv("VLLM_PLUGINS", value);
+  // NOT vllm_test::SetEnv, and this is the exception its own header describes:
+  // "A test that genuinely needs a defined-but-empty variable cannot use this
+  // helper and has to say so at its own call site." This is that call site.
+  //
+  // The two states are DIFFERENT here and the shim collapses them. VLLM_PLUGINS
+  // UNSET means load every plugin (see the `// load all` call below);
+  // VLLM_PLUGINS="" means an allowlist of {""}, which matches no plugin name and
+  // therefore disables all of them -- Phase 1 below is built on exactly that
+  // distinction. SetEnv maps an empty value to a DELETE on both platforms, so
+  // routing through it turned "disable everything" into "load everything" and
+  // the toy and broken plugins both ran.
+  //
+  // Found the expensive way: the shim looked like the right answer, its header
+  // even names the three files that grew private _putenv_s branches, and the
+  // caveat is in that same header two paragraphs down. Three CPU lanes went red.
+  if (value == nullptr) {
+    ::unsetenv("VLLM_PLUGINS");
+  } else {
+    ::setenv("VLLM_PLUGINS", value, /*overwrite=*/1);
+  }
   vllm::plugins::ResetLoadedForTesting();
 }
 
