@@ -97,8 +97,14 @@ _expect("no-vendored-tree" OFF "sm_121a" ON "${_scratch}/empty" "${_root}" OFF)
 
 vt_triton_aot_available_arches(_arches)
 list(LENGTH _arches _n_arches)
-if(NOT _n_arches EQUAL 6)
-  _fail("expected six vendored trees, got ${_n_arches}")
+# SEVEN here, not upstream's six: sm_120a is this fork's tree, vendored for the
+# consumer Blackwell this project develops on. Pinning the COUNT is the point of
+# this check, so the literal stays a literal -- it just has to be the right one.
+# THIRD gate that counted six: scripts/check-triton-aot-multiarch.py (c567a3760),
+# cmake/TritonAOTMultiArchTest.cmake (18a6912c7), and this. Each was found by a
+# separate CI run because each earlier fix looked for gates and did not sweep.
+if(NOT _n_arches EQUAL 7)
+  _fail("expected seven vendored trees, got ${_n_arches}")
 endif()
 file(MAKE_DIRECTORY "${_scratch}/partial")
 foreach(_arch IN LISTS _arches)

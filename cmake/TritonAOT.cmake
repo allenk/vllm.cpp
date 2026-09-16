@@ -257,7 +257,7 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
     "${_manifest_line}")
 
   if(NOT VLLM_CPP_TRITON_REGEN)
-    # ── BUILDER path: consume and namespace all six vendored trees. ──────────
+    # ── BUILDER path: consume and namespace all seven vendored trees. ────────
     _triton_aot_arch_names(_arch_names)
     set(_all_sources)
     set(_dispatch_dir "${CMAKE_BINARY_DIR}/triton_aot_multiarch")

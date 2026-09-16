@@ -87,6 +87,12 @@ EXEMPT_LANES = {
     "vulkan_windows": (
         "Windows MSVC. Same lane and the same recorded debt as cpu_windows"
     ),
+    "cuda_windows": (
+        "Windows MSVC. Same lane and the same recorded debt as cpu_windows. "
+        "This fork adds the job; the two Windows lanes above were already "
+        "classified here before any of them existed in release.yml, which is "
+        "why only the third one reddened the gate"
+    ),
 }
 
 
