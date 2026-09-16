@@ -2538,7 +2538,31 @@ TEST_CASE("MoeSiluMul matches the CPU oracle within NMSE <= 5e-4") {
         vt::MoeSiluMul(q, tout, tg, tu);
         std::vector<uint16_t> got(n);
         doutb.Download(got.data());
-        CHECK(got == ref_b);  // single multiply + RNE store both sides: exact
+        // NMSE, not ==, and the case title already said so. The bitwise form
+        // rested on "single multiply + RNE store both sides: exact", which only
+        // holds while the device arm and the CPU arm spell silu the same way.
+        // They need not: g/(1+exp(-g)) and g*sigmoid(g) are the same function
+        // and different roundings, and a backend is free to pick either for its
+        // own kernel. THREE backends already red here on that basis --
+        // #1802 (CUDA sm_110, "differing in the last digit of a handful of
+        // elements, consistent with an ordinary bf16 rounding difference in a
+        // hardware-specific kernel implementation"), #1954 (ROCm gfx1200), and
+        // #907 records the sibling silu_and_mul case on GB10. Vulkan is the
+        // fourth, which is what turned "three platform reds" into "the
+        // assertion is wrong".
+        //
+        // This is the convention the file already follows elsewhere: the
+        // MoeRouterTopK case below states it outright -- arithmetic results are
+        // compared by NMSE, only DISCRETE outputs (there, the selected indices)
+        // require an exact match. silu(gate)*up is arithmetic. The f32 arm of
+        // this very case uses Nmse; the bf16-to-float-then-Nmse shape is used
+        // at four other sites in this file.
+        std::vector<float> gotf(n), reff(n);
+        for (size_t i = 0; i < n; ++i) {
+          gotf[i] = vt::BF16ToF32(got[i]);
+          reff[i] = vt::BF16ToF32(ref_b[i]);
+        }
+        CHECK(Nmse(reff, gotf) <= kNmseTol);
       } else {
         dg.Upload(gate);
         du.Upload(up);
