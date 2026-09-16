@@ -1694,9 +1694,12 @@ endif()
 # Windows CUDA build linked with seven unresolved externals. The translation
 # unit now carries a _WIN32 branch with the same contract (write to a temporary,
 # then rename), so it compiles everywhere and the consumer resolves.
-if(TRUE)
-  target_sources(vllm PRIVATE src/vt/cuda/nvfp4_persistent_cache.cpp)
-endif()
+#
+# UNCONDITIONAL, and deliberately not `if(TRUE)`. The first cut of this change
+# left the block shape behind with a tautological condition, which reads as if
+# a platform test were intended and lost. There is no platform test: every
+# target needs this unit.
+target_sources(vllm PRIVATE src/vt/cuda/nvfp4_persistent_cache.cpp)
 # --- Tenstorrent backend (BACKEND-TENSTORRENT W0 skeleton) -------------------
 # Mostly ADDITIVE like the Metal/Vulkan/ROCm blocks above: a source list, a
 # PUBLIC compile definition, and one link library. TTNN::TTNN is TT-NN's own

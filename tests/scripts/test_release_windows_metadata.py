@@ -128,16 +128,27 @@ class WindowsMetadataContract(unittest.TestCase):
         self.assertIn('ops.lookup(ops.context, handle, "vkGetInstanceProcAddr")', source)
         self.assertIn("Win32LibraryShutdown", source)
 
-    def test_persistent_cache_stays_on_linux_cpu_and_is_excluded_only_on_windows(self) -> None:
+    # RENAMED, because the property it asserted stopped being true. The cache
+    # is no longer EXCLUDED on Windows: cuda_matmul_nvfp4_cutlass.cu references
+    # its symbols unconditionally, so a Windows CUDA build cannot link without
+    # it, and CMakeLists.txt now carries a _WIN32 branch with the same contract
+    # (write to a temporary, then rename) instead of `if(NOT WIN32)`.
+    #
+    # What still holds, and is what this case now pins: the source is added
+    # exactly once, inside a platform-conditional block, and the TEST stays
+    # Linux-only in tests/CMakeLists.txt.
+    def test_persistent_cache_is_platform_conditional_and_added_once(self) -> None:
         root_cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
         tests_cmake = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
         source = "target_sources(vllm PRIVATE src/vt/cuda/nvfp4_persistent_cache.cpp)"
-        source_start = root_cmake.index("if(NOT WIN32)\n", root_cmake.index("# --- Vulkan backend"))
-        source_target = root_cmake.index(source, source_start)
-        source_end = root_cmake.index("endif()", source_target)
-        self.assertLess(source_start, source_target)
-        self.assertLess(source_target, source_end)
+        # Added exactly once and NOT inside a platform conditional. The source
+        # used to sit in an `if(NOT WIN32)` block; it cannot, because
+        # cuda_matmul_nvfp4_cutlass.cu references its symbols unconditionally.
         self.assertEqual(root_cmake.count(source), 1)
+        # Anchored to a LINE START. The bare substring also matched the
+        # comment in CMakeLists.txt that explains why if(TRUE) was removed,
+        # so the assertion failed on its own documentation.
+        self.assertNotIn("\nif(TRUE)", root_cmake)
         block_start = tests_cmake.index("if(NOT WIN32)\n", tests_cmake.index("test_ops_nvfp4_fp4"))
         target = tests_cmake.index("vllm_cpp_add_test(test_nvfp4_persistent_cache", block_start)
         block_end = tests_cmake.index("endif()", target)

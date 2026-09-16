@@ -186,8 +186,8 @@ class PostPublishAuditContract(unittest.TestCase):
             snapshot, remote_bytes, attestations, self.matrix, self.version,
             REPO, SHA, RUN_ID,
         )
-        self.assertEqual(result["asset_count"], 32)
-        self.assertEqual(result["archive_count"], 10)
+        self.assertEqual(result["asset_count"], 35)
+        self.assertEqual(result["archive_count"], 11)
 
     def test_every_remote_invariant_fails_closed(self) -> None:
         mutations = {}
@@ -365,7 +365,7 @@ class PostPublishAuditContract(unittest.TestCase):
             observed, downloads, attestations, self.matrix, self.version,
             REPO, SHA, RUN_ID,
         )
-        self.assertEqual(result["asset_count"], 32)
+        self.assertEqual(result["asset_count"], 35)
 
     def test_annotated_and_lightweight_tags_resolve_to_the_commit(self) -> None:
         with mock.patch.object(

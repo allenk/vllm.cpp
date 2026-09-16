@@ -54,8 +54,11 @@ def expected_names(matrix: dict[str, Any], version: str) -> tuple[set[str], set[
     ):
         raise ValueError("audit requires the exact authoritative release matrix")
     artifacts = matrix.get("artifacts")
-    if not isinstance(artifacts, list) or len(artifacts) != 10:
-        raise ValueError("audit requires the canonical ten-artifact matrix")
+    # ELEVEN since this fork added windows-x86_64-msvc-cuda. The count is
+    # asserted rather than derived on purpose -- the audit exists to refuse a
+    # matrix that silently lost or gained a lane -- so it just has to be right.
+    if not isinstance(artifacts, list) or len(artifacts) != 11:
+        raise ValueError("audit requires the canonical eleven-artifact matrix")
     archives: set[str] = set()
     names = {"release-index.json", "RELEASE_INDEX.md"}
     ids: set[str] = set()
@@ -75,8 +78,11 @@ def expected_names(matrix: dict[str, Any], version: str) -> tuple[set[str], set[
         ids.add(artifact_id)
         archives.add(archive)
         names.update((archive, archive + ".sha256", archive + ".provenance.json"))
-    if len(names) != 32:
-        raise ValueError("audited release must have exactly 32 canonical assets")
+    # 35, not 32: {release-index.json, RELEASE_INDEX.md} plus THREE names per
+    # artifact (archive, .sha256, .provenance.json). This fork has eleven
+    # artifacts rather than ten, so 2 + 11*3 = 35.
+    if len(names) != 35:
+        raise ValueError("audited release must have exactly 35 canonical assets")
     return names, archives
 
 
@@ -191,8 +197,8 @@ def validate_remote_release(
             raise ValueError(f"required release job {required} did not succeed exactly once")
 
     asset_rows = release.get("assets")
-    if not isinstance(asset_rows, list) or len(asset_rows) != 32:
-        raise ValueError("GitHub release must report exactly 32 assets")
+    if not isinstance(asset_rows, list) or len(asset_rows) != 35:
+        raise ValueError("GitHub release must report exactly 35 assets")
     by_name: dict[str, dict[str, Any]] = {}
     for row in asset_rows:
         name = row.get("name") if isinstance(row, dict) else None

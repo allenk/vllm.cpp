@@ -731,7 +731,9 @@ class ReleasePipelineContract(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 assert_archive_producer_format(self, [mutant], "zip")
 
-    def test_publish_matrix_contains_all_ten_primary_bundles_with_explicit_formats(self) -> None:
+    # ELEVEN, not ten: this fork adds windows-x86_64-msvc-cuda alongside the
+    # two Windows lanes the matrix already declared.
+    def test_publish_matrix_contains_all_primary_bundles_with_explicit_formats(self) -> None:
         matrix = json.loads(MATRIX.read_text(encoding="utf-8"))
         artifacts = self.pipeline.validate_matrix(matrix)
         self.assertTrue(matrix["release_ready"])
@@ -748,6 +750,7 @@ class ReleasePipelineContract(unittest.TestCase):
                 "macos-arm64-metal-mlx": "preview",
                 "windows-x86_64-msvc-cpu": "preview",
                 "windows-x86_64-msvc-vulkan": "preview",
+                "windows-x86_64-msvc-cuda": "preview",
             },
         )
         self.assertTrue(all(item["required"] is True for item in artifacts))

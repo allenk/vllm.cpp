@@ -74,6 +74,9 @@ class ShippedFilesTests(unittest.TestCase):
                 "cpu_windows",
                 "cpu_x86",
                 "cuda_arm64",
+                # This fork adds the third Windows lane; the other two were
+                # already here, as they already were in EXEMPT_LANES.
+                "cuda_windows",
                 "cuda_x86",
                 "metal_arm64",
                 "mlx_arm64",
