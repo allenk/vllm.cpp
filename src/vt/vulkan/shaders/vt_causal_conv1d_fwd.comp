@@ -157,8 +157,28 @@ void main() {
   // passed in, so a short sequence simply leaves the later blocks empty instead
   // of the host having to know each length.
   const uint tb = (t_len + VT_CONV_BLOCKS - 1u) / VT_CONV_BLOCKS;
-  const uint t_lo = blk * tb;
-  const uint t_hi = min(t_lo + tb, t_len);
+  // BLOCK 0 TAKES EVERY t THAT READS THE CARRIED STATE, which is t < width.
+  //
+  // It has to, because block 0 is ALSO the block that overwrites that state at
+  // the end of this same dispatch, and there is no ordering between workgroups.
+  // The plain `blk * tb` split let a t < width land on blk > 0, whose `old_row`
+  // copy is then a race against block 0's write-back: whichever workgroup the
+  // driver happened to schedule first decided the answer.
+  //
+  // Measured before the fix, with VT_CONV_BLOCKS = 5 (what the host picks for
+  // the cross-device case: base_groups 1, avg_len 5): the wrong elements were
+  // exactly the (sequence, t) pairs with t < width that fell outside block 0 --
+  // seq0 t=1,2 and seq2 t=2 -- never t=0, and never a t inside block 0.
+  // Forcing a single block via VT_VULKAN_CONV_TARGET_GROUPS=1 turned 20 bad
+  // elements into 0 across three runs without touching any code, which is what
+  // identified the split rather than the arithmetic as the cause.
+  //
+  // The cost is that block 0 may carry up to `width` tokens instead of `tb`.
+  // width is K-1 and K is small, and the blocks it displaces simply come out
+  // empty (t_lo >= t_hi), so the grid is unchanged.
+  const uint t_lo = (blk == 0u) ? 0u : max(blk * tb, p.width);
+  const uint t_hi = (blk == 0u) ? min(max(tb, p.width), t_len)
+                                : min(blk * tb + tb, t_len);
 
   for (uint t = t_lo; t < t_hi; ++t) {
     float acc = b;
