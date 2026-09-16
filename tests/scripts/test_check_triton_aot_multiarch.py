@@ -19,6 +19,11 @@ FLAGS = {
     "sm_89": 0x00590559,
     "sm_90a": 0x005A0D5A,
     "sm_100a": 0x0600640A,
+    # sm_120a is this fork's tree (consumer Blackwell). The fixture BUILDS its
+    # tree set from this dict, so a tree missing here is a tree the synthetic
+    # vendored root does not create -- which is why no grep for `six` or a
+    # literal count finds this one. It is the FOURTH place that counted six.
+    "sm_120a": 0x06007802,
     "sm_121a": 0x0600790A,
 }
 
@@ -69,7 +74,7 @@ class TritonAotMultiArchContract(unittest.TestCase):
                 check=False,
             )
 
-    def test_exact_six_trees_and_namespaced_symbols_pass(self) -> None:
+    def test_exact_tree_set_and_namespaced_symbols_pass(self) -> None:
         result = self.run_checker()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
