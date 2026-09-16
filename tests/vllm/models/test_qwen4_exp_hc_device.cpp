@@ -651,11 +651,18 @@ TEST_CASE("vt::Qwen4ExpGatedResidual refuses by name") {
                                                    t_down, t_up, &t_inject, ok),
                          doctest::Contains("null TOGETHER"), std::exception);
   }
+  // The two Contains() below say hyper_state, not hyper. The parameter was
+  // renamed in 7a000fc91: Windows SDK rpcndr.h:210 does `#define hyper
+  // __int64`, so every .cu that reaches it through cub preprocesses
+  // `const Tensor& hyper` into `const Tensor& __int64` and fails to compile.
+  // The diagnostics name the parameter, so they moved with it and these
+  // expectations have to as well -- a rename is not finished until the
+  // strings that quote the name have been grepped for.
   SUBCASE("a hyper stream that is not hc_count * hidden_size wide") {
     Tensor narrow = MakeT(hyper.data(), DType::kF32, {T, kFlat - HC});
     CHECK_THROWS_WITH_AS(vt::Qwen4ExpGatedResidual(q, t_mixed, &t_inj, narrow, t_w,
                                                    t_down, t_up, &t_inject, ok),
-                         doctest::Contains("hyper must be"), std::exception);
+                         doctest::Contains("hyper_state must be"), std::exception);
   }
   SUBCASE("a mix_up in mix_down's orientation") {
     // [R, flat] where [flat, R] belongs: the single most likely porting slip,
@@ -990,6 +997,6 @@ TEST_CASE("vt::Qwen4ExpGatedResidual keeps its ELEMENTWISE operands float") {
     Tensor bad = MakeQ8_0T(qh.data(), {T, kFlat});
     CHECK_THROWS_WITH_AS(vt::Qwen4ExpGatedResidual(q, t_mixed, nullptr, bad, t_g,
                                                    t_down, t_up, nullptr, args),
-                         doctest::Contains("hyper must be float"), std::exception);
+                         doctest::Contains("hyper_state must be float"), std::exception);
   }
 }
