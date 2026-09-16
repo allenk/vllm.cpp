@@ -808,6 +808,21 @@ jobs:
           python3 tests/scripts/test_claim_view.py
           python3 tests/scripts/test_upstream_inventory.py
       - name: Live-state rows are reconciled against Git reality
+        # UPSTREAM ONLY, and the step's own comment below says why without
+        # quite reaching the conclusion: "It does not cover a FORK, whose
+        # branch is a ref `origin` cannot hold". On this fork `origin` is
+        # allenk/vllm.cpp, which has no `row/*` heads at all -- that branch
+        # naming belongs to upstream's in-flight PR flow, which this fork does
+        # not run. The fetch therefore resolves zero refs and
+        # `require_branch_information` aborts, correctly refusing to report an
+        # IN-FLIGHT verdict it cannot compute.
+        #
+        # Skipped rather than worked around: pushing upstream's 267 row heads
+        # into this fork to satisfy a classifier for a workflow we do not use
+        # would be 648 commits of noise, and loosening the abort would trade a
+        # loud refusal for a quiet misreport -- which is the exact failure the
+        # abort was added to prevent.
+        if: github.repository == 'mudler/vllm.cpp'
         # The classifier reads its evidence from `origin/main`. This job's
         # checkout already uses `fetch-depth: 0`, which DOES leave
         # `refs/remotes/origin/*` behind, so the ref is present today -- the

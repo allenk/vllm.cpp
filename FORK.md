@@ -120,6 +120,11 @@ release/release-version.json     the -vk version
 .github/workflows/release.yml    the fork guard, the three Windows jobs
 release/release-matrix.json      windows-x86_64-msvc-cuda
 scripts/check-triton-aot-multiarch.py   the sm_120a row
+cmake/TritonAOT*Test.cmake       the seven-tree counts
+tests/scripts/test_check_triton_aot_multiarch.py   the sm_120a fixture
+.github/workflows/ci.yml         the upstream-only guard on audit-live-rows
+release/release-version.json + the eight files that spell 0.0.3-vk.1
+scripts/env-doc-allowlist.txt    our 42 Vulkan/Triton-CPU tuning knobs
 this file
 ```
 
