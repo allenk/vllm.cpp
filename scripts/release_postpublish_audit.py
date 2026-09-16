@@ -157,8 +157,8 @@ def validate_remote_release(
     tag = declaration.get("tag")
     if set(declaration) != {"prerelease", "project_version", "schema", "tag", "version"} or (
         declaration.get("schema") != "vllm.cpp.release-version.v1"
-        or version != "0.0.3-pre.1" or project_version != "0.0.3"
-        or tag != "v0.0.3-pre.1" or declaration.get("prerelease") is not True
+        or version != "0.0.3-vk.1" or project_version != "0.0.3"
+        or tag != "v0.0.3-vk.1" or declaration.get("prerelease") is not True
     ):
         raise ValueError("audit release identity must be the authorized pre-alpha")
     names, archives = expected_names(matrix, version)

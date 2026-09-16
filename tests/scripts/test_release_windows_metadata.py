@@ -62,7 +62,7 @@ class WindowsMetadataContract(unittest.TestCase):
             output_dir=output, pe_report=pe_report, repo_root=ROOT, source_clean=True,
             source_commit=SHA, stage_dir=stage, tier_report=tier_report,
             toolchain="Visual Studio 2022 v143 /MT", toolset_version="14.38.33130",
-            ucrt_version="10.0.20348.0", version="0.0.3-pre.1",
+            ucrt_version="10.0.20348.0", version="0.0.3-vk.1",
         )
 
     def test_cpu_metadata_is_native_preview_and_sbom_names_exe(self) -> None:

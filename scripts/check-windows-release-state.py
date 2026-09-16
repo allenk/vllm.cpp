@@ -73,7 +73,7 @@ def validate_wiring(preflight: str, ci: str, audit_workflow: str) -> list[str]:
         "attestations: read",
         "ref: ${{ github.event.workflow_run.head_sha }}",
         "python3 scripts/release_postpublish_audit.py",
-        '--repo "${GITHUB_REPOSITORY}"', "--tag v0.0.3-pre.1",
+        '--repo "${GITHUB_REPOSITORY}"', "--tag v0.0.3-vk.1",
         '--sha "${{ github.event.workflow_run.head_sha }}"',
         '--run-id "${{ github.event.workflow_run.id }}"',
         "--release-version release/release-version.json",
