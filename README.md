@@ -356,11 +356,11 @@ hardware-blocked and why, is linked from [Project status](#project-status).
 |---|---|---|
 | **CUDA** | GB10 / DGX Spark (sm_121a) | Runtime-gated. 27B at/above vLLM throughput, 35B prefill-pending |
 | **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 to sm_121a) | Per-arch builds pass; ten-SM archive candidate awaits hosted cubin audit; no runtime proof here |
-| **CPU (Triton)** | x86-64 Linux | Optional acceleration provider above the native CPU one, off unless `VLLM_CPP_TRITON_CPU` is set. Kernels are loaded with `dlopen`, which is compiled out on Windows, so a Windows build registers the provider and declines every op |
+| **CPU (Triton)** | x86-64 Linux | Optional provider above the native CPU one, off unless `VLLM_CPP_TRITON_CPU` is set. Linux-only: kernels load via `dlopen`. |
 | **RISC-V (RVV)** | riscv64 | Feasibility only: correct under `qemu-riscv64`, faithful to the x86 reference. No performance numbers, not in the release matrix |
 | **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis (SUPERSEDED, #1003), Arm i8mm tier |
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
-| **Vulkan** | Portable GPU | `opt-125m` STRICT token-exact; Qwen3.6-27B decode **matches llama.cpp Vulkan** (4.36 vs 4.35, denominator SUPERSEDED, #1003). Eight added shaders, the two `VK_NV_cooperative_matrix2` ones behind a device capability gate with a portable path; portability gated on Mesa lavapipe (8-wide subgroups) |
+| **Vulkan** | Portable GPU | `opt-125m` STRICT token-exact; Qwen3.6-27B decode **matches llama.cpp Vulkan** (4.36 vs 4.35, denominator SUPERSEDED, #1003). Eight added shaders; coopmat2 behind a capability gate. |
 | **ROCm** | AMD GPUs | Native EXL3 generation on gfx1151, matching the CPU reference. Discrete GPU correctness and competitive performance remain unverified ([evidence](.agents/specs/backend-rocm-exl3.md)) |
 | **Tenstorrent** | Blackhole | OPT-125m strict 6/6; Qwen3 gate wired, full rerun pending |
 | **Intel XPU / ANE** | Intel, Apple NPU | Spiked or roadmap |
