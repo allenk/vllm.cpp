@@ -165,8 +165,53 @@ And we hold every other engine to the same treatment: same model, same workload,
 | peak memory | 2.83 GiB | 2.80 GiB | 1.01x |
 
 Decode lands inside llama.cpp's own spread, and the memory gap is 30 MiB. Tokens are
-**byte-identical to llama.cpp's greedy decode**. Single-stream only: concurrent serving against
-llama.cpp's server is unmeasured.
+**byte-identical to llama.cpp's greedy decode**.
+
+#### Concurrent serving on CPU, and what it cost to get there
+
+That axis used to read "unmeasured" here. It is measured now, on three CPUs, and it does not
+flatter us.
+
+The quantised CPU path computes one output row per pass over the weights, so concurrent requests
+share nothing and throughput goes flat from about four of them. The **q8_0 repack tier** interleaves
+four output rows so a single fetched weight element feeds sixteen multiply-accumulates instead of
+one. Same file, same binary, one switch (`VT_CPU_QUANT_REPACK`), 128-in/128-out, interleaved legs
+behind a discarded warmup:
+
+| concurrency | 1 | 4 | 8 | 16 | 32 | **scaling** |
+|---|--:|--:|--:|--:|--:|--:|
+| repack **off** | 13.9 | 23.8 | 24.8 | 25.1 | 25.1 | **1.84x** |
+| repack **on** | 16.6 | 39.5 | 53.2 | 61.2 | 64.3 | **3.88x** |
+
+On a Snapdragon 8 Gen 3 the same switch reads **1.18x → 1.72x**. With the tier off, x86, the phone
+and a Jetson Orin all converge on ~1.1–1.2x — which is the clearest statement available that the
+figure describes the kernel and not the silicon.
+
+**llama.cpp is still ahead on this axis**, and by how much is now located rather than guessed:
+
+| | llama.cpp / vllm.cpp |
+|---|--:|
+| decode, c=1 | 1.17x |
+| decode, c=8 | 1.38x |
+| **prefill (TTFT)** | **2.76x** |
+| concurrency scaling | 1.51x |
+
+Decode is close; **prefill is where the deficit lives**. Four candidate causes have been priced and
+all four are small — a larger tile (1.00x; llama.cpp's `tinyBLAS_Q0_AVX` caps at the same 4x4),
+AVX-VNNI (1.025x, implemented and instruction-verified), parallelising the serial activation prep
+(≤1.09x, from an Amdahl fit over a thread sweep), and deferring the in-loop reduction (1.22x). Their
+product is ~1.36x against a per-thread gap of 3.27x, and both kernels reach the same 8 MACs per
+instruction, so the remainder is **open and deliberately unattributed**
+([open gaps](docs/benchmarks/open-gaps.md)).
+
+Two more things the same work established. Our thread scaling is the *better* of the two — 6.99x
+against 5.59x from 1 to 16 threads — so reading only the many-thread cell **understates** the kernel
+gap rather than overstating it. And on an Arm chip with `dotprod` but no `i8mm`, our tier is gated
+off entirely while upstream ggml serves that chip through a second arm we have not ported, so
+everything measured there is repacked-against-not-repacked.
+
+Method, per-platform tables, and the engagement checks that are not throughput:
+[docs/benchmarks/cpu-q8_0-repack.md](docs/benchmarks/cpu-q8_0-repack.md).
 
 > **Every llama.cpp denominator here is SUPERSEDED**: they came from `237ad9b96`, our own local-only
 > fork, 65 performance commits deep. The pin is now stock `b10451` and each figure is owed a re-take
@@ -205,7 +250,9 @@ every figure traces back to the run that produced it.
 
 > **Pre-release, under heavy development.** Correctness is gated token-for-token against a pinned
 > vLLM oracle across 27 gated architectures. Speed is proven on one GPU (GB10, sm_121a) plus a CPU
-> path that matches or beats llama.cpp on GGUF, against a SUPERSEDED fork denominator (#1003).
+> path that matches or beats llama.cpp single-stream on GGUF, against a SUPERSEDED fork denominator
+> (#1003). On the CONCURRENT CPU axis, measured on three CPUs against a freshly built llama.cpp, we
+> are behind: 1.17-1.38x on decode and 2.76x on prefill, with the prefill remainder open.
 > The current public overview is kept in [Project status](#project-status).
 
 ## Quickstart
