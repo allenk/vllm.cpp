@@ -1,31 +1,29 @@
-// CIQ G7 repack-at-load — Arm i8mm gemm/gemv kernels + dispatch.
+// Q8_0 repack tier (CIQ G7): the repacked-layout GEMM, one driver, kernels per ISA.
 //
-// Ported from llama.cpp @ 237ad9b96 `ggml/src/ggml-cpu/arch/arm/repack.cpp`:
-//   ggml_gemm_q8_0_4x8_q8_0  :5006  (NEON + i8mm 4x4-tile prefill kernel)
-//   ggml_gemv_q8_0_4x8_q8_0  :1757  (NEON + dotprod M=1 / leftover-row kernel)
-// selected for q8_0 on NEON + i8mm by `ggml_repack_get_optimal_repack_type`
-// (repack.cpp:4683 -> q8_0_4x8_q8_0 == tensor_traits<block_q8_0, 8, 4>).
+// Renamed from cpu_quant_repack_arm.cpp 2026-09-20. The file used to hold the
+// Arm kernels AND the driver inside `#if __aarch64__ && __ARM_FEATURE_MATMUL_INT8`,
+// which made a second architecture cost a copy of ~80 architecture-free lines.
+// The driver now sits outside; an ISA supplies `GemmTileQ8_0` (prefill, 4x4) and
+// `GemvRowQ8_0` (decode, M=1) and nothing else.
 //
-// DEVIATION for BIT-IDENTITY (recorded). Upstream folds the per-block scale with
-// the FUSED `vfmaq_f32`; this port uses the NON-FUSED `vmlaq_f32` in the SAME
-// block order, so — combined with the global -ffp-contract=off — the float
-// accumulation is the exact `scale = d_w*d_a; acc = cvt(int)*scale + acc`
-// sequence the tier-0 / G6 mmla kernels use (cpu_quant_dot_arm.cpp). The integer
-// mmla/dot sums are exact regardless of grouping, and the interleave carries the
-// quant values verbatim, so the repacked GEMM is byte-for-byte equal to
-// `kMatmulBTQuant`'s non-repacked output (memcmp round-trip test).
+// The Arm kernels are unchanged, line for line: the tier-0 bit-identity contract
+// (non-fused vmla) lives in their arithmetic, and a retype would not show up in
+// review.
 //
-// COMPILE/RUNTIME GATING mirrors the mmla tier: compiled with +i8mm for one TU
-// (CMakeLists), body guarded by `__aarch64__ && __ARM_FEATURE_MATMUL_INT8`, and
-// handed out at runtime only after the shared Linux HWCAP/HWCAP2 or Darwin
-// sysctl detector proves i8mm+DotProd. VT_CPU_QUANT_REPACK can force portable
-// or i8mm; forcing i8mm on unsupported hardware fails before these instructions
-// can execute. Off i8mm aarch64 the loader never repacks.
+// The x86 kernels build the same 4x4 from `maddubs`, since x86 has no `vmmlaq_s32`:
+// broadcasting one activation row across the four 64-bit lanes lines it up
+// against the four interleaved weight rows in one operation. Validated against
+// the plain path before landing -- integer dots exact on 196,608 of 196,608
+// blocks, tile within 2.8e-07 of AVX2-plain (fp32 ordering). Measured there:
+// decode 1.40x, prefill(M=4) 1.66x over an AVX2 plain path, single-threaded and
+// cache-resident, so the engine-level number will be smaller.
+//
+// x86 IS OPT-IN (`VT_CPU_QUANT_REPACK=1`). Landing the tier and changing the
+// default are separate decisions: repack COPIES the weight slice rather than
+// borrowing the mmap, so enabling it raises the loader's peak footprint, and
+// that peak already measures ~2.4x the model on a 7 GB board.
+
 #include "vt/quant.h"
-
-#if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
-
-#include <arm_neon.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -35,14 +33,18 @@
 #include "cpu_quant_blocks.h"
 #include "cpu_quant_repack.h"
 #include "cpu_threadpool.h"
-#include "vt/cpu/cpu_isa_arm.h"
 #include "vt/tensor.h"
 
+#if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
+#define VT_REPACK_ARM 1
+#include <arm_neon.h>
+#include "vt/cpu/cpu_isa_arm.h"
+#elif defined(__AVX2__)
+#define VT_REPACK_X86 1
+#include <immintrin.h>
+#endif
+
 namespace vt::cpu {
-namespace {
-
-}  // namespace
-
 namespace {
 
 float LoadActF32(const Tensor& t, int64_t elem_offset) {
@@ -63,6 +65,8 @@ void StoreOutF32(const Tensor& t, int64_t elem_offset, float v) {
     default: VT_CHECK(false, "quant_repack: unsupported output dtype");
   }
 }
+
+#if defined(VT_REPACK_ARM)
 
 // ggml_gemm_q8_0_4x8_q8_0 (NEON+i8mm branch, repack.cpp:5091-5155), restricted
 // to a range of weight COLUMN-groups [xg0, xg1) so the driver can parallelize
@@ -167,9 +171,124 @@ void GemvRowQ8_0(float* s_row, const BlockQ8_0x4* wgroups,
   }
 }
 
+#elif defined(VT_REPACK_X86)
+
+// int8 dot of one 32-byte chunk. `aw` is |w| read as UNSIGNED bytes and `sa` is
+// `a` carrying w's sign -- which is exactly the (unsigned, signed) operand pair
+// VNNI's vpdpbusd wants, so the VNNI path is a drop-in rather than a rewrite.
+//
+// WHY THIS BRANCH EXISTS. Measured 2026-09-21: this engine emitted ZERO
+// vpdpbusd while llama.cpp's CPU backend emitted 677, on a host whose
+// /proc/cpuinfo reports both avx_vnni and avx512_vnni. llama.cpp's own
+// tinyBLAS carries the identical ladder (llamafile/sgemm.cpp:1754-1764
+// `updot`), and ITS `#else` fallback is byte-for-byte the sequence below -- so
+// we were running llama.cpp's slow path while it ran its fast one. The prefill
+// half of the gap measured 2.76x at the time.
+//
+// The cause was a flag in our own CMakeLists pinning this TU to -mavx2, with a
+// comment justifying it for machines that lack AVX2. That reasoning is sound
+// for "do not crash on old hardware" and says nothing about "do not leave new
+// hardware unused" -- this project's own rule that a backend's default is not
+// its capability, applied to a default we set.
+//
+// -mavxvnni AND NOT -mavx512vnni, deliberately: the 512-bit flag would also let
+// the compiler re-vectorise the whole TU at 512 bits, which changes two things
+// at once. The VEX-encoded 256-bit form keeps the vector width identical so the
+// only variable is the dot instruction itself.
+//
+// BIT-IDENTICAL, not merely close. maddubs accumulates into int16 and can
+// saturate; dpbusd accumulates into int32 and cannot. For q8_0 the operands are
+// bounded by 127, so a pair of products reaches at most 2*127*127 = 32258 <
+// 32767 and the int16 path never saturates -- the two routes agree exactly
+// rather than approximately.
+inline __m256i DotChunk(__m256i w, __m256i a) {
+  const __m256i aw = _mm256_sign_epi8(w, w);
+  const __m256i sa = _mm256_sign_epi8(a, w);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+  return _mm256_dpbusd_epi32(_mm256_setzero_si256(), aw, sa);
+#elif defined(__AVXVNNI__)
+  return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), aw, sa);
+#else
+  const __m256i p16 = _mm256_maddubs_epi16(aw, sa);
+  return _mm256_madd_epi16(p16, _mm256_set1_epi16(1));
+#endif
+}
+
+void GemvRowQ8_0(float* s_row, const BlockQ8_0x4* wgroups,
+                 const BlockQ8_0* a_row, int64_t nblocks, int64_t xg0,
+                 int64_t xg1) {
+  for (int64_t g = xg0; g < xg1; ++g) {
+    const BlockQ8_0x4* bp = wgroups + g * nblocks;
+    __m128 acc = _mm_setzero_ps();
+    for (int64_t b = 0; b < nblocks; ++b, ++bp) {
+      const __m256i* wq = reinterpret_cast<const __m256i*>(bp->qs);
+      const int64_t* aq = reinterpret_cast<const int64_t*>(a_row[b].qs);
+      __m256i s32 = _mm256_setzero_si256();
+      for (int c = 0; c < 4; ++c) {
+        s32 = _mm256_add_epi32(
+            s32, DotChunk(_mm256_loadu_si256(wq + c), _mm256_set1_epi64x(aq[c])));
+      }
+      // dwords [r0a r0b r1a r1b | r2a r2b r3a r3b] -> [r0 r1 r2 r3]
+      const __m256i h = _mm256_hadd_epi32(s32, s32);
+      const __m128i lo = _mm256_castsi256_si128(h);              // [r0 r1 r0 r1]
+      const __m128i hi = _mm256_extracti128_si256(h, 1);         // [r2 r3 r2 r3]
+      const __m128i d4 = _mm_unpacklo_epi64(lo, hi);             // [r0 r1 r2 r3]
+      const __m128 wd = _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(bp->d)));
+      const __m128 scale = _mm_mul_ps(wd, _mm_set1_ps(F16ToF32(a_row[b].d)));
+      acc = _mm_add_ps(acc, _mm_mul_ps(_mm_cvtepi32_ps(d4), scale));
+    }
+    _mm_storeu_ps(s_row + g * kQ8_0xNrowsInterleaved, acc);
+  }
+}
+
+void GemmTileQ8_0(float* s, int64_t bs, const BlockQ8_0x4* wgroups,
+                        const BlockQ8_0x4* agroups, int64_t mgroups,
+                        int64_t nblocks, int64_t xg0, int64_t xg1) {
+  for (int64_t yg = 0; yg < mgroups; ++yg) {
+    const BlockQ8_0x4* a_base = agroups + yg * nblocks;
+    for (int64_t xg = xg0; xg < xg1; ++xg) {
+      const BlockQ8_0x4* bp = wgroups + xg * nblocks;
+      const BlockQ8_0x4* ap = a_base;
+      __m128 accf[4] = {_mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps(),
+                        _mm_setzero_ps()};
+      for (int64_t bi = 0; bi < nblocks; ++bi, ++ap, ++bp) {
+        __m256i acc[4] = {_mm256_setzero_si256(), _mm256_setzero_si256(),
+                          _mm256_setzero_si256(), _mm256_setzero_si256()};
+        for (int c = 0; c < 4; ++c) {
+          const __m256i bv =
+              _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bp->qs + c * 32));
+          const int64_t* arow = reinterpret_cast<const int64_t*>(ap->qs + c * 32);
+          for (int i = 0; i < 4; ++i) {
+            acc[i] = _mm256_add_epi32(
+                acc[i], DotChunk(bv, _mm256_set1_epi64x(arow[i])));
+          }
+        }
+        const __m128 bd =
+            _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(bp->d)));
+        const __m128 ad =
+            _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(ap->d)));
+        alignas(16) float adv[4];
+        _mm_store_ps(adv, ad);
+        for (int i = 0; i < 4; ++i) {
+          const __m256i h = _mm256_hadd_epi32(acc[i], acc[i]);
+          const __m128i d4 = _mm_unpacklo_epi64(_mm256_castsi256_si128(h),
+                                                _mm256_extracti128_si256(h, 1));
+          accf[i] = _mm_add_ps(
+              accf[i], _mm_mul_ps(_mm_cvtepi32_ps(d4),
+                                  _mm_mul_ps(bd, _mm_set1_ps(adv[i]))));
+        }
+      }
+      for (int i = 0; i < 4; ++i) _mm_storeu_ps(s + (yg * 4 + i) * bs + xg * 4, accf[i]);
+    }
+  }
+}
+
+#endif
+
 }  // namespace
 
 bool QuantRepackActive() {
+#if defined(VT_REPACK_ARM)
   static const bool v = [] {
     const char* e = std::getenv("VT_CPU_QUANT_REPACK");
     bool enabled = false;
@@ -180,7 +299,22 @@ bool QuantRepackActive() {
     return enabled;
   }();
   return v;
+#elif defined(VT_REPACK_X86)
+  // OPT-IN on x86 until the loader-footprint cost of repack-at-load has an
+  // engine-level measurement. Same env grammar as the Arm arm.
+  static const bool v = [] {
+    const char* e = std::getenv("VT_CPU_QUANT_REPACK");
+    if (e == nullptr) return false;
+    const std::string s(e);
+    return s == "1" || s == "on" || s == "true" || s == "x86" || s == "avx2";
+  }();
+  return v;
+#else
+  return false;
+#endif
 }
+
+#if defined(VT_REPACK_ARM) || defined(VT_REPACK_X86)
 
 void QuantRepackMatmul(Tensor& out, const Tensor& a, const Tensor& b) {
   VT_CHECK(b.repacked && b.dtype == DType::kQ8_0,
@@ -265,17 +399,12 @@ void QuantRepackMatmul(Tensor& out, const Tensor& a, const Tensor& b) {
   }
 }
 
-}  // namespace vt::cpu
+#else  // no repack kernels on this target; the loader never repacks.
 
-#else  // no aarch64 i8mm — stubs; the loader never repacks, so these are inert.
-
-#include "vt/tensor.h"
-
-namespace vt::cpu {
-bool QuantRepackActive() { return false; }
 void QuantRepackMatmul(Tensor&, const Tensor&, const Tensor&) {
   VT_CHECK(false, "quant_repack_matmul: repack tier is not built on this target");
 }
-}  // namespace vt::cpu
 
 #endif
+
+}  // namespace vt::cpu

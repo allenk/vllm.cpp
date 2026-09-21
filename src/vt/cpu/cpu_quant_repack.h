@@ -8,7 +8,7 @@
 // what lets the repacked GEMM be bit-identical to the tier-0 path. They are
 // architecture-independent and always compiled (the round-trip unit test
 // exercises them on every CI box); only the GEMM kernels that CONSUME the
-// layout are i8mm-gated (cpu_quant_repack_arm.cpp).
+// layout are i8mm-gated (cpu_quant_repack_simd.cpp).
 #pragma once
 
 #include <cstdint>

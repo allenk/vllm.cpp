@@ -1387,7 +1387,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_quant_dot_sdot.cpp
   src/vt/cpu/cpu_quant_dot_arm.cpp
   src/vt/cpu/cpu_quant_repack.cpp
-  src/vt/cpu/cpu_quant_repack_arm.cpp
+  src/vt/cpu/cpu_quant_repack_simd.cpp
   src/vt/cpu/cpu_quant_traits.cpp
   src/vt/cpu/cpu_quant_gemm.cpp
   src/vt/cpu/cpu_layernorm.cpp
@@ -1442,6 +1442,34 @@ add_library(vllm::vllm ALIAS vllm)
 # still applies on top, which is what keeps mul-then-add non-fused and therefore
 # byte-identical to the portable tier.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  # G7 repack tier, x86 half. The kernels are AVX2 (maddubs/sign/madd) and the
+  # branch is selected by __AVX2__, which neither compiler defines unless asked.
+  # This is the ONLY TU given it: widening the whole build's baseline would be a
+  # different decision with its own portability question, and the tier is opt-in
+  # at RUNTIME anyway (VT_CPU_QUANT_REPACK), so a machine without AVX2 simply
+  # never reaches the code.
+  if(MSVC)
+    set_source_files_properties(src/vt/cpu/cpu_quant_repack_simd.cpp PROPERTIES
+      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>")
+  else()
+    # VT_X86_VNNI (default OFF) turns on the vpdpbusd path in DotChunk, which
+    # collapses the int8 dot from two instructions to one. OFF reproduces the
+    # previous binary exactly, so turning it on is an A/B with one variable.
+    #
+    # -mavxvnni and NOT -mavx512vnni on purpose: the 512-bit flag would also let
+    # the compiler re-vectorise this whole TU at 512 bits, which would change the
+    # kernel AND the vector width together and make the measurement unattributable.
+    # AVX-VNNI is Alder Lake / Zen 4 and later; the runtime gate
+    # (VT_CPU_QUANT_REPACK) plus this build flag keep older hosts on the old path.
+    option(VT_X86_VNNI "Build the x86 repack dot with AVX-VNNI (vpdpbusd)" OFF)
+    if(VT_X86_VNNI)
+      set_source_files_properties(src/vt/cpu/cpu_quant_repack_simd.cpp PROPERTIES
+        COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mavx2;-mfma;-mf16c;-mavxvnni>")
+    else()
+      set_source_files_properties(src/vt/cpu/cpu_quant_repack_simd.cpp PROPERTIES
+        COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mavx2;-mfma;-mf16c>")
+    endif()
+  endif()
   # x86-only TUs: <immintrin.h> does not exist on aarch64, so they are ADDED
   # here rather than in the unconditional source list.
   target_sources(vllm PRIVATE
@@ -1478,13 +1506,13 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set_property(SOURCE src/vt/cpu/cpu_quant_dot_sdot.cpp APPEND PROPERTY
       COMPILE_DEFINITIONS VT_CPU_A76_Q8_DOT=1)
   endif()
-  # G6 mmla tier AND G7 repack tier (cpu_quant_repack_arm.cpp) both need i8mm.
+  # G6 mmla tier AND G7 repack tier (cpu_quant_repack_simd.cpp) both need i8mm.
   # The global -ffp-contract=off (top of this file) still applies on top of this
   # per-file -march, which is what keeps the repack gemm/gemv's non-fused
   # `vmlaq_f32` bit-identical to the tier-0 path.
   set_source_files_properties(
     src/vt/cpu/cpu_quant_dot_arm.cpp
-    src/vt/cpu/cpu_quant_repack_arm.cpp PROPERTIES
+    src/vt/cpu/cpu_quant_repack_simd.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-march=armv8.2-a+i8mm+dotprod>")
 endif()
 # Static-init registrars (e.g. the CPU backend, the platform table, the op

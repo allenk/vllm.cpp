@@ -209,7 +209,7 @@ bool GgufNvfp4ComputeAvailable(vt::DeviceType dev);
 //
 // `host_repack_active` IS A PARAMETER, not a call inside this function, and that
 // is what makes the rule testable. `QuantRepackActive()` compiles to a literal
-// `false` on every non-aarch64 target (src/vt/cpu/cpu_quant_repack_arm.cpp), so
+// `false` on every non-aarch64 target (src/vt/cpu/cpu_quant_repack_simd.cpp), so
 // an assertion that reached this decision only through `FromEnv` would pass on
 // x86 CI whether the device term existed or not — a mute switch, not a gate.
 // This is the same move `RouteGgufTensor` above made for `dev`: a decision that
