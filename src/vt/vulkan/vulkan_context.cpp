@@ -1549,12 +1549,91 @@ void* VulkanContext::AllocBuffer(size_t bytes, void** out_buffer, void** out_mem
 
   VkMemoryRequirements req{};
   vk.vkGetBufferMemoryRequirements(device, buffer, &req);
-  VkMemoryAllocateInfo mai{};
-  mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  mai.allocationSize = req.size;
-  mai.memoryTypeIndex = memory_type_index_;
+
+  // PER-ALLOCATION fallback, and the memory type re-derived against THIS
+  // buffer's requirements.
+  //
+  // The index picked at init (memory_type_index_) was found with type_bits =
+  // ~0u, i.e. without any particular buffer in hand, and was then used
+  // unconditionally. Two problems with that, one latent and one measured:
+  //
+  //   * a type outside `req.memoryTypeBits` is not slow, it is INVALID for this
+  //     buffer -- the init-time choice simply never consulted the mask;
+  //   * there is nothing to fall back TO at the moment an allocation fails. The
+  //     comment at the init site describes llama.cpp's ordered fallback
+  //     (ggml_vk_create_buffer:3065-3090), but llama.cpp retries PER BUFFER and
+  //     we had collapsed that to one index chosen once.
+  //
+  // MEASURED (Jetson Orin Nano, 7.31 GiB device-local heap, Qwen3.5-2B-Q8_0):
+  // the model loaded, --fit placed, the recurrent-state budget was reported --
+  // and the FIRST request died on vkAllocateMemory with VK_ERROR_OUT_OF_DEVICE_
+  // MEMORY. A unified-memory board is exactly the case where the preferred
+  // DEVICE_LOCAL|HOST_VISIBLE type and the plain HOST_VISIBLE one may be backed
+  // by different heaps under different pressure.
+  VkPhysicalDeviceMemoryProperties memprops{};
+  vk.vkGetPhysicalDeviceMemoryProperties(Unpack<VkPhysicalDevice>(physical_device_), &memprops);
+  const int preferred = FindMemoryType(
+      memprops, req.memoryTypeBits, kHostFlags | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  const int host_only = FindMemoryType(memprops, req.memoryTypeBits, kHostFlags);
+  uint32_t candidates[3];
+  int ncand = 0;
+  // Honour the init-time choice first when this buffer permits it, so the common
+  // path allocates exactly where it always did and nothing about a working
+  // configuration changes.
+  if ((req.memoryTypeBits & (1u << memory_type_index_)) != 0) {
+    candidates[ncand++] = memory_type_index_;
+  }
+  if (preferred >= 0 && (ncand == 0 || candidates[0] != static_cast<uint32_t>(preferred))) {
+    candidates[ncand++] = static_cast<uint32_t>(preferred);
+  }
+  if (host_only >= 0) {
+    bool dup = false;
+    for (int i = 0; i < ncand; ++i) {
+      if (candidates[i] == static_cast<uint32_t>(host_only)) dup = true;
+    }
+    if (!dup) candidates[ncand++] = static_cast<uint32_t>(host_only);
+  }
+  VT_CHECK(ncand > 0,
+           "vulkan: no memory type satisfies this buffer's requirements (typeBits=" +
+               std::to_string(req.memoryTypeBits) + ")");
+
   VkDeviceMemory memory = VK_NULL_HANDLE;
-  Check(vk.vkAllocateMemory(device, &mai, nullptr, &memory), "vkAllocateMemory");
+  VkResult alloc_result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+  uint32_t used_type = candidates[0];
+  for (int i = 0; i < ncand; ++i) {
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = candidates[i];
+    alloc_result = vk.vkAllocateMemory(device, &mai, nullptr, &memory);
+    if (alloc_result == VK_SUCCESS) {
+      used_type = candidates[i];
+      break;
+    }
+  }
+
+  if (alloc_result != VK_SUCCESS) {
+    // SAY WHAT FAILED. The generic Check() reported only "VkResult -2", which
+    // cannot distinguish a genuine exhaustion from a per-allocation limit or a
+    // wrong type -- and the accounting to distinguish them was already being
+    // kept, just never printed.
+    const AllocAccounting& a = Accounting();
+    std::string types;
+    for (int i = 0; i < ncand; ++i) {
+      types += (i ? "," : "") + std::to_string(candidates[i]);
+    }
+    VT_CHECK(false,
+             "vulkan: vkAllocateMemory failed with VkResult " + std::to_string(alloc_result) +
+                 " for " + std::to_string(static_cast<uint64_t>(req.size)) +
+                 " bytes (requested " + std::to_string(static_cast<uint64_t>(len)) +
+                 "); tried memory type(s) " + types + "; live " +
+                 std::to_string(a.live_count.load(std::memory_order_relaxed)) +
+                 " allocation(s) holding " +
+                 std::to_string(a.live_requested.load(std::memory_order_relaxed)) +
+                 " bytes, " + std::to_string(a.total_count.load(std::memory_order_relaxed)) +
+                 " made in total");
+  }
+  (void)used_type;
   Check(vk.vkBindBufferMemory(device, buffer, memory, 0), "vkBindBufferMemory");
 
   // Account AFTER the allocation succeeded, so a failed allocation never
