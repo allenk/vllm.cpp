@@ -82,6 +82,20 @@ class VulkanContext {
   // static initialization.
   static bool Available();
 
+  // Sum of the DEVICE_LOCAL heap sizes this physical device reports, or 0 when
+  // no device is available. Feeds ResidencyPolicy::device_memory_total_bytes,
+  // whose contract is TOTAL rather than free (include/vllm/platforms/interface.h)
+  // so a load-time fit verdict does not become a function of what else the box
+  // happens to be doing.
+  //
+  // WHY THIS EXISTS: with the field left 0 = UNKNOWN, the GGUF fit refusal
+  // declines to decide, --fit places nothing, and the first real allocation
+  // dies at vkAllocateMemory with VK_ERROR_OUT_OF_DEVICE_MEMORY. Measured on a
+  // Jetson Orin Nano, where the driver DOES publish heap 7.31 GiB / budget
+  // 5.70 GiB -- the data was there and nobody asked for it. Invisible on a
+  // 98 GiB desktop, which is why it survived this long.
+  size_t DeviceMemoryTotalBytes() const;
+
   // Dispatch one compute kernel, SYNCHRONOUSLY (record, submit, wait). `name` is
   // a key in the committed SPIR-V table (src/vt/vulkan/vulkan_spirv.h).
   // `buffers` are the VkBuffer handles for descriptor bindings 0..n-1, in order;
@@ -607,6 +621,12 @@ class VulkanContext {
 // intermittently skip platform registration. Same reasoning, same shape, as
 // vt::metal::MetalDeviceAvailable().
 bool VulkanDeviceAvailable();
+
+// Plain-C++ spelling of VulkanContext::DeviceMemoryTotalBytes(), for the same
+// reason as the line above: the platform TU must not depend on this backend's
+// static-initialization order. Returns 0 when no device is available, which the
+// ResidencyPolicy contract reads as UNKNOWN -- never as "unlimited".
+size_t VulkanDeviceMemoryTotalBytes();
 
 // Workgroup size every kernel in this backend is compiled with. Mirrors VT_TG in
 // src/vt/vulkan/shaders/vt_common.glsl; the host must agree with the SPIR-V

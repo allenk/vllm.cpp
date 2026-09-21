@@ -860,6 +860,31 @@ bool VulkanContext::Available() {
 
 bool VulkanDeviceAvailable() { return VulkanContext::Available(); }
 
+size_t VulkanContext::DeviceMemoryTotalBytes() const {
+  if (physical_device_ == nullptr) return 0;
+  VkPhysicalDeviceMemoryProperties mem{};
+  Api().vkGetPhysicalDeviceMemoryProperties(
+      static_cast<VkPhysicalDevice>(physical_device_), &mem);
+  size_t total = 0;
+  for (uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+    // DEVICE_LOCAL only. On a unified device (GB10, Tegra, Apple) that is the
+    // single heap and equals system RAM; on a discrete card it is VRAM and the
+    // host-visible upload heap is correctly excluded.
+    if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+      total += static_cast<size_t>(mem.memoryHeaps[i].size);
+    }
+  }
+  return total;
+}
+
+size_t VulkanDeviceMemoryTotalBytes() {
+  // Available() first: constructing the context on a machine without a
+  // conformant device throws, and this is called from a platform query that
+  // must stay silent there.
+  if (!VulkanContext::Available()) return 0;
+  return VulkanContext::Get().DeviceMemoryTotalBytes();
+}
+
 uint32_t FlatGroupCount(int64_t n) {
   if (n <= 0) return 0;
   return static_cast<uint32_t>((n + kWorkgroupSize - 1) / kWorkgroupSize);

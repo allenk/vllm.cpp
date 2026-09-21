@@ -70,7 +70,22 @@ class VulkanPlatform final : public Platform {
   // Metal platforms — NOT the CUDA answer, which pools and host-frees for reasons
   // specific to the CUDA allocator. A discrete-GPU staging path (which WOULD
   // want a pool) is not implemented in W0.
-  ResidencyPolicy residency_policy() const override { return {}; }
+  // Every field except the memory total stays at its default, for the reason
+  // above. The total is the ONE thing this platform can answer and previously
+  // did not: left at 0 = UNKNOWN, the load-time GGUF fit refusal declines to
+  // decide, --fit places nothing, and the first real allocation dies at
+  // vkAllocateMemory with VK_ERROR_OUT_OF_DEVICE_MEMORY. Measured on a Jetson
+  // Orin Nano (7.31 GiB heap, 5.70 GiB budget published by the driver) where a
+  // 2.0 GB model could not be loaded at all. A 98 GiB desktop never reaches the
+  // failure, which is why the gap survived.
+  //
+  // TOTAL, not free: the contract in include/vllm/platforms/interface.h asks
+  // for total precisely so a load-time verdict is not a function of contention.
+  ResidencyPolicy residency_policy() const override {
+    ResidencyPolicy p;
+    p.device_memory_total_bytes = vt::vulkan::VulkanDeviceMemoryTotalBytes();
+    return p;
+  }
 
   // Attention-backend priority. There is NO Vulkan attention kernel in this
   // skeleton — kPagedAttention is not registered for kVULKAN — so returning a
