@@ -10,6 +10,8 @@ measurement evidence remains in [the benchmark record](../.agents/benchmark-reco
 | `vllm-online-serving` | Online serving compared with vLLM | Mixed | [Details](benchmarks/vllm-online-serving.md) |
 | `memory` | Host and device memory measurements | Mixed | [Details](benchmarks/memory.md) |
 | `llama-cpp-cpu` | CPU comparison with llama.cpp | Superseded | [Details](benchmarks/llama-cpp-cpu.md) |
+| `cpu-q8_0-repack` | The q8_0 repack tier on three CPUs: x86-64, Arm with i8mm, Arm without | Measured | [Details](benchmarks/cpu-q8_0-repack.md) |
+| `windows-rtx-pro-6000` | Windows x64 single-host matrix on a consumer Blackwell (sm_120) | Measured | [Details](benchmarks/windows-rtx-pro-6000.md) |
 | `mlx-lm-apple-m4` | Apple M4 comparison with MLX-LM | Measured | [Details](benchmarks/mlx-lm-apple-m4.md) |
 | `dwarfstar-gguf` | GGUF comparison with DwarfStar | Measured | [Details](benchmarks/dwarfstar-gguf.md) |
 | `speculative-decoding` | Speculative decoding measurements | Mixed | [Details](benchmarks/speculative-decoding.md) |
