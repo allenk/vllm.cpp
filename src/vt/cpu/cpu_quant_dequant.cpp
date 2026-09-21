@@ -602,6 +602,58 @@ void DequantIQ1_XXXS(const uint8_t* data, int64_t nb, float* y) {
   }
 }
 
+// block_iq1_m = { u8 qs[32]; u8 qh[16]; u8 scales[8]; } (56 bytes, NO f16
+// field). dequantize_row_iq1_m:2675 of the PINNED oracle llama.cpp @ b10451.
+// The super-block scale is the f16 spliced out of the four TOP nibbles of
+// scales[0..3]; the eight 3-bit sub-block scales sit two per byte at bit
+// 6*(ib%2)+{0,3} in the low 6 bits (dl = d*(2*ls+1)). The 11-bit grid index is
+// qs[l] widened by 3 bits from qh[l/2], and the delta sign per lane group is
+// qh[l/2] bit 0x08 (groups 0/2) / 0x80 (groups 1/3); a lane reconstructs as
+// dl * (grid[j] + delta) with delta = +/-kIq1sDelta (upstream's IQ1M_DELTA,
+// ggml-common.h:1133, is the same 0.125f). Sub-blocks 0/1 scale with dl1 and
+// 2/3 with dl2, exactly as upstream's loop does.
+void DequantIQ1_M(const uint8_t* data, int64_t nb, float* y) {
+  constexpr int qk = 256;
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t* blk = data + i * 56;
+    const uint8_t* qs = blk;
+    const uint8_t* qh = blk + 32;
+    const uint8_t* scales = blk + 48;
+    // Upstream reads the sub-block scales through a `const uint16_t*` view of
+    // `scales`, so sc[ib/2] spans scales[2*(ib/2)] and scales[2*(ib/2)+1].
+    const uint16_t sc[4] = {
+        static_cast<uint16_t>(scales[0] | (scales[1] << 8)),
+        static_cast<uint16_t>(scales[2] | (scales[3] << 8)),
+        static_cast<uint16_t>(scales[4] | (scales[5] << 8)),
+        static_cast<uint16_t>(scales[6] | (scales[7] << 8)),
+    };
+    const uint16_t packed = static_cast<uint16_t>(
+        (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) |
+        (sc[3] & 0xf000));
+    const float d = vt::F16ToF32(packed);
+    for (int ib = 0; ib < qk / 32; ++ib) {
+      const float dl1 = d * static_cast<float>(
+          2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1);
+      const float dl2 = d * static_cast<float>(
+          2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1);
+      const float dl[2] = {dl1, dl2};
+      for (int l = 0; l < 4; ++l) {
+        const int8_t* grid = reinterpret_cast<const int8_t*>(
+            kIq1sGrid + (qs[l] | ((static_cast<uint16_t>(qh[l / 2])
+                                   << (8 - 4 * (l % 2))) & 0x700)));
+        const float delta =
+            (qh[l / 2] & (l % 2 == 0 ? 0x08 : 0x80)) ? -kIq1sDelta
+                                                     : kIq1sDelta;
+        for (int j = 0; j < 8; ++j)
+          y[j] = dl[l / 2] * (static_cast<float>(grid[j]) + delta);
+        y += 8;
+      }
+      qs += 4;
+      qh += 2;
+    }
+  }
+}
+
 // block_mxfp4 = { u8 e; u8 qs[16]; } (17 bytes) dequantize_row_mxfp4:511.
 // OCP micro-scaling fp4: d = E8M0ToF32Half(e) is one power-of-two block scale;
 // each of the 32 elements is an e2m1 nibble looked up in kValuesMxfp4. The
@@ -649,6 +701,7 @@ ToFloatFn BlockToFloat(DType dtype) {
     case DType::kIQ2_S: return &ToFloatAdapter<&DequantIQ2_S, 256>;
     case DType::kIQ1_S: return &ToFloatAdapter<&DequantIQ1_S, 256>;
     case DType::kIQ1_XXXS: return &ToFloatAdapter<&DequantIQ1_XXXS, 256>;
+    case DType::kIQ1_M: return &ToFloatAdapter<&DequantIQ1_M, 256>;
     case DType::kIQ4_NL: return &ToFloatAdapter<&DequantIQ4_NL, 32>;
     case DType::kMXFP4: return &ToFloatAdapter<&DequantMXFP4, 32>;
     case DType::kIQ2_XS: return &ToFloatAdapter<&DequantIQ2_XS, 256>;

@@ -41,6 +41,12 @@ using vt::DeviceType;
 using vt::Queue;
 using vt::Tensor;
 
+namespace vt::tenstorrent {
+// Tenstorrent residency probe (tenstorrent_internal.h); declared here to keep
+// the test TU free of internal includes.
+bool DeviceShadowExact(const Tensor& t, uint32_t rows, uint32_t cols);
+}  // namespace vt::tenstorrent
+
 namespace {
 
 bool TenstorrentPresent() { return vt::TryGetBackend(DeviceType::kTENSTORRENT) != nullptr; }
@@ -755,6 +761,95 @@ TEST_CASE("kTENSTORRENT kCastBf16 / kCastF32 round-trip F32 values") {
   }
 }
 
+// RED-first for ISSUE-LOCAL-01M2K8WWA0X09VJF55NTS16VTV: a producer shadow
+// natively shaped [128, 6144] (the APEX gated-norm activation) reaches
+// kCastBf16, which serves it raw and hands NormalizeDevF32Tile(1, n). The
+// (1, n) arguments are the FLATTENED shape, so the logical-shape guard fires
+// and the free ttnn::reshape launched reshape_rm — whose staging CBs scale
+// with the 3,145,728 B f32 row, 2x the L1 cap, fatal at program allocation.
+// The shadow is device-authoritative (committed by a device Matmul, the same
+// CommitDevice2D path the production driver uses) and the oracle is the host
+// single-round RNE cast.
+static uint16_t RneF32ToBf16(float v) {
+  uint32_t bits;
+  std::memcpy(&bits, &v, 4);
+  const uint32_t lsb = (bits >> 16) & 1u;
+  const uint32_t rounded = bits + 0x7fffu + lsb;
+  return static_cast<uint16_t>(rounded >> 16);
+}
+
+TEST_CASE("kTENSTORRENT kCastBf16 serves a [128,6144] f32 shadow without the "
+          "L1-fatal reshape") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kCastBf16, DeviceType::kTENSTORRENT));
+  constexpr int64_t M = 128, K = 16, C = 6144;
+  const Device dev{DeviceType::kTENSTORRENT, 0};
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  auto cast_bf16 = reinterpret_cast<vt::CastBf16Fn>(
+      vt::GetOp(vt::OpId::kCastBf16, DeviceType::kTENSTORRENT));
+
+  // Producer: a device Matmul commits an f32 [M, C] shadow on mo. The b leg
+  // is all ones and every a value is exact, so the shadow holds known f32
+  // values without any readback of the committed slot.
+  std::vector<float> ha(static_cast<size_t>(M * K));
+  for (size_t i = 0; i < ha.size(); ++i)
+    ha[i] = static_cast<float>(static_cast<int>(i % 15) - 7) * 0.25f;
+  std::vector<float> hb(static_cast<size_t>(K * C), 1.0f);
+  std::vector<float> hout(static_cast<size_t>(M * C), -1.0f);
+  void* ma = backend.Alloc(ha.size() * sizeof(float));
+  void* mb = backend.Alloc(hb.size() * sizeof(float));
+  void* mo = backend.Alloc(hout.size() * sizeof(float));
+  void* mo_bf = backend.Alloc(hout.size() * sizeof(uint16_t));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, ha.data(), ha.size() * sizeof(float));
+  backend.Copy(q, mb, hb.data(), hb.size() * sizeof(float));
+  Tensor ta = Tensor::Contiguous(ma, vt::DType::kF32, dev, {M, K});
+  Tensor tb = Tensor::Contiguous(mb, vt::DType::kF32, dev, {K, C});
+  Tensor to = Tensor::Contiguous(mo, vt::DType::kF32, dev, {M, C});
+  reinterpret_cast<vt::MatmulFn>(
+      vt::GetOp(vt::OpId::kMatmul, DeviceType::kTENSTORRENT))(q, to, ta, tb);
+
+  // The cast input rides the committed [M, C] shadow (device-authoritative:
+  // device_current, host_current=false, dtype f32, numel == 786,432). The
+  // f32 wide-row shadow is built through the production kCastF32 arm on the
+  // committed matmul shadow, so the case exercises the 3,145,728 B f32 row
+  // the APEX e2e dies on, not just the bf16 one.
+  Tensor in2d = Tensor::Contiguous(mo, vt::DType::kF32, dev, {M, C});
+  void* mo_f32 = backend.Alloc(hout.size() * sizeof(float));
+  Tensor tf32 = Tensor::Contiguous(mo_f32, vt::DType::kF32, dev, {M * C});
+  auto cast_f32 = reinterpret_cast<vt::CastF32Fn>(
+      vt::GetOp(vt::OpId::kCastF32, DeviceType::kTENSTORRENT));
+  cast_f32(q, tf32, in2d);
+  Tensor in_f32 = Tensor::Contiguous(mo_f32, vt::DType::kF32, dev, {M, C});
+  Tensor out = Tensor::Contiguous(mo_bf, vt::DType::kBF16, dev, {M * C});
+  cast_bf16(q, out, in_f32);
+
+  // Readback and bit-exact compare against the host single-round RNE cast.
+  std::vector<uint16_t> got(static_cast<size_t>(M * C), 0xbeef);
+  backend.Copy(q, got.data(), mo_bf, got.size() * sizeof(uint16_t));
+  size_t bad = 0, first_bad = 0;
+  for (int64_t i = 0; i < M; ++i) {
+    const uint16_t want = RneF32ToBf16(ha[static_cast<size_t>(i * K)]);
+    for (int64_t j = 0; j < C; ++j) {
+      const size_t idx = static_cast<size_t>(i * C + j);
+      if (got[idx] != want) {
+        if (bad == 0) first_bad = idx;
+        ++bad;
+      }
+    }
+  }
+  backend.Free(ma);
+  backend.Free(mb);
+  backend.Free(mo);
+  backend.Free(mo_f32);
+  backend.Free(mo_bf);
+  CHECK_MESSAGE(bad == 0, "RNE mismatch: " << bad << " elements, first at "
+                                           << first_bad);
+}
+
 // Default Qwen3-dense RoPE (Metal M3b). Small T*H uses host apply (bit-exact);
 // large prefill uses device NeoX (BF16) — covered by PreferDeviceRope threshold.
 TEST_CASE("kTENSTORRENT kRopeNeox is BIT-EXACT vs a host F32 reference (small)") {
@@ -1424,6 +1519,141 @@ TEST_CASE("kTENSTORRENT kPagedAttention pure-decode matches host within BF16 env
   CHECK(max_abs < 0.5f);
 }
 
+// Batched (B=2) pure decode. RED-FIRST for
+// ISSUE-LOCAL-01M2X9XSS0N7WB5BTJ0326B892: the eager (uncaptured) device
+// decode path flattened the sdpa output [1,B,H,D] TILE to [B, H*D] through
+// the free ttnn::reshape, which derives padded = logical and computes a
+// physical shape up to 16x the buffer — "MeshBuffer must be large enough to
+// hold the tensor" on every concurrency>=2 decode step, silently caught, and
+// the op fell back to the host oracle. The B=1 case above never saw it: its
+// decode step replays a captured graph. The device-path requirement is the
+// red signal: the broken reshape forces CommitHost (no device shadow).
+TEST_CASE("kTENSTORRENT kPagedAttention pure-decode batched B=2 keeps the device path") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kPagedAttention, DeviceType::kTENSTORRENT));
+
+  constexpr int64_t Hq = 4, Hkv = 2, D = 128, Bsz = 32, Seq = 64, B = 2;
+  constexpr int64_t NBlocksPerReq = Seq / Bsz;  // 2
+  constexpr int64_t NBlocks = B * NBlocksPerReq;
+  constexpr int64_t Page = Hkv * D;
+  const size_t cache_elems = static_cast<size_t>(NBlocks * Bsz * Page);
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+
+  std::vector<float> host_q(static_cast<size_t>(B * Hq * D));
+  std::vector<float> host_kc(cache_elems), host_vc(cache_elems);
+  for (size_t i = 0; i < host_q.size(); ++i)
+    host_q[i] = (static_cast<float>((i * 7) % 19) - 9.0f) * 0.05f;
+  for (size_t i = 0; i < host_kc.size(); ++i) {
+    host_kc[i] = (static_cast<float>((i * 5) % 15) - 7.0f) * 0.03f;
+    host_vc[i] = (static_cast<float>((i * 3) % 13) - 6.0f) * 0.02f;
+  }
+  // Request r owns physical blocks {2r, 2r+1} — distinct pages per request.
+  std::vector<int32_t> block_table(static_cast<size_t>(B * NBlocksPerReq));
+  for (int64_t r = 0; r < B; ++r)
+    for (int64_t c = 0; c < NBlocksPerReq; ++c)
+      block_table[static_cast<size_t>(r * NBlocksPerReq + c)] =
+          static_cast<int32_t>(r * NBlocksPerReq + c);
+  std::vector<int32_t> seq_lens{static_cast<int32_t>(Seq),
+                                static_cast<int32_t>(Seq)};
+  std::vector<int32_t> qsl{0, 1, 2};
+  std::vector<float> host_out(static_cast<size_t>(B * Hq * D), 0.0f);
+
+  void* mem_q = backend.Alloc(host_q.size() * sizeof(float));
+  void* mem_out = backend.Alloc(host_out.size() * sizeof(float));
+  void* mem_kc = backend.Alloc(host_kc.size() * sizeof(float));
+  void* mem_vc = backend.Alloc(host_vc.size() * sizeof(float));
+  void* mem_bt = backend.Alloc(block_table.size() * sizeof(int32_t));
+  void* mem_sl = backend.Alloc(seq_lens.size() * sizeof(int32_t));
+  void* mem_qsl = backend.Alloc(qsl.size() * sizeof(int32_t));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_q, host_q.data(), host_q.size() * sizeof(float));
+  backend.Copy(q, mem_kc, host_kc.data(), host_kc.size() * sizeof(float));
+  backend.Copy(q, mem_vc, host_vc.data(), host_vc.size() * sizeof(float));
+  backend.Copy(q, mem_bt, block_table.data(), block_table.size() * sizeof(int32_t));
+  backend.Copy(q, mem_sl, seq_lens.data(), seq_lens.size() * sizeof(int32_t));
+  backend.Copy(q, mem_qsl, qsl.data(), qsl.size() * sizeof(int32_t));
+
+  Tensor tq = Tensor::Contiguous(mem_q, vt::DType::kF32,
+                                 Device{DeviceType::kTENSTORRENT, 0}, {B, Hq, D});
+  Tensor tout = Tensor::Contiguous(mem_out, vt::DType::kF32,
+                                   Device{DeviceType::kTENSTORRENT, 0}, {B, Hq, D});
+  Tensor tkc = Tensor::Contiguous(mem_kc, vt::DType::kF32,
+                                  Device{DeviceType::kTENSTORRENT, 0},
+                                  {NBlocks, Bsz, Hkv, D});
+  Tensor tvc = Tensor::Contiguous(mem_vc, vt::DType::kF32,
+                                  Device{DeviceType::kTENSTORRENT, 0},
+                                  {NBlocks, Bsz, Hkv, D});
+  Tensor tbt = Tensor::Contiguous(mem_bt, vt::DType::kI32,
+                                  Device{DeviceType::kTENSTORRENT, 0}, {B, NBlocksPerReq});
+  Tensor tsl =
+      Tensor::Contiguous(mem_sl, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0}, {B});
+  Tensor tqsl = Tensor::Contiguous(mem_qsl, vt::DType::kI32,
+                                   Device{DeviceType::kTENSTORRENT, 0}, {B + 1});
+
+  vt::PagedAttentionArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(D));
+  args.causal = true;
+  auto pa = reinterpret_cast<vt::PagedAttentionFn>(
+      vt::GetOp(vt::OpId::kPagedAttention, DeviceType::kTENSTORRENT));
+  pa(q, tout, tq, tkc, tvc, tbt, tsl, tqsl, args);
+
+  // THE RED SIGNAL: the device decode path commits its flattened [B, H*D]
+  // result into out's slot; the host fallback (the crash's silent landing
+  // zone) commits host bytes and drops the device shadow.
+  REQUIRE(vt::tenstorrent::DeviceShadowExact(tout, static_cast<uint32_t>(B),
+                                             static_cast<uint32_t>(Hq * D)));
+
+  backend.Copy(q, host_out.data(), mem_out, host_out.size() * sizeof(float));
+  backend.Free(mem_q);
+  backend.Free(mem_out);
+  backend.Free(mem_kc);
+  backend.Free(mem_vc);
+  backend.Free(mem_bt);
+  backend.Free(mem_sl);
+  backend.Free(mem_qsl);
+
+  // Host NHD oracle per request (same envelope as the B=1 case above).
+  const int64_t qpk = Hq / Hkv;
+  float max_abs = 0.0f;
+  for (int64_t r = 0; r < B; ++r) {
+    for (int64_t h = 0; h < Hq; ++h) {
+      const int64_t g = h / qpk;
+      const int64_t qoff = (r * Hq + h) * D;
+      float m = -std::numeric_limits<float>::infinity();
+      std::vector<float> scores(static_cast<size_t>(Seq));
+      for (int64_t j = 0; j < Seq; ++j) {
+        float dot = 0.0f;
+        const int64_t kbase =
+            (r * NBlocksPerReq + j / Bsz) * (Bsz * Page) + (j % Bsz) * Page + g * D;
+        for (int64_t e = 0; e < D; ++e)
+          dot += host_q[static_cast<size_t>(qoff + e)] *
+                 host_kc[static_cast<size_t>(kbase + e)];
+        scores[static_cast<size_t>(j)] = dot * args.scale;
+        m = std::max(m, scores[static_cast<size_t>(j)]);
+      }
+      float denom = 0.0f;
+      for (int64_t j = 0; j < Seq; ++j) {
+        scores[static_cast<size_t>(j)] = std::exp(scores[static_cast<size_t>(j)] - m);
+        denom += scores[static_cast<size_t>(j)];
+      }
+      const float inv = 1.0f / denom;
+      for (int64_t e = 0; e < D; ++e) {
+        float acc = 0.0f;
+        for (int64_t j = 0; j < Seq; ++j)
+          acc += scores[static_cast<size_t>(j)] * inv *
+                 host_vc[static_cast<size_t>(
+                     (r * NBlocksPerReq + j / Bsz) * (Bsz * Page) +
+                     (j % Bsz) * Page + g * D + e)];
+        max_abs = std::max(max_abs, std::fabs(host_out[static_cast<size_t>(qoff + e)] - acc));
+      }
+    }
+  }
+  CHECK(max_abs < 0.5f);
+}
+
 // Multi-token pure prefill with TILE-legal geometry exercises
 // ttnn::chunked_scaled_dot_product_attention (or host fallback).
 TEST_CASE("kTENSTORRENT kPagedAttention pure-prefill matches host within BF16 envelope") {
@@ -1933,6 +2163,130 @@ TEST_CASE("kTENSTORRENT kRmsNormGated matches the CPU f32 oracle (silu + sigmoid
       }
     }
   }
+}
+
+// Batched-prefill gated-norm (ISSUE-LOCAL-01M2XSWCP507W0M18EXHGR5TGS): the
+// gate rides a committed device shadow whose native geometry is [T, W] (the
+// z projection output, [256, 6144]) while x flattens to [T*Hv, D] = [12288,
+// 128]. NormalizeDevF32Tile keeps the rank-2 native geometry, so the kernel
+// must bridge [256,6144] -> [12288,128] (same numel AND same tile count) —
+// the free TILE reshape at the M=2 prefill shape fatals 'MeshBuffer must be
+// large enough' and the poisoned view OOMs the step downstream.
+TEST_CASE("kTENSTORRENT kRmsNormGated serves a [256,6144] committed gate "
+          "shadow at the batched-prefill [12288,128] geometry") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kRmsNormGated, DeviceType::kTENSTORRENT));
+  constexpr int64_t T = 256, Hv = 48, D = 128;
+  const Device dev{DeviceType::kTENSTORRENT, 0};
+  Backend& tt = vt::GetBackend(DeviceType::kTENSTORRENT);
+  Backend& cpu = *vt::TryGetBackend(DeviceType::kCPU);
+
+  vt::RmsNormGatedArgs args;
+  args.eps = 1e-6f;
+  args.sigmoid_gate = 1;
+
+  // Producer: a device Matmul commits the f32 [T, Hv*D] z-projection shadow.
+  // b is all ones so the shadow values are the (host-known) row sums of a.
+  std::vector<float> ha(static_cast<size_t>(T * 16));
+  for (size_t i = 0; i < ha.size(); ++i)
+    ha[i] = static_cast<float>(static_cast<int>(i % 15) - 7) * 0.25f;
+  std::vector<float> gate_vals(static_cast<size_t>(T), 0.0f);
+  for (int64_t t = 0; t < T; ++t) {
+    float s = 0.0f;
+    for (int64_t k = 0; k < 16; ++k)
+      s += ha[static_cast<size_t>(t * 16 + k)];
+    gate_vals[static_cast<size_t>(t)] = s;
+  }
+  void* ma = tt.Alloc(ha.size() * sizeof(float));
+  void* mb = tt.Alloc(16 * Hv * D * sizeof(float));
+  void* mo = tt.Alloc(T * Hv * D * sizeof(float));
+  Queue q = tt.CreateQueue();
+  tt.Copy(q, ma, ha.data(), ha.size() * sizeof(float));
+  std::vector<float> ones(static_cast<size_t>(16 * Hv * D), 1.0f);
+  tt.Copy(q, mb, ones.data(), ones.size() * sizeof(float));
+  Tensor ta = Tensor::Contiguous(ma, vt::DType::kF32, dev, {T, 16});
+  Tensor tb = Tensor::Contiguous(mb, vt::DType::kF32, dev, {16, Hv * D});
+  Tensor to = Tensor::Contiguous(mo, vt::DType::kF32, dev, {T, Hv * D});
+  reinterpret_cast<vt::MatmulFn>(
+      vt::GetOp(vt::OpId::kMatmul, DeviceType::kTENSTORRENT))(q, to, ta, tb);
+
+  // x: [T, Hv, D] contiguous host f32, committed as its own slot.
+  std::vector<float> hx(static_cast<size_t>(T * Hv * D));
+  {
+    uint32_t s = 9100u;
+    for (float& v : hx) v = 2.0f * GdnLcg(s);
+  }
+  std::vector<float> hw(static_cast<size_t>(D));
+  {
+    uint32_t s = 777u;
+    for (float& v : hw) v = 0.8f + 0.4f * (GdnLcg(s) + 0.5f);
+  }
+  void* mx = tt.Alloc(hx.size() * sizeof(float));
+  void* mw = tt.Alloc(hw.size() * sizeof(float));
+  void* mout = tt.Alloc(hx.size() * sizeof(float));
+  tt.Copy(q, mx, hx.data(), hx.size() * sizeof(float));
+  tt.Copy(q, mw, hw.data(), hw.size() * sizeof(float));
+  Tensor tx = Tensor::Contiguous(mx, vt::DType::kF32, dev, {T, Hv, D});
+  Tensor tw = Tensor::Contiguous(mw, vt::DType::kF32, dev, {D});
+  Tensor tout = Tensor::Contiguous(mout, vt::DType::kF32, dev, {T, Hv, D});
+  // The gate view: rank-3 [T, Hv, D] covering the committed owner exactly.
+  Tensor tg{};
+  tg.data = mo;
+  tg.dtype = vt::DType::kF32;
+  tg.device = dev;
+  tg.rank = 3;
+  tg.shape[0] = T;
+  tg.shape[1] = Hv;
+  tg.shape[2] = D;
+  tg.stride[0] = Hv * D;
+  tg.stride[1] = D;
+  tg.stride[2] = 1;
+  vt::RmsNormGated(q, tout, tx, tg, tw, args);
+  std::vector<float> out_tt(hx.size(), 0.0f);
+  tt.Copy(q, out_tt.data(), mout, out_tt.size() * sizeof(float));
+
+  // CPU oracle: identical geometry, gate bytes = the known producer values
+  // (each gate row is the constant row sum of a).
+  std::vector<float> hg(static_cast<size_t>(T * Hv * D));
+  for (int64_t t = 0; t < T; ++t)
+    for (int64_t e = 0; e < Hv * D; ++e)
+      hg[static_cast<size_t>(t * Hv * D + e)] = gate_vals[static_cast<size_t>(t)];
+  void* cgx = cpu.Alloc(hx.size() * sizeof(float));
+  void* cgg = cpu.Alloc(hg.size() * sizeof(float));
+  void* cgw = cpu.Alloc(hw.size() * sizeof(float));
+  void* cgo = cpu.Alloc(hx.size() * sizeof(float));
+  Queue cq = cpu.CreateQueue();
+  cpu.Copy(cq, cgx, hx.data(), hx.size() * sizeof(float));
+  cpu.Copy(cq, cgg, hg.data(), hg.size() * sizeof(float));
+  cpu.Copy(cq, cgw, hw.data(), hw.size() * sizeof(float));
+  Tensor ctx = Tensor::Contiguous(cgx, vt::DType::kF32, Device{DeviceType::kCPU, 0}, {T, Hv, D});
+  Tensor ctg = Tensor::Contiguous(cgg, vt::DType::kF32, Device{DeviceType::kCPU, 0}, {T, Hv, D});
+  Tensor ctw = Tensor::Contiguous(cgw, vt::DType::kF32, Device{DeviceType::kCPU, 0}, {D});
+  Tensor cto = Tensor::Contiguous(cgo, vt::DType::kF32, Device{DeviceType::kCPU, 0}, {T, Hv, D});
+  vt::RmsNormGated(cq, cto, ctx, ctg, ctw, args);
+  std::vector<float> out_cpu(hx.size(), 0.0f);
+  cpu.Copy(cq, out_cpu.data(), cgo, out_cpu.size() * sizeof(float));
+
+  const float tol = 0.035f;
+  GdnDiffStats d = CompareVsOracle(out_tt, out_cpu, /*rel=*/0.0f, tol);
+  MESSAGE("kRmsNormGated committed-shadow [", T, ",", Hv * D, "] -> [",
+          T * Hv, ",", D, "]: max_abs=", d.max_abs, " max_rel=", d.max_rel,
+          " tol=", tol);
+  tt.Free(ma);
+  tt.Free(mb);
+  tt.Free(mo);
+  tt.Free(mx);
+  tt.Free(mw);
+  tt.Free(mout);
+  cpu.Free(cgx);
+  cpu.Free(cgg);
+  cpu.Free(cgw);
+  cpu.Free(cgo);
+  CHECK(std::isfinite(d.max_abs));
+  CHECK(d.within);
 }
 
 TEST_CASE("kTENSTORRENT kCausalConv1dFwd matches the CPU f32 oracle (rolling conv state, varlen)") {
@@ -2713,6 +3067,93 @@ TEST_CASE("kTENSTORRENT kGdnDecode matches the CPU f32 oracle (rank-1 step, both
       CHECK(std::isfinite(ds.max_abs));
       CHECK(ds.within);
     }
+  }
+
+  // --- Large-dynamic-range state (fidelity arm): the real APEX prefill-final
+  // GDN state carries mixed O(10^2)/O(10^-3) elements, and on that
+  // distribution the composed rank-1 step's matmuls (run without an f32
+  // ComputeConfig) lose 10-30% per layer. The small-range arm above hides the
+  // defect inside its 2% elementwise envelope. Here the state draws
+  // ±10^uniform(-3,2) and — critically — v is built ON MANIFOLD: the delta
+  // rule's correction v - S@k is deliberately small in the real model (the
+  // state has already absorbed the stream), so the reduced-precision error in
+  // dot = S@k (relative ~2^-11 under tf32 MACs) stops being a rounding footnote
+  // and becomes a first-order error in v' = (v-dot)*beta, and hence in the
+  // committed state. The gate is a tight rel-RMS envelope on the state (0.2%;
+  // the f32-safe chunked adapter measures ~0.01% on identical inputs).
+  {
+    const int64_t B = 1, Hk = 2, Hv = 8;
+    std::vector<float> q, k, v, g, beta;
+    gen(75000u, B, Hk, Hv, q, k, v, g, beta);
+    std::vector<float> st(static_cast<size_t>(B * Hv * Dv * Dk));
+    {
+      uint32_t s = 76000u;
+      for (float& x : st) {
+        const float mag =
+            std::pow(10.0f, -3.0f + 5.0f * (GdnLcg(s) + 0.5f));  // 10^[-3, 2]
+        x = (GdnLcg(s) < 0.0f ? -1.0f : 1.0f) * mag;
+      }
+    }
+    // On-manifold v: v[b,h,r] = (S[b,h,r,:] @ k[b,0,:]) * (1 + eps), eps ~ 1%
+    // — the stream the state has already absorbed, plus a fresh-token
+    // correction. Host-side in double so only the DEVICE's dot precision is
+    // under test.
+    for (int64_t b = 0; b < B; ++b)
+      for (int64_t h = 0; h < Hv; ++h) {
+        uint32_t s = static_cast<uint32_t>(77000u + b * 17 + h);
+        for (int64_t r = 0; r < Dv; ++r) {
+          double dot = 0.0;
+          for (int64_t j = 0; j < Dk; ++j)
+            dot += static_cast<double>(
+                       st[static_cast<size_t>(((b * Hv) + h) * Dv * Dk + r * Dk + j)]) *
+                   static_cast<double>(k[static_cast<size_t>((b * Hk + h / (Hv / Hk)) * Dk + j)]);
+          v[static_cast<size_t>((b * Hv + h) * Dv + r)] =
+              static_cast<float>(dot) * (1.0f + 0.01f * (2.0f * GdnLcg(s)));
+        }
+      }
+    std::vector<float> st_cpu = st, st_tt = st;
+    std::vector<float> out_cpu(static_cast<size_t>(B * Hv * Dv), 0.0f),
+        out_tt(static_cast<size_t>(B * Hv * Dv), 0.0f);
+    step(cpu, DeviceType::kCPU, B, Hk, Hv, q, k, v, g, beta, st_cpu, nullptr, out_cpu);
+    step(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, B, Hk,
+         Hv, q, k, v, g, beta, st_tt, nullptr, out_tt);
+    auto rel_rms = [](const std::vector<float>& got, const std::vector<float>& ref) {
+      double num = 0.0, den = 0.0;
+      for (size_t i = 0; i < ref.size(); ++i) {
+        const double d = static_cast<double>(got[i]) - static_cast<double>(ref[i]);
+        num += d * d;
+        den += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+      }
+      return std::sqrt(num) / std::sqrt(den + 1e-30);
+    };
+    const double st_rr = rel_rms(st_tt, st_cpu);
+    const double out_rr = rel_rms(out_tt, out_cpu);
+    // Diagnostics: where the reduced-precision error lands (small elements).
+    GdnDiffStats d_small = [&] {
+      GdnDiffStats d;
+      for (size_t i = 0; i < st_cpu.size(); ++i) {
+        if (std::fabs(st_cpu[i]) >= 0.1f) continue;
+        const float a = std::fabs(st_tt[i] - st_cpu[i]);
+        d.max_abs = std::max(d.max_abs, a);
+        if (std::fabs(st_cpu[i]) > 1e-5f)
+          d.max_rel = std::max(d.max_rel, a / std::fabs(st_cpu[i]));
+      }
+      return d;
+    }();
+    // Tight elementwise envelope on the state: 0.2% relative + a 1e-5 abs
+    // floor (f32 compute agrees with the scalar f32 oracle at ~1e-6 relative;
+    // the chunked f32-safe adapter measures ~0.01% on identical inputs). A
+    // whole-state rel-RMS gate would NOT catch the defect: the reduced-
+    // precision error lands in the small-magnitude elements (the correction
+    // signal), and the large elements dominate the RMS.
+    const float tol = 0.002f, abs_floor = 1e-5f;
+    GdnDiffStats ds = CompareVsOracle(st_tt, st_cpu, tol, abs_floor);
+    MESSAGE("kGdnDecode wide-range state: state rel_rms=", st_rr,
+            " out rel_rms=", out_rr, " max_rel(|ref|<0.1)=",
+            d_small.max_rel, " state tol=", tol, " abs_floor=", abs_floor,
+            " state max_abs=", ds.max_abs, " max_rel=", ds.max_rel);
+    CHECK(std::isfinite(ds.max_abs));
+    CHECK(ds.within);
   }
 
   // --- Indexed form: state is the FULL cache; slot idx[bt] per token.
@@ -5424,10 +5865,22 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuant matches the CPU integer vec_dot bit-exact
   Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
   Queue q = backend.CreateQueue();
 
-  // The registered set, in the kernel's ARG_ENC order (0/1/2/3): Q4_K is
-  // W1's vehicle, Q5_K/Q6_K/Q8_0 the W3 decode set.
-  const vt::DType encodings[] = {vt::DType::kQ4_K, vt::DType::kQ5_K,
-                                 vt::DType::kQ6_K, vt::DType::kQ8_0};
+  // The registered set, in the kernel's ARG_ENC order (0/1/2/3/4/5/6): Q4_K
+  // is W1's vehicle, Q5_K/Q6_K/Q8_0 the W3 decode set, IQ3_XXS the
+  // QUANT-GGUF-IQ-TENSTORRENT wave-1 addition (enc_sel 4) and IQ2_XXS/IQ2_S
+  // the wave-2 addition (enc_sel 5/6), all q8_K pairings, and Q3_K the
+  // wave-3 addition (enc_sel 7, the min-term K-quant — not the codebook
+  // family), and IQ3_S the tenstorrent-gsq-keepquant wave-1 addition
+  // (enc_sel 8, the IQ3_XXS cousin with separate scales, signs and qh
+  // high-index bits), and IQ4_XS the tenstorrent-gsq-keepquant wave-2
+  // addition (enc_sel 9, the 4-bit non-linear codebook with a 6-bit
+  // super-block scale splice).
+  const vt::DType encodings[] = {
+      vt::DType::kQ4_K,   vt::DType::kQ5_K,
+      vt::DType::kQ6_K,   vt::DType::kQ8_0,
+      vt::DType::kIQ3_XXS, vt::DType::kIQ2_XXS,
+      vt::DType::kIQ2_S,  vt::DType::kQ3_K, vt::DType::kIQ3_S,
+      vt::DType::kIQ4_XS, vt::DType::kIQ2_XS};
   for (const vt::DType enc : encodings) {
     const int64_t kBlockBytes = vt::BlockBytes(enc);
     const int64_t kBlockElems = vt::BlockElems(enc);
@@ -5440,7 +5893,28 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuant matches the CPU integer vec_dot bit-exact
     } else if (enc == vt::DType::kQ6_K) {
       REQUIRE(kBlockBytes == 210);
       REQUIRE(kBlockElems == 256);
-    } else {
+    } else if (enc == vt::DType::kIQ3_XXS) {
+      REQUIRE(kBlockBytes == 98);
+      REQUIRE(kBlockElems == 256);
+    } else if (enc == vt::DType::kIQ2_XXS) {
+      REQUIRE(kBlockBytes == 66);
+      REQUIRE(kBlockElems == 256);
+    } else if (enc == vt::DType::kIQ2_S) {
+      REQUIRE(kBlockBytes == 82);
+      REQUIRE(kBlockElems == 256);
+    } else if (enc == vt::DType::kQ3_K) {
+      REQUIRE(kBlockBytes == 110);
+      REQUIRE(kBlockElems == 256);
+    } else if (enc == vt::DType::kIQ3_S) {
+      REQUIRE(kBlockBytes == 110);
+      REQUIRE(kBlockElems == 256);
+    } else if (enc == vt::DType::kIQ4_XS) {
+      REQUIRE(kBlockBytes == 136);
+      REQUIRE(kBlockElems == 256);
+    } else if (enc == vt::DType::kIQ2_XS) {
+      REQUIRE(kBlockBytes == 74);
+      REQUIRE(kBlockElems == 256);
+    } else if (enc == vt::DType::kQ8_0) {
       REQUIRE(kBlockBytes == 34);
       REQUIRE(kBlockElems == 32);
     }
@@ -5491,8 +5965,72 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuant matches the CPU integer vec_dot bit-exact
         for (int i = 0; i < 16; ++i) blk[192 + i] = rand_byte();  // scales
         const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
         std::memcpy(blk + 208, &d_bits, sizeof(d_bits));
-      } else {
-        // block_q8_0 = { f16 d; i8 qs[32] } (34B)
+      } else if (enc == vt::DType::kIQ3_XXS) {
+        // block_iq3_xxs = { f16 d; u8 qs[96] } (98B) — qs[0..63] are grid
+        // indices (a full byte indexes kIq3xxsGrid[256]), qs[64..71] are the
+        // per-32 scale+sign u32s: the top nibble is the 4-bit scale, bits
+        // 0..27 four 7-bit sign selectors — random bytes stay in range.
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        for (int i = 0; i < 96; ++i) blk[2 + i] = rand_byte();
+      } else if (enc == vt::DType::kIQ2_XXS) {
+        // block_iq2_xxs = { f16 d; u16 qs[32] } (66B) — the 32 u16s are 8 u32
+        // pairs: the pair's low bytes index kIq2xxsGrid[256] (full byte, in
+        // range), the second u32's top nibble is the 4-bit scale and bits
+        // 0..27 four 7-bit kKsignsIq2xs selectors — random bytes stay in range.
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        for (int i = 0; i < 64; ++i) blk[2 + i] = rand_byte();
+      } else if (enc == vt::DType::kIQ2_S) {
+        // block_iq2_s = { f16 d; u8 qs[64]; u8 qh[8]; u8 scales[8] } (82B) —
+        // qs bytes are 8-bit kIq2sGrid[1024] indices widened by 2 qh bits (in
+        // range), qh any, scales two 4-bit scale nibbles per 32-sub-block.
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        for (int i = 0; i < 64; ++i) blk[2 + i] = rand_byte();   // qs
+        for (int i = 0; i < 8; ++i) blk[66 + i] = rand_byte();   // qh
+        for (int i = 0; i < 8; ++i) blk[74 + i] = rand_byte();   // scales
+      } else if (enc == vt::DType::kQ3_K) {
+        // block_q3_K = { u8 hmask[32]; u8 qs[64]; u8 scales[12]; f16 d }
+        // (110B) — hmask any (the clear-bit subtraction reads single bits),
+        // qs the packed low 2 bits, scales the 6-bit splice bytes the
+        // kmask1/kmask2 split consumes; random bytes stay in the dot's
+        // bit-exact class (the same argument as Q6_K's signed scales).
+        for (int i = 0; i < 32; ++i) blk[0 + i] = rand_byte();   // hmask
+        for (int i = 0; i < 64; ++i) blk[32 + i] = rand_byte();  // qs
+        for (int i = 0; i < 12; ++i) blk[96 + i] = rand_byte();  // scales
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 108, &d_bits, sizeof(d_bits));
+      } else if (enc == vt::DType::kIQ3_S) {
+        // block_iq3_s = { f16 d; u8 qs[64]; u8 qh[8]; u8 signs[32];
+        // u8 scales[4] } (110B) — qs bytes are 8-bit kIq3sGrid[512] indices
+        // widened by one qh bit (in range), qh any, signs any (single-bit
+        // selectors), scales two 4-bit scale nibbles per 32-sub-block pair;
+        // random bytes stay in the dot's bit-exact class.
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        for (int i = 0; i < 64; ++i) blk[2 + i] = rand_byte();    // qs
+        for (int i = 0; i < 8; ++i) blk[66 + i] = rand_byte();    // qh
+        for (int i = 0; i < 32; ++i) blk[74 + i] = rand_byte();   // signs
+        for (int i = 0; i < 4; ++i) blk[106 + i] = rand_byte();   // scales
+      } else if (enc == vt::DType::kIQ4_XS) {
+        // block_iq4_xs = { f16 d; u16 scales_h; u8 scales_l[4]; u8 qs[128] }
+        // (136B) — each qs byte is two kvalues_iq4nl[16] indices (nibbles, in
+        // range), scales_l the low 4 bits of six sub-block scales and
+        // scales_h their 2-bit-high splices; random bytes stay in the dot's
+        // bit-exact class.
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        for (int i = 0; i < 134; ++i) blk[2 + i] = rand_byte();
+      } else if (enc == vt::DType::kIQ2_XS) {
+        // block_iq2_xs = { f16 d; u16 qs[32]; u8 scales[8] } (74B) — each qs
+        // u16 is a 9-bit kIq2xsGrid[512] index plus a 7-bit kKsignsIq2xs
+        // selector (any bytes in range), scales two 4-bit sub-scale nibbles
+        // per 32-sub-block; random bytes stay in the dot's bit-exact class.
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        for (int i = 0; i < 72; ++i) blk[2 + i] = rand_byte();  // qs + scales
+      } else if (enc == vt::DType::kQ8_0) {
         const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
         std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
         for (int i = 0; i < 32; ++i) blk[2 + i] = rand_byte();  // full int8 range
@@ -5635,6 +6173,1020 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuant matches the CPU integer vec_dot bit-exact
     MESSAGE("int8-dot sweep enc=", static_cast<int>(enc),
             ": the 18-shape bf16-act sweep + the f32-act leg bit-exact vs the CPU vec_dot");
   }
+}
+
+// QUANT-GGUF-IQ-TENSTORRENT repair: pin the DEFAULT-path dispatch the row's
+// reachability claim names. IQ3_XXS has no W4a grouped arm, so its only serve
+// is the int8-dot kernel, dispatched REGARDLESS of VT_TT_KEEPQUANT_INT8DOT
+// (tenstorrent_ops.cpp MatmulBTQuantKernel). The sweep above self-gates on the
+// env, so deleting the dispatch override alone left every gate green: the
+// route pin (OpRegistered) proves admission, not dispatch. This leg runs the
+// IQ3_XXS device decode with the lever explicitly UNSET and holds the same
+// bit-exact bar vs the CPU integer vec_dot oracle — the dispatch-only
+// mutation (override deleted, admission kept) refuses the route here and goes
+// RED.
+TEST_CASE("kTENSTORRENT kMatmulBTQuant IQ3_XXS serves the int8-dot arm on the DEFAULT path (VT_TT_KEEPQUANT_INT8DOT unset)") {
+  // Default-path contract: the lever env must NOT be set for this leg. Save
+  // and restore the ambient value whatever happens (the microbench pattern).
+  const char* prev_lever = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+  const bool had_lever = prev_lever != nullptr;
+  const std::string saved_lever =
+      had_lever ? std::string(prev_lever) : std::string();
+  struct RestoreLeverEnv {
+    const bool had;
+    const std::string saved;
+    ~RestoreLeverEnv() {
+      if (had) ::setenv("VT_TT_KEEPQUANT_INT8DOT", saved.c_str(), 1);
+      else ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+    }
+  } restore_lever_env{had_lever, saved_lever};
+  ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  const vt::DType enc = vt::DType::kIQ3_XXS;
+  const int64_t kBlockBytes = vt::BlockBytes(enc);
+  const int64_t kBlockElems = vt::BlockElems(enc);
+  REQUIRE(kBlockBytes == 98);
+  REQUIRE(kBlockElems == 256);
+  auto quant_act = vt::cpu::BlockFromFloat(vt::DType::kQ8_K);
+  auto vec_dot = vt::cpu::BlockVecDot(enc);
+  REQUIRE(quant_act != nullptr);
+  REQUIRE(vec_dot != nullptr);
+
+  // The sweep's IQ3_XXS packed generator and PRNG style, fixed seed.
+  std::mt19937 rng(20260909u);
+  auto rand_byte = [&rng]() { return static_cast<uint8_t>(rng() & 0xFF); };
+  auto rand_f16_signed = [&rng](float lo, float span) {
+    return (lo + span * static_cast<float>(rng() % 64) / 64.0f) *
+           ((rng() % 2) != 0 ? 1.0f : -1.0f);
+  };
+  auto fill_block = [&](uint8_t* blk) {
+    // block_iq3_xxs = { f16 d; u8 qs[96] } (98B): qs[0..63] grid indices,
+    // qs[64..71] per-32 scale+sign u32s; random bytes stay in range.
+    const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+    std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+    for (int i = 0; i < 96; ++i) blk[2 + i] = rand_byte();
+  };
+
+  // Decode shapes (M=1 is the GEMV), both one- and multi-block K.
+  for (int64_t M : {int64_t{1}, int64_t{3}}) {
+    for (int64_t N : {int64_t{1}, int64_t{17}}) {
+      for (int64_t nb : {int64_t{1}, int64_t{16}}) {
+        const int64_t K = nb * kBlockElems;
+        std::vector<uint8_t> packed(N * nb * kBlockBytes);
+        for (int64_t b = 0; b < N * nb; ++b)
+          fill_block(packed.data() + b * kBlockBytes);
+        std::vector<float> a_f32(M * K);
+        for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
+        std::vector<uint16_t> a_bf(M * K);
+        for (size_t i = 0; i < a_f32.size(); ++i) a_bf[i] = vt::F32ToBF16(a_f32[i]);
+        std::vector<float> a_q32(M * K);
+        for (size_t i = 0; i < a_f32.size(); ++i) a_q32[i] = vt::BF16ToF32(a_bf[i]);
+
+        // CPU integer oracle: quantize each activation row once, one nrc==1
+        // vec_dot per (m, n) pair.
+        const size_t y_row_bytes = vt::cpu::QuantActRowBytes(enc, K);
+        std::vector<uint8_t> y(M * y_row_bytes);
+        for (int64_t m = 0; m < M; ++m)
+          quant_act(a_q32.data() + m * K, y.data() + m * y_row_bytes, K);
+        std::vector<float> oracle(M * N);
+        for (int64_t m = 0; m < M; ++m)
+          for (int64_t n = 0; n < N; ++n)
+            vec_dot(static_cast<int>(K), &oracle[static_cast<size_t>(m) * N + n],
+                    /*bs=*/0, packed.data() + static_cast<size_t>(n) * nb * kBlockBytes,
+                    /*bx=*/0, y.data() + m * y_row_bytes, /*by=*/0, /*nrc=*/1);
+
+        void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+        void* mem_b = backend.Alloc(packed.size());
+        void* mem_o = backend.Alloc(std::max<size_t>(M * N, 16) * sizeof(float));
+        backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+        backend.Copy(q, mem_b, packed.data(), packed.size());
+        Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                        Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+        Tensor b_t = Tensor::Contiguous(mem_b, enc,
+                                        Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+        Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                        Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+        vt::MatmulBT(q, o_t, a_t, b_t);  // route refusal under the mutation throws here
+        std::vector<float> out(std::max<size_t>(M * N, 16), 0.0f);
+        backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+        backend.Free(mem_a);
+        backend.Free(mem_b);
+        backend.Free(mem_o);
+
+        INFO("default path, enc=", static_cast<int>(enc), " M=", M, " N=", N,
+             " nb=", nb, " K=", K);
+        if (std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) != 0) {
+          int64_t bad = 0;
+          for (int64_t i = 0; i < static_cast<int64_t>(oracle.size()); ++i) {
+            if (std::memcmp(&out[static_cast<size_t>(i)], &oracle[static_cast<size_t>(i)],
+                            sizeof(float)) != 0) {
+              if (bad < 4)
+                MESSAGE("diff m=", i / N, " n=", i % N, " dev=", out[static_cast<size_t>(i)],
+                        " oracle=", oracle[static_cast<size_t>(i)]);
+              ++bad;
+            }
+          }
+          MESSAGE("total bad: ", bad, " / ", oracle.size(),
+                  " (default-path IQ3_XXS did not take the int8-dot arm)");
+        }
+        CHECK(std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) == 0);
+      }
+    }
+  }
+  MESSAGE("default-path IQ3_XXS decode: the 8-shape leg bit-exact vs the CPU vec_dot "
+          "with VT_TT_KEEPQUANT_INT8DOT unset");
+}
+
+// QUANT-GGUF-IQ-TENSTORRENT wave 2: the same default-path pin for the two
+// encodings wave 2 registers — IQ2_XXS (enc_sel 5) and IQ2_S (enc_sel 6).
+// Neither has a W4a grouped arm, so the int8-dot kernel is their only serve,
+// dispatched REGARDLESS of VT_TT_KEEPQUANT_INT8DOT; the lever is explicitly
+// UNSET here and the same bit-exact bar holds vs the CPU integer vec_dot
+// oracles (VecDotIQ2_XXSQ8_K, VecDotIQ2_SQ8_K). The dispatch-only mutation
+// (override deleted, admission kept) refuses the route here and goes RED.
+TEST_CASE("kTENSTORRENT kMatmulBTQuant IQ2_XXS and IQ2_S serve the int8-dot arm on the DEFAULT path (VT_TT_KEEPQUANT_INT8DOT unset)") {
+  // Default-path contract: the lever env must NOT be set for this leg.
+  const char* prev_lever = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+  const bool had_lever = prev_lever != nullptr;
+  const std::string saved_lever =
+      had_lever ? std::string(prev_lever) : std::string();
+  struct RestoreLeverEnv {
+    const bool had;
+    const std::string saved;
+    ~RestoreLeverEnv() {
+      if (had) ::setenv("VT_TT_KEEPQUANT_INT8DOT", saved.c_str(), 1);
+      else ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+    }
+  } restore_lever_env{had_lever, saved_lever};
+  ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  const vt::DType encodings[] = {vt::DType::kIQ2_XXS, vt::DType::kIQ2_S};
+  for (const vt::DType enc : encodings) {
+    const int64_t kBlockBytes = vt::BlockBytes(enc);
+    const int64_t kBlockElems = vt::BlockElems(enc);
+    if (enc == vt::DType::kIQ2_XXS) {
+      REQUIRE(kBlockBytes == 66);
+      REQUIRE(kBlockElems == 256);
+    } else {
+      REQUIRE(kBlockBytes == 82);
+      REQUIRE(kBlockElems == 256);
+    }
+    auto quant_act = vt::cpu::BlockFromFloat(vt::DType::kQ8_K);
+    auto vec_dot = vt::cpu::BlockVecDot(enc);
+    REQUIRE(quant_act != nullptr);
+    REQUIRE(vec_dot != nullptr);
+
+    // The sweep's PRNG style and packed generators, fixed seed.
+    std::mt19937 rng(20260909u);
+    auto rand_byte = [&rng]() { return static_cast<uint8_t>(rng() & 0xFF); };
+    auto rand_f16_signed = [&rng](float lo, float span) {
+      return (lo + span * static_cast<float>(rng() % 64) / 64.0f) *
+             ((rng() % 2) != 0 ? 1.0f : -1.0f);
+    };
+    auto fill_block = [&](uint8_t* blk) {
+      const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+      std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+      if (enc == vt::DType::kIQ2_XXS) {
+        for (int i = 0; i < 64; ++i) blk[2 + i] = rand_byte();  // qs (u16[32])
+      } else {
+        for (int i = 0; i < 64; ++i) blk[2 + i] = rand_byte();   // qs
+        for (int i = 0; i < 8; ++i) blk[66 + i] = rand_byte();   // qh
+        for (int i = 0; i < 8; ++i) blk[74 + i] = rand_byte();   // scales
+      }
+    };
+
+    // Decode shapes (M=1 is the GEMV), both one- and multi-block K.
+    for (int64_t M : {int64_t{1}, int64_t{3}}) {
+      for (int64_t N : {int64_t{1}, int64_t{17}}) {
+        for (int64_t nb : {int64_t{1}, int64_t{16}}) {
+          const int64_t K = nb * kBlockElems;
+          std::vector<uint8_t> packed(N * nb * kBlockBytes);
+          for (int64_t b = 0; b < N * nb; ++b)
+            fill_block(packed.data() + b * kBlockBytes);
+          std::vector<float> a_f32(M * K);
+          for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
+          std::vector<uint16_t> a_bf(M * K);
+          for (size_t i = 0; i < a_f32.size(); ++i) a_bf[i] = vt::F32ToBF16(a_f32[i]);
+          std::vector<float> a_q32(M * K);
+          for (size_t i = 0; i < a_f32.size(); ++i) a_q32[i] = vt::BF16ToF32(a_bf[i]);
+
+          // CPU integer oracle: quantize each activation row once, one nrc==1
+          // vec_dot per (m, n) pair.
+          const size_t y_row_bytes = vt::cpu::QuantActRowBytes(enc, K);
+          std::vector<uint8_t> y(M * y_row_bytes);
+          for (int64_t m = 0; m < M; ++m)
+            quant_act(a_q32.data() + m * K, y.data() + m * y_row_bytes, K);
+          std::vector<float> oracle(M * N);
+          for (int64_t m = 0; m < M; ++m)
+            for (int64_t n = 0; n < N; ++n)
+              vec_dot(static_cast<int>(K), &oracle[static_cast<size_t>(m) * N + n],
+                      /*bs=*/0, packed.data() + static_cast<size_t>(n) * nb * kBlockBytes,
+                      /*bx=*/0, y.data() + m * y_row_bytes, /*by=*/0, /*nrc=*/1);
+
+          void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+          void* mem_b = backend.Alloc(packed.size());
+          void* mem_o = backend.Alloc(std::max<size_t>(M * N, 16) * sizeof(float));
+          backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+          backend.Copy(q, mem_b, packed.data(), packed.size());
+          Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                          Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+          Tensor b_t = Tensor::Contiguous(mem_b, enc,
+                                          Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+          Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                          Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+          vt::MatmulBT(q, o_t, a_t, b_t);  // route refusal under the mutation throws here
+          std::vector<float> out(std::max<size_t>(M * N, 16), 0.0f);
+          backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+          backend.Free(mem_a);
+          backend.Free(mem_b);
+          backend.Free(mem_o);
+
+          INFO("default path, enc=", static_cast<int>(enc), " M=", M, " N=", N,
+               " nb=", nb, " K=", K);
+          if (std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) != 0) {
+            int64_t bad = 0;
+            for (int64_t i = 0; i < static_cast<int64_t>(oracle.size()); ++i) {
+              if (std::memcmp(&out[static_cast<size_t>(i)], &oracle[static_cast<size_t>(i)],
+                              sizeof(float)) != 0) {
+                if (bad < 4)
+                  MESSAGE("diff m=", i / N, " n=", i % N, " dev=", out[static_cast<size_t>(i)],
+                          " oracle=", oracle[static_cast<size_t>(i)]);
+                ++bad;
+              }
+            }
+            MESSAGE("total bad: ", bad, " / ", oracle.size(),
+                    " (default-path ", vt::Name(enc), " did not take the int8-dot arm)");
+          }
+          CHECK(std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) == 0);
+        }
+      }
+    }
+    MESSAGE("default-path ", vt::Name(enc),
+            " decode: the 8-shape leg bit-exact vs the CPU vec_dot "
+            "with VT_TT_KEEPQUANT_INT8DOT unset");
+  }
+}
+
+// QUANT-GGUF-IQ-TENSTORRENT wave 3: the same default-path pin for Q3_K
+// (enc_sel 7), the min-term K-quant the census closes with. Q3_K has no W4a
+// grouped arm, so the int8-dot kernel is its only serve, dispatched
+// REGARDLESS of VT_TT_KEEPQUANT_INT8DOT; the lever is explicitly UNSET here
+// and the same bit-exact bar holds vs the CPU integer vec_dot oracle
+// (VecDotQ3_KQ8_K). The dispatch-only mutation (override deleted, admission
+// kept) refuses the route here and goes RED.
+TEST_CASE("kTENSTORRENT kMatmulBTQuant Q3_K serves the int8-dot arm on the DEFAULT path (VT_TT_KEEPQUANT_INT8DOT unset)") {
+  // Default-path contract: the lever env must NOT be set for this leg.
+  const char* prev_lever = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+  const bool had_lever = prev_lever != nullptr;
+  const std::string saved_lever =
+      had_lever ? std::string(prev_lever) : std::string();
+  struct RestoreLeverEnv {
+    const bool had;
+    const std::string saved;
+    ~RestoreLeverEnv() {
+      if (had) ::setenv("VT_TT_KEEPQUANT_INT8DOT", saved.c_str(), 1);
+      else ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+    }
+  } restore_lever_env{had_lever, saved_lever};
+  ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  const vt::DType enc = vt::DType::kQ3_K;
+  const int64_t kBlockBytes = vt::BlockBytes(enc);
+  const int64_t kBlockElems = vt::BlockElems(enc);
+  REQUIRE(kBlockBytes == 110);
+  REQUIRE(kBlockElems == 256);
+  auto quant_act = vt::cpu::BlockFromFloat(vt::DType::kQ8_K);
+  auto vec_dot = vt::cpu::BlockVecDot(enc);
+  REQUIRE(quant_act != nullptr);
+  REQUIRE(vec_dot != nullptr);
+
+  // The sweep's Q3_K packed generator and PRNG style, fixed seed.
+  std::mt19937 rng(20260909u);
+  auto rand_byte = [&rng]() { return static_cast<uint8_t>(rng() & 0xFF); };
+  auto rand_f16_signed = [&rng](float lo, float span) {
+    return (lo + span * static_cast<float>(rng() % 64) / 64.0f) *
+           ((rng() % 2) != 0 ? 1.0f : -1.0f);
+  };
+  auto fill_block = [&](uint8_t* blk) {
+    // block_q3_K = { u8 hmask[32]; u8 qs[64]; u8 scales[12]; f16 d } (110B).
+    for (int i = 0; i < 32; ++i) blk[0 + i] = rand_byte();   // hmask
+    for (int i = 0; i < 64; ++i) blk[32 + i] = rand_byte();  // qs
+    for (int i = 0; i < 12; ++i) blk[96 + i] = rand_byte();  // scales
+    const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+    std::memcpy(blk + 108, &d_bits, sizeof(d_bits));
+  };
+
+  // Decode shapes (M=1 is the GEMV), both one- and multi-block K.
+  for (int64_t M : {int64_t{1}, int64_t{3}}) {
+    for (int64_t N : {int64_t{1}, int64_t{17}}) {
+      for (int64_t nb : {int64_t{1}, int64_t{16}}) {
+        const int64_t K = nb * kBlockElems;
+        std::vector<uint8_t> packed(N * nb * kBlockBytes);
+        for (int64_t b = 0; b < N * nb; ++b)
+          fill_block(packed.data() + b * kBlockBytes);
+        std::vector<float> a_f32(M * K);
+        for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
+        std::vector<uint16_t> a_bf(M * K);
+        for (size_t i = 0; i < a_f32.size(); ++i) a_bf[i] = vt::F32ToBF16(a_f32[i]);
+        std::vector<float> a_q32(M * K);
+        for (size_t i = 0; i < a_f32.size(); ++i) a_q32[i] = vt::BF16ToF32(a_bf[i]);
+
+        // CPU integer oracle: quantize each activation row once, one nrc==1
+        // vec_dot per (m, n) pair.
+        const size_t y_row_bytes = vt::cpu::QuantActRowBytes(enc, K);
+        std::vector<uint8_t> y(M * y_row_bytes);
+        for (int64_t m = 0; m < M; ++m)
+          quant_act(a_q32.data() + m * K, y.data() + m * y_row_bytes, K);
+        std::vector<float> oracle(M * N);
+        for (int64_t m = 0; m < M; ++m)
+          for (int64_t n = 0; n < N; ++n)
+            vec_dot(static_cast<int>(K), &oracle[static_cast<size_t>(m) * N + n],
+                    /*bs=*/0, packed.data() + static_cast<size_t>(n) * nb * kBlockBytes,
+                    /*bx=*/0, y.data() + m * y_row_bytes, /*by=*/0, /*nrc=*/1);
+
+        void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+        void* mem_b = backend.Alloc(packed.size());
+        void* mem_o = backend.Alloc(std::max<size_t>(M * N, 16) * sizeof(float));
+        backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+        backend.Copy(q, mem_b, packed.data(), packed.size());
+        Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                        Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+        Tensor b_t = Tensor::Contiguous(mem_b, enc,
+                                        Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+        Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                        Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+        vt::MatmulBT(q, o_t, a_t, b_t);  // route refusal under the mutation throws here
+        std::vector<float> out(std::max<size_t>(M * N, 16), 0.0f);
+        backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+        backend.Free(mem_a);
+        backend.Free(mem_b);
+        backend.Free(mem_o);
+
+        INFO("default path, enc=", static_cast<int>(enc), " M=", M, " N=", N,
+             " nb=", nb, " K=", K);
+        if (std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) != 0) {
+          int64_t bad = 0;
+          for (int64_t i = 0; i < static_cast<int64_t>(oracle.size()); ++i) {
+            if (std::memcmp(&out[static_cast<size_t>(i)], &oracle[static_cast<size_t>(i)],
+                            sizeof(float)) != 0) {
+              if (bad < 4)
+                MESSAGE("diff m=", i / N, " n=", i % N, " dev=", out[static_cast<size_t>(i)],
+                        " oracle=", oracle[static_cast<size_t>(i)]);
+              ++bad;
+            }
+          }
+          MESSAGE("total bad: ", bad, " / ", oracle.size(),
+                  " (default-path Q3_K did not take the int8-dot arm)");
+        }
+        CHECK(std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) == 0);
+      }
+    }
+  }
+  MESSAGE("default-path Q3_K decode: the 8-shape leg bit-exact vs the CPU vec_dot "
+          "with VT_TT_KEEPQUANT_INT8DOT unset");
+}
+
+// ISSUE-LOCAL-01M2NSDATJQ1YNW1PA9ZBMAAM5: the 27B prefill shapes that broke the
+// int8-dot arm. Both encodings the 27B checkpoint stores on this route, the two
+// production tile widths (down-proj K=17408 N=5120, gate/up K=5120 N=17408) and
+// the M=256 prefill row count, one shape each per encoding, M=256 fixed. The
+// bar is the default-path Q3_K pin's: the device result is BIT-EXACT against
+// the CPU integer vec_dot oracle per (m, n), and the outputs are finite and
+// non-degenerate.
+TEST_CASE("kTENSTORRENT int8-dot 27B prefill shapes M=256 (ISSUE-LOCAL-01M2NSDATJQ1YNW1PA9ZBMAAM5)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  auto quant_act = vt::cpu::BlockFromFloat(vt::DType::kQ8_K);
+  REQUIRE(quant_act != nullptr);
+
+  const int64_t M = 256;
+  struct Shape {
+    const char* label;
+    int64_t N;
+    int64_t nb;
+  };
+  const Shape shapes[] = {
+      {"down-proj K=17408", 5120, 68},
+      {"gate/up K=5120", 17408, 20},
+  };
+
+  for (const vt::DType enc :
+       {vt::DType::kQ3_K, vt::DType::kIQ3_XXS, vt::DType::kIQ3_S,
+        vt::DType::kIQ4_XS, vt::DType::kIQ2_XS}) {
+    const int64_t kBlockBytes = vt::BlockBytes(enc);
+    const int64_t kBlockElems = vt::BlockElems(enc);
+    if (enc == vt::DType::kQ3_K) {
+      REQUIRE(kBlockBytes == 110);
+      REQUIRE(kBlockElems == 256);
+    } else if (enc == vt::DType::kIQ3_S) {
+      // tenstorrent-gsq-keepquant wave 1: the largest census gap (97
+      // tensors) joins the prefill-shape bar the ISSUE-LOCAL-01M2NSDATJQ1Y
+      // repair pinned for the other two.
+      REQUIRE(kBlockBytes == 110);
+      REQUIRE(kBlockElems == 256);
+    } else if (enc == vt::DType::kIQ4_XS) {
+      // tenstorrent-gsq-keepquant wave 2: the 33 census tensors (ssm_out +
+      // attn) join the prefill-shape bar the ISSUE-LOCAL-01M2NSDATJQ1Y
+      // repair pinned for the other three.
+      REQUIRE(kBlockBytes == 136);
+      REQUIRE(kBlockElems == 256);
+    } else if (enc == vt::DType::kIQ2_XS) {
+      // tenstorrent-gsq-keepquant wave 3: the 32 census tensors (ffn) join
+      // the same prefill-shape bar.
+      REQUIRE(kBlockBytes == 74);
+      REQUIRE(kBlockElems == 256);
+    } else {
+      REQUIRE(kBlockBytes == 98);
+      REQUIRE(kBlockElems == 256);
+    }
+    auto vec_dot = vt::cpu::BlockVecDot(enc);
+    REQUIRE(vec_dot != nullptr);
+
+    // The default-path Q3_K test's packed generator and PRNG style, fixed seed.
+    std::mt19937 rng(20260921u);
+    auto rand_byte = [&rng]() { return static_cast<uint8_t>(rng() & 0xFF); };
+    auto rand_f16_signed = [&rng](float lo, float span) {
+      return (lo + span * static_cast<float>(rng() % 64) / 64.0f) *
+             ((rng() % 2) != 0 ? 1.0f : -1.0f);
+    };
+    auto fill_block = [&](uint8_t* blk) {
+      if (enc == vt::DType::kQ3_K) {
+        // block_q3_K = { u8 hmask[32]; u8 qs[64]; u8 scales[12]; f16 d } (110B).
+        for (int i = 0; i < 32; ++i) blk[0 + i] = rand_byte();   // hmask
+        for (int i = 0; i < 64; ++i) blk[32 + i] = rand_byte();  // qs
+        for (int i = 0; i < 12; ++i) blk[96 + i] = rand_byte();  // scales
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 108, &d_bits, sizeof(d_bits));
+      } else if (enc == vt::DType::kIQ3_S) {
+        // block_iq3_s = { f16 d; u8 qs[64]; u8 qh[8]; u8 signs[32];
+        // u8 scales[4] } (110 bytes).
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        for (int i = 0; i < 64; ++i) blk[2 + i] = rand_byte();    // qs
+        for (int i = 0; i < 8; ++i) blk[66 + i] = rand_byte();    // qh
+        for (int i = 0; i < 32; ++i) blk[74 + i] = rand_byte();   // signs
+        for (int i = 0; i < 4; ++i) blk[106 + i] = rand_byte();   // scales
+      } else if (enc == vt::DType::kIQ4_XS) {
+        // block_iq4_xs = { f16 d; u16 scales_h; u8 scales_l[4]; u8 qs[128] }
+        // (136 bytes).
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        for (int i = 0; i < 134; ++i) blk[2 + i] = rand_byte();
+      } else if (enc == vt::DType::kIQ2_XS) {
+        // block_iq2_xs = { f16 d; u16 qs[32]; u8 scales[8] } (74 bytes).
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        for (int i = 0; i < 72; ++i) blk[2 + i] = rand_byte();
+      } else {
+        // block_iq3_xxs = { f16 d; u8 qs[96] } (98 bytes).
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        for (int i = 0; i < 96; ++i) blk[2 + i] = rand_byte();  // qs
+      }
+    };
+
+    for (const Shape& sh : shapes) {
+      const int64_t N = sh.N;
+      const int64_t K = sh.nb * kBlockElems;
+      std::vector<uint8_t> packed(N * sh.nb * kBlockBytes);
+      for (int64_t b = 0; b < N * sh.nb; ++b)
+        fill_block(packed.data() + b * kBlockBytes);
+      std::vector<float> a_f32(M * K);
+      for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
+      std::vector<uint16_t> a_bf(M * K);
+      for (size_t i = 0; i < a_f32.size(); ++i) a_bf[i] = vt::F32ToBF16(a_f32[i]);
+      std::vector<float> a_q32(M * K);
+      for (size_t i = 0; i < a_f32.size(); ++i) a_q32[i] = vt::BF16ToF32(a_bf[i]);
+
+      // CPU integer oracle: quantize each activation row once, one nrc==1
+      // vec_dot per (m, n) pair.
+      const size_t y_row_bytes = vt::cpu::QuantActRowBytes(enc, K);
+      std::vector<uint8_t> y(M * y_row_bytes);
+      for (int64_t m = 0; m < M; ++m)
+        quant_act(a_q32.data() + m * K, y.data() + m * y_row_bytes, K);
+      std::vector<float> oracle(M * N);
+      for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n)
+          vec_dot(static_cast<int>(K), &oracle[static_cast<size_t>(m) * N + n],
+                  /*bs=*/0, packed.data() + static_cast<size_t>(n) * sh.nb * kBlockBytes,
+                  /*bx=*/0, y.data() + m * y_row_bytes, /*by=*/0, /*nrc=*/1);
+
+      void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+      void* mem_b = backend.Alloc(packed.size());
+      void* mem_o = backend.Alloc(std::max<size_t>(M * N, 16) * sizeof(float));
+      backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+      backend.Copy(q, mem_b, packed.data(), packed.size());
+      Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                      Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+      Tensor b_t = Tensor::Contiguous(mem_b, enc,
+                                      Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+      Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                      Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+      vt::MatmulBT(q, o_t, a_t, b_t);
+      std::vector<float> out(std::max<size_t>(M * N, 16), 0.0f);
+      backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+      backend.Free(mem_a);
+      backend.Free(mem_b);
+      backend.Free(mem_o);
+
+      const char* enc_name = (enc == vt::DType::kQ3_K)    ? "Q3_K"
+                             : (enc == vt::DType::kIQ3_S)  ? "IQ3_S"
+                             : (enc == vt::DType::kIQ4_XS) ? "IQ4_XS"
+                             : (enc == vt::DType::kIQ2_XS) ? "IQ2_XS"
+                                                           : "IQ3_XXS";
+      INFO(enc_name, " ", sh.label,
+           " N=", N, " nb=", sh.nb, " K=", K, " M=", M);
+      int64_t bad = 0;
+      int64_t zero = 0;
+      int64_t infs = 0;
+      for (int64_t i = 0; i < static_cast<int64_t>(M * N); ++i) {
+        const float dev = out[static_cast<size_t>(i)];
+        const float ref = oracle[static_cast<size_t>(i)];
+        if (std::memcmp(&dev, &ref, sizeof(float)) != 0) {
+          if (bad < 4)
+            MESSAGE("diff m=", i / N, " n=", i % N, " dev=", dev, " oracle=", ref);
+          ++bad;
+        }
+        if (dev == 0.0f) ++zero;
+        if (std::isinf(dev)) ++infs;
+      }
+      MESSAGE("enc=", enc_name, " ", sh.label, ": bad=", bad,
+              " zero=", zero, " infs=", infs, " / ", M * N);
+      CHECK(bad == 0);
+      CHECK(zero < (M * N) / 2);
+      CHECK(std::memcmp(out.data(), oracle.data(), M * N * sizeof(float)) == 0);
+    }
+  }
+  MESSAGE("27B prefill shapes M=256: Q3_K, IQ3_XXS, IQ3_S, IQ4_XS and IQ2_XS "
+          "bit-exact vs the CPU vec_dot");
+}
+
+// tenstorrent-gsq-keepquant wave 1: the IQ3_S default-path dispatch pin and
+// the APEX decode-shape leg (M=1 GEMV at the two 27B production tile
+// widths). The Q3_K wave-3 test is the template; the lever is explicitly
+// UNSET here and the bit-exact bar holds vs the CPU integer vec_dot oracle
+// (VecDotIQ3_SQ8_K). The dispatch-only mutation (override deleted, admission
+// kept) refuses the route here and goes RED.
+TEST_CASE("kTENSTORRENT kMatmulBTQuant IQ3_S serves the int8-dot arm on the DEFAULT path (VT_TT_KEEPQUANT_INT8DOT unset)") {
+  // Default-path contract: the lever env must NOT be set for this leg.
+  const char* prev_lever = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+  const bool had_lever = prev_lever != nullptr;
+  const std::string saved_lever =
+      had_lever ? std::string(prev_lever) : std::string();
+  struct RestoreLeverEnv {
+    const bool had;
+    const std::string saved;
+    ~RestoreLeverEnv() {
+      if (had) ::setenv("VT_TT_KEEPQUANT_INT8DOT", saved.c_str(), 1);
+      else ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+    }
+  } restore_lever_env{had_lever, saved_lever};
+  ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  const vt::DType enc = vt::DType::kIQ3_S;
+  const int64_t kBlockBytes = vt::BlockBytes(enc);
+  const int64_t kBlockElems = vt::BlockElems(enc);
+  REQUIRE(kBlockBytes == 110);
+  REQUIRE(kBlockElems == 256);
+  auto quant_act = vt::cpu::BlockFromFloat(vt::DType::kQ8_K);
+  auto vec_dot = vt::cpu::BlockVecDot(enc);
+  REQUIRE(quant_act != nullptr);
+  REQUIRE(vec_dot != nullptr);
+
+  // The sweep's PRNG style and packed generator, fixed seed.
+  std::mt19937 rng(20260922u);
+  auto rand_byte = [&rng]() { return static_cast<uint8_t>(rng() & 0xFF); };
+  auto rand_f16_signed = [&rng](float lo, float span) {
+    return (lo + span * static_cast<float>(rng() % 64) / 64.0f) *
+           ((rng() % 2) != 0 ? 1.0f : -1.0f);
+  };
+  auto fill_block = [&](uint8_t* blk) {
+    const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+    std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+    for (int i = 0; i < 64; ++i) blk[2 + i] = rand_byte();    // qs
+    for (int i = 0; i < 8; ++i) blk[66 + i] = rand_byte();    // qh
+    for (int i = 0; i < 32; ++i) blk[74 + i] = rand_byte();   // signs
+    for (int i = 0; i < 4; ++i) blk[106 + i] = rand_byte();   // scales
+  };
+
+  // Decode shapes: small blocks (the f32-exact P==1 floor) plus the two APEX
+  // decode shapes M=1 at the production tile widths (down-proj K=17408
+  // N=5120, gate/up K=5120 N=17408). M=256 at the same widths is the
+  // prefill-shapes leg above.
+  struct Shape {
+    const char* label;
+    int64_t M;
+    int64_t N;
+    int64_t nb;
+  };
+  const Shape shapes[] = {
+      {"small M=1", 1, 17, 16},
+      {"small M=3", 3, 17, 16},
+      {"down-proj decode", 1, 5120, 68},
+      {"gate/up decode", 1, 17408, 20},
+  };
+  for (const Shape& sh : shapes) {
+    const int64_t M = sh.M;
+    const int64_t N = sh.N;
+    const int64_t K = sh.nb * kBlockElems;
+    std::vector<uint8_t> packed(N * sh.nb * kBlockBytes);
+    for (int64_t b = 0; b < N * sh.nb; ++b)
+      fill_block(packed.data() + b * kBlockBytes);
+    std::vector<float> a_f32(M * K);
+    for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
+    std::vector<uint16_t> a_bf(M * K);
+    for (size_t i = 0; i < a_f32.size(); ++i) a_bf[i] = vt::F32ToBF16(a_f32[i]);
+    std::vector<float> a_q32(M * K);
+    for (size_t i = 0; i < a_f32.size(); ++i) a_q32[i] = vt::BF16ToF32(a_bf[i]);
+
+    // CPU integer oracle: quantize each activation row once, one nrc==1
+    // vec_dot per (m, n) pair.
+    const size_t y_row_bytes = vt::cpu::QuantActRowBytes(enc, K);
+    std::vector<uint8_t> y(M * y_row_bytes);
+    for (int64_t m = 0; m < M; ++m)
+      quant_act(a_q32.data() + m * K, y.data() + m * y_row_bytes, K);
+    std::vector<float> oracle(M * N);
+    for (int64_t m = 0; m < M; ++m)
+      for (int64_t n = 0; n < N; ++n)
+        vec_dot(static_cast<int>(K), &oracle[static_cast<size_t>(m) * N + n],
+                /*bs=*/0, packed.data() + static_cast<size_t>(n) * sh.nb * kBlockBytes,
+                /*bx=*/0, y.data() + m * y_row_bytes, /*by=*/0, /*nrc=*/1);
+
+    void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+    void* mem_b = backend.Alloc(packed.size());
+    void* mem_o = backend.Alloc(std::max<size_t>(M * N, 16) * sizeof(float));
+    backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_b, packed.data(), packed.size());
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+    Tensor b_t = Tensor::Contiguous(mem_b, enc,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+    vt::MatmulBT(q, o_t, a_t, b_t);  // route refusal under the mutation throws here
+    std::vector<float> out(std::max<size_t>(M * N, 16), 0.0f);
+    backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+    backend.Free(mem_a);
+    backend.Free(mem_b);
+    backend.Free(mem_o);
+
+    INFO("default path IQ3_S ", sh.label, " N=", N, " nb=", sh.nb, " K=", K,
+         " M=", M);
+    int64_t bad = 0;
+    int64_t zero = 0;
+    int64_t infs = 0;
+    for (int64_t i = 0; i < static_cast<int64_t>(M * N); ++i) {
+      const float dev = out[static_cast<size_t>(i)];
+      const float ref = oracle[static_cast<size_t>(i)];
+      if (std::memcmp(&dev, &ref, sizeof(float)) != 0) {
+        if (bad < 4)
+          MESSAGE("diff m=", i / N, " n=", i % N, " dev=", dev,
+                  " oracle=", ref);
+        ++bad;
+      }
+      if (dev == 0.0f) ++zero;
+      if (std::isinf(dev)) ++infs;
+    }
+    MESSAGE("IQ3_S ", sh.label, ": bad=", bad, " zero=", zero,
+            " infs=", infs, " / ", M * N);
+    CHECK(bad == 0);
+    CHECK(zero < (M * N) / 2);
+    CHECK(std::memcmp(out.data(), oracle.data(), M * N * sizeof(float)) == 0);
+  }
+  MESSAGE("default-path IQ3_S decode: bit-exact vs the CPU vec_dot with "
+          "VT_TT_KEEPQUANT_INT8DOT unset");
+}
+
+// tenstorrent-gsq-keepquant wave 2: the IQ4_XS default-path dispatch pin and
+// the APEX decode-shape leg (M=1 GEMV at the two 27B production tile
+// widths), the wave-1 IQ3_S test as template. The lever is explicitly UNSET
+// here and the bit-exact bar holds vs the CPU integer vec_dot oracle
+// (VecDotIQ4_XSQ8_K, which already existed — the IQ2_XS/IQ4_XS row landed it
+// with the CPU dot tests). The dispatch-only mutation (override deleted,
+// admission kept) refuses the route here and goes RED.
+TEST_CASE("kTENSTORRENT kMatmulBTQuant IQ4_XS serves the int8-dot arm on the DEFAULT path (VT_TT_KEEPQUANT_INT8DOT unset)") {
+  // Default-path contract: the lever env must NOT be set for this leg.
+  const char* prev_lever = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+  const bool had_lever = prev_lever != nullptr;
+  const std::string saved_lever =
+      had_lever ? std::string(prev_lever) : std::string();
+  struct RestoreLeverEnv {
+    const bool had;
+    const std::string saved;
+    ~RestoreLeverEnv() {
+      if (had) ::setenv("VT_TT_KEEPQUANT_INT8DOT", saved.c_str(), 1);
+      else ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+    }
+  } restore_lever_env{had_lever, saved_lever};
+  ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  const vt::DType enc = vt::DType::kIQ4_XS;
+  const int64_t kBlockBytes = vt::BlockBytes(enc);
+  const int64_t kBlockElems = vt::BlockElems(enc);
+  REQUIRE(kBlockBytes == 136);
+  REQUIRE(kBlockElems == 256);
+  auto quant_act = vt::cpu::BlockFromFloat(vt::DType::kQ8_K);
+  auto vec_dot = vt::cpu::BlockVecDot(enc);
+  REQUIRE(quant_act != nullptr);
+  REQUIRE(vec_dot != nullptr);
+
+  // The sweep's PRNG style and packed generator, fixed seed.
+  std::mt19937 rng(20260923u);
+  auto rand_byte = [&rng]() { return static_cast<uint8_t>(rng() & 0xFF); };
+  auto rand_f16_signed = [&rng](float lo, float span) {
+    return (lo + span * static_cast<float>(rng() % 64) / 64.0f) *
+           ((rng() % 2) != 0 ? 1.0f : -1.0f);
+  };
+  auto fill_block = [&](uint8_t* blk) {
+    const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+    std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+    for (int i = 0; i < 134; ++i) blk[2 + i] = rand_byte();  // scales_h,
+                                                             // scales_l, qs
+  };
+
+  // Decode shapes: small blocks (the f32-exact P==1 floor) plus the two APEX
+  // decode shapes M=1 at the production tile widths (down-proj K=17408
+  // N=5120, gate/up K=5120 N=17408). M=256 at the same widths is the
+  // prefill-shapes leg above.
+  struct Shape {
+    const char* label;
+    int64_t M;
+    int64_t N;
+    int64_t nb;
+  };
+  const Shape shapes[] = {
+      {"small M=1", 1, 17, 16},
+      {"small M=3", 3, 17, 16},
+      {"down-proj decode", 1, 5120, 68},
+      {"gate/up decode", 1, 17408, 20},
+  };
+  for (const Shape& sh : shapes) {
+    const int64_t M = sh.M;
+    const int64_t N = sh.N;
+    const int64_t K = sh.nb * kBlockElems;
+    std::vector<uint8_t> packed(N * sh.nb * kBlockBytes);
+    for (int64_t b = 0; b < N * sh.nb; ++b)
+      fill_block(packed.data() + b * kBlockBytes);
+    std::vector<float> a_f32(M * K);
+    for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
+    std::vector<uint16_t> a_bf(M * K);
+    for (size_t i = 0; i < a_f32.size(); ++i) a_bf[i] = vt::F32ToBF16(a_f32[i]);
+    std::vector<float> a_q32(M * K);
+    for (size_t i = 0; i < a_f32.size(); ++i) a_q32[i] = vt::BF16ToF32(a_bf[i]);
+
+    // CPU integer oracle: quantize each activation row once, one nrc==1
+    // vec_dot per (m, n) pair.
+    const size_t y_row_bytes = vt::cpu::QuantActRowBytes(enc, K);
+    std::vector<uint8_t> y(M * y_row_bytes);
+    for (int64_t m = 0; m < M; ++m)
+      quant_act(a_q32.data() + m * K, y.data() + m * y_row_bytes, K);
+    std::vector<float> oracle(M * N);
+    for (int64_t m = 0; m < M; ++m)
+      for (int64_t n = 0; n < N; ++n)
+        vec_dot(static_cast<int>(K), &oracle[static_cast<size_t>(m) * N + n],
+                /*bs=*/0, packed.data() + static_cast<size_t>(n) * sh.nb * kBlockBytes,
+                /*bx=*/0, y.data() + m * y_row_bytes, /*by=*/0, /*nrc=*/1);
+
+    void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+    void* mem_b = backend.Alloc(packed.size());
+    void* mem_o = backend.Alloc(std::max<size_t>(M * N, 16) * sizeof(float));
+    backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_b, packed.data(), packed.size());
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+    Tensor b_t = Tensor::Contiguous(mem_b, enc,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+    vt::MatmulBT(q, o_t, a_t, b_t);  // route refusal under the mutation throws here
+    std::vector<float> out(std::max<size_t>(M * N, 16), 0.0f);
+    backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+    backend.Free(mem_a);
+    backend.Free(mem_b);
+    backend.Free(mem_o);
+
+    INFO("default path IQ4_XS ", sh.label, " N=", N, " nb=", sh.nb, " K=", K,
+         " M=", M);
+    {
+    }
+    int64_t bad = 0;
+    int64_t zero = 0;
+    int64_t infs = 0;
+    for (int64_t i = 0; i < static_cast<int64_t>(M * N); ++i) {
+      const float dev = out[static_cast<size_t>(i)];
+      const float ref = oracle[static_cast<size_t>(i)];
+      if (std::memcmp(&dev, &ref, sizeof(float)) != 0) {
+        if (bad < 4)
+          MESSAGE("diff m=", i / N, " n=", i % N, " dev=", dev,
+                  " oracle=", ref);
+        ++bad;
+      }
+      if (dev == 0.0f) ++zero;
+      if (std::isinf(dev)) ++infs;
+    }
+    MESSAGE("IQ4_XS ", sh.label, ": bad=", bad, " zero=", zero,
+            " infs=", infs, " / ", M * N);
+    CHECK(bad == 0);
+    CHECK(zero < (M * N) / 2);
+    CHECK(std::memcmp(out.data(), oracle.data(), M * N * sizeof(float)) == 0);
+  }
+  MESSAGE("default-path IQ4_XS decode: bit-exact vs the CPU vec_dot with "
+          "VT_TT_KEEPQUANT_INT8DOT unset");
+}
+
+// tenstorrent-gsq-keepquant wave 3: the IQ2_XS default-path dispatch pin and
+// the APEX decode-shape leg (M=1 GEMV at the two 27B production tile
+// widths), the wave-2 IQ4_XS test as template. The lever is explicitly UNSET
+// here and the bit-exact bar holds vs the CPU integer vec_dot oracle
+// (VecDotIQ2_XSQ8_K, which already existed — the IQ2_XS/IQ4_XS row landed it
+// with the CPU dot tests). The dispatch-only mutation (override deleted,
+// admission kept) refuses the route here and goes RED.
+TEST_CASE("kTENSTORRENT kMatmulBTQuant IQ2_XS serves the int8-dot arm on the DEFAULT path (VT_TT_KEEPQUANT_INT8DOT unset)") {
+  // Default-path contract: the lever env must NOT be set for this leg.
+  const char* prev_lever = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+  const bool had_lever = prev_lever != nullptr;
+  const std::string saved_lever =
+      had_lever ? std::string(prev_lever) : std::string();
+  struct RestoreLeverEnv {
+    const bool had;
+    const std::string saved;
+    ~RestoreLeverEnv() {
+      if (had) ::setenv("VT_TT_KEEPQUANT_INT8DOT", saved.c_str(), 1);
+      else ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+    }
+  } restore_lever_env{had_lever, saved_lever};
+  ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  const vt::DType enc = vt::DType::kIQ2_XS;
+  const int64_t kBlockBytes = vt::BlockBytes(enc);
+  const int64_t kBlockElems = vt::BlockElems(enc);
+  REQUIRE(kBlockBytes == 74);
+  REQUIRE(kBlockElems == 256);
+  auto quant_act = vt::cpu::BlockFromFloat(vt::DType::kQ8_K);
+  auto vec_dot = vt::cpu::BlockVecDot(enc);
+  REQUIRE(quant_act != nullptr);
+  REQUIRE(vec_dot != nullptr);
+
+  // The sweep's PRNG style and packed generator, fixed seed.
+  std::mt19937 rng(20260924u);
+  auto rand_byte = [&rng]() { return static_cast<uint8_t>(rng() & 0xFF); };
+  auto rand_f16_signed = [&rng](float lo, float span) {
+    return (lo + span * static_cast<float>(rng() % 64) / 64.0f) *
+           ((rng() % 2) != 0 ? 1.0f : -1.0f);
+  };
+  auto fill_block = [&](uint8_t* blk) {
+    const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+    std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+    for (int i = 0; i < 72; ++i) blk[2 + i] = rand_byte();  // qs + scales
+  };
+
+  // Decode shapes: small blocks (the f32-exact P==1 floor) plus the two APEX
+  // decode shapes M=1 at the production tile widths (down-proj K=17408
+  // N=5120, gate/up K=5120 N=17408). M=256 at the same widths is the
+  // prefill-shapes leg above.
+  struct Shape {
+    const char* label;
+    int64_t M;
+    int64_t N;
+    int64_t nb;
+  };
+  const Shape shapes[] = {
+      {"small M=1", 1, 17, 16},
+      {"small M=3", 3, 17, 16},
+      {"down-proj decode", 1, 5120, 68},
+      {"gate/up decode", 1, 17408, 20},
+  };
+  for (const Shape& sh : shapes) {
+    const int64_t M = sh.M;
+    const int64_t N = sh.N;
+    const int64_t K = sh.nb * kBlockElems;
+    std::vector<uint8_t> packed(N * sh.nb * kBlockBytes);
+    for (int64_t b = 0; b < N * sh.nb; ++b)
+      fill_block(packed.data() + b * kBlockBytes);
+    std::vector<float> a_f32(M * K);
+    for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
+    std::vector<uint16_t> a_bf(M * K);
+    for (size_t i = 0; i < a_f32.size(); ++i) a_bf[i] = vt::F32ToBF16(a_f32[i]);
+    std::vector<float> a_q32(M * K);
+    for (size_t i = 0; i < a_f32.size(); ++i) a_q32[i] = vt::BF16ToF32(a_bf[i]);
+
+    // CPU integer oracle: quantize each activation row once, one nrc==1
+    // vec_dot per (m, n) pair.
+    const size_t y_row_bytes = vt::cpu::QuantActRowBytes(enc, K);
+    std::vector<uint8_t> y(M * y_row_bytes);
+    for (int64_t m = 0; m < M; ++m)
+      quant_act(a_q32.data() + m * K, y.data() + m * y_row_bytes, K);
+    std::vector<float> oracle(M * N);
+    for (int64_t m = 0; m < M; ++m)
+      for (int64_t n = 0; n < N; ++n)
+        vec_dot(static_cast<int>(K), &oracle[static_cast<size_t>(m) * N + n],
+                /*bs=*/0, packed.data() + static_cast<size_t>(n) * sh.nb * kBlockBytes,
+                /*bx=*/0, y.data() + m * y_row_bytes, /*by=*/0, /*nrc=*/1);
+
+    void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+    void* mem_b = backend.Alloc(packed.size());
+    void* mem_o = backend.Alloc(std::max<size_t>(M * N, 16) * sizeof(float));
+    backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_b, packed.data(), packed.size());
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+    Tensor b_t = Tensor::Contiguous(mem_b, enc,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+    vt::MatmulBT(q, o_t, a_t, b_t);  // route refusal under the mutation throws here
+    std::vector<float> out(std::max<size_t>(M * N, 16), 0.0f);
+    backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+    backend.Free(mem_a);
+    backend.Free(mem_b);
+    backend.Free(mem_o);
+
+    INFO("default path IQ2_XS ", sh.label, " N=", N, " nb=", sh.nb, " K=", K,
+         " M=", M);
+    int64_t bad = 0;
+    int64_t zero = 0;
+    int64_t infs = 0;
+    for (int64_t i = 0; i < static_cast<int64_t>(M * N); ++i) {
+      const float dev = out[static_cast<size_t>(i)];
+      const float ref = oracle[static_cast<size_t>(i)];
+      if (std::memcmp(&dev, &ref, sizeof(float)) != 0) {
+        if (bad < 4)
+          MESSAGE("diff m=", i / N, " n=", i % N, " dev=", dev,
+                  " oracle=", ref);
+        ++bad;
+      }
+      if (dev == 0.0f) ++zero;
+      if (std::isinf(dev)) ++infs;
+    }
+    MESSAGE("IQ2_XS ", sh.label, ": bad=", bad, " zero=", zero,
+            " infs=", infs, " / ", M * N);
+    CHECK(bad == 0);
+    CHECK(zero < (M * N) / 2);
+    CHECK(std::memcmp(out.data(), oracle.data(), M * N * sizeof(float)) == 0);
+  }
+  MESSAGE("default-path IQ2_XS decode: bit-exact vs the CPU vec_dot with "
+          "VT_TT_KEEPQUANT_INT8DOT unset");
 }
 
 // KEEPQUANT W3 (issue #2959): the decode set generalizes to the other GGUF
@@ -6535,6 +8087,129 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuantGrouped matches the CPU grouped provider i
   }
 }
 
+// THE DECODE f32-EXACT LEG: M=1 (decode) wide-range Q4_K grouped GEMV vs a
+// double-accumulated f32-domain CPU oracle over the exact BlockToFloat
+// weight decode and the SAME bf16-widened activation the device stages. The
+// pre-fix decode branch typecast BOTH the decoded f32 weight tile and the
+// f32 activation to bf16 and ran a full bf16 TILE matmul; the oracle
+// accumulates in f64 over exact f32 weights. Wide-range activations
+// (state-like ±10^uniform(-3,2)) make that operand rounding first-order:
+// small-magnitude outputs — the elements the elementwise envelope exists to
+// catch — carry a relative error far past the 0.002 gate. Shape mirrors a
+// 27B decode slice (N=1024 per-group intermediate, K=5120 = Qwen3.8-27B
+// hidden_size).
+TEST_CASE("kTENSTORRENT kMatmulBTQuantGrouped decode (P=1) matches the CPU f32 quantized dot within the elementwise envelope") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped,
+                           vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  const vt::DType enc = vt::DType::kQ4_K;
+  const int64_t kBlockBytes = vt::BlockBytes(enc);
+  const int64_t kBlockElems = vt::BlockElems(enc);
+  constexpr int64_t kE = 1, kN = 1024, kNb = 20;  // K = 5120, 27B hidden_size
+  const int64_t K = kNb * kBlockElems;
+
+  std::mt19937 rng(20260913u);
+  std::vector<uint8_t> packed(kE * kN * kNb * kBlockBytes);
+  for (size_t b = 0; b < packed.size() / kBlockBytes; ++b) {
+    uint8_t* blk = packed.data() + b * kBlockBytes;
+    const uint16_t d_bits =
+        vt::F32ToF16((0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f) *
+                     ((rng() % 2) != 0 ? 1.0f : -1.0f));
+    const uint16_t dmin_bits =
+        vt::F32ToF16(0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f);
+    std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+    std::memcpy(blk + 2, &dmin_bits, sizeof(dmin_bits));
+    for (int i = 4; i < kBlockBytes; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
+  }
+  // Wide-range state-like activation: ±10^uniform(-3,2), one row (M=1).
+  std::vector<float> a_f32(K);
+  for (float& x : a_f32) {
+    const float mag = std::pow(10.0f, -3.0f + 5.0f * (static_cast<float>(rng() % 1024) / 1024.0f));
+    x = ((rng() % 2) != 0 ? -1.0f : 1.0f) * mag;
+  }
+  std::vector<uint16_t> a_bf(a_f32.size());
+  for (size_t i = 0; i < a_f32.size(); ++i) a_bf[i] = vt::F32ToBF16(a_f32[i]);
+  std::vector<float> a_q32(a_f32.size());
+  for (size_t i = 0; i < a_f32.size(); ++i) a_q32[i] = vt::BF16ToF32(a_bf[i]);
+  std::vector<int32_t> ids(1, 0);
+
+  // CPU f32-domain oracle: the exact weight decode the device must mirror
+  // (BlockToFloat, W3-pinned bit-exact) dotted against the SAME bf16-widened
+  // activation the device stages, accumulated in double. NOT the q8_K
+  // vec_dot: quantizing the activation to q8_K is the int8-dot arm's domain
+  // (bit-exact, pinned by its own sweep); this arm keeps activations
+  // unquantized, so the q8_K rounding (~0.4-2% elementwise) would swamp the
+  // gate. What the envelope proves is that no bf16 ROUNDING detour remains
+  // on the device dot.
+  auto block_to_float = vt::cpu::BlockToFloat(enc);
+  REQUIRE(block_to_float != nullptr);
+  std::vector<float> w_f32(kE * kN * K);
+  block_to_float(packed.data(), w_f32.data(), kE * kN * K);
+  std::vector<float> oracle(kN, 0.0f);
+  for (int64_t n = 0; n < kN; ++n) {
+    double acc = 0.0;
+    for (int64_t c = 0; c < K; ++c)
+      acc += static_cast<double>(w_f32[static_cast<size_t>(n) * K + c]) *
+             static_cast<double>(a_q32[static_cast<size_t>(c)]);
+    oracle[static_cast<size_t>(n)] = static_cast<float>(acc);
+  }
+
+  void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+  void* mem_w = backend.Alloc(packed.size());
+  void* mem_o = backend.Alloc(kN * sizeof(float));
+  void* mem_i = backend.Alloc(ids.size() * sizeof(int32_t));
+  backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+  backend.Copy(q, mem_w, packed.data(), packed.size());
+  backend.Copy(q, mem_i, ids.data(), ids.size() * sizeof(int32_t));
+  Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                  Device{vt::DeviceType::kTENSTORRENT, 0}, {1, K});
+  Tensor w_t = Tensor::Contiguous(mem_w, enc,
+                                  Device{vt::DeviceType::kTENSTORRENT, 0}, {kE * kN, K});
+  Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                  Device{vt::DeviceType::kTENSTORRENT, 0}, {1, kN});
+  Tensor i_t = Tensor::Contiguous(mem_i, vt::DType::kI32,
+                                  Device{vt::DeviceType::kTENSTORRENT, 0}, {1});
+  vt::MatmulBTQuantGrouped(q, o_t, a_t, w_t, i_t);
+  std::vector<float> out(kN, 0.0f);
+  backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+  backend.Free(mem_a);
+  backend.Free(mem_w);
+  backend.Free(mem_o);
+  backend.Free(mem_i);
+
+  // Elementwise envelope: 0.002 relative + a 1e-5 abs floor (the f32 device
+  // compute agrees with the f32 scalar oracle at ~1e-6 relative; a bf16
+  // operand rounding detour measures far past 0.002 on the small outputs).
+  const double rel_tol = 0.002, abs_floor = 1e-5;
+  double worst_rel = 0.0, worst_abs = 0.0;
+  int64_t bad = 0;
+  for (int64_t i = 0; i < kN; ++i) {
+    const double ref = static_cast<double>(oracle[static_cast<size_t>(i)]);
+    const double d = std::fabs(static_cast<double>(out[static_cast<size_t>(i)]) - ref);
+    const double lim = rel_tol * std::fabs(ref) + abs_floor;
+    worst_rel = std::max(worst_rel, d / (std::fabs(ref) + 1e-30));
+    worst_abs = std::max(worst_abs, d);
+    if (d > lim) {
+      if (bad < 4)
+        MESSAGE("diff n=", i, " dev=", out[static_cast<size_t>(i)],
+                " oracle=", oracle[static_cast<size_t>(i)], " |d|=", d,
+                " lim=", lim);
+      ++bad;
+    }
+  }
+  MESSAGE("grouped decode P=1 Q4_K N=", kN, " K=", K, ": worst_rel=", worst_rel,
+          " worst_abs=", worst_abs, " bad=", bad, "/", kN,
+          " (rel_tol=", rel_tol, " abs_floor=", abs_floor, ")");
+  CHECK_MESSAGE(bad == 0, "grouped decode drift past the elementwise envelope: ",
+                bad, " of ", kN, " outputs (worst_rel=", worst_rel, ")");
+}
 // ---------------------------------------------------------------------------
 // KEEPQUANT W4a wave-3a (#3030): the E=1 (dense) grouped arm becomes
 // capture-compatible and memory-bounded. Three legs:
@@ -6726,6 +8401,11 @@ TEST_CASE("kTENSTORRENT E=1 grouped keep-quant capture survives the 50 MiB trace
                     eager.size() * sizeof(float)) == 0);
   MESSAGE("capture x2 byte-identity: PASS; trace demand pass0=", demand[0],
           " B pass1=", demand[1], " B (region 52428800 B)");
+  // Cleanup, once (the teardown double-free: an earlier revision indented
+  // backend.Free(mem_i) INSIDE this pass loop, freeing the same buffer twice
+  // per run before the trailing free — a plain triple free that glibc catches
+  // nondeterministically, depending on the heap layout the run happens to
+  // produce, which is why the abort looked flaky and "at tt-metal teardown").
   backend.Free(mem_a);
   backend.Free(mem_w);
   backend.Free(mem_o);
@@ -8166,3 +9846,313 @@ TEST_CASE("kTENSTORRENT single-chunk keep-quant decode keeps the word shadow res
 // (q6_K + q4_K, bit-for-bit vs the element-level reorder through the real
 // dequantizer) and locked by the bf16-out capture test above.
 
+
+// ── BFP8 weight residency (spec .agents/specs/tenstorrent-bfp-weight-
+// residency.md) ─────────────────────────────────────────────────────────────
+// VT_TT_WEIGHT_RESIDENCY=1 converts a bf16 matmul WEIGHT to a device-resident
+// BFLOAT8_B operand at first staging and the NATIVE ttnn::matmul consumes it
+// (bf16 activation x BFP8 weight — ttnn/operations/matmul/matmul.cpp:521-532).
+// The f32-exact SFPU floor is not involved. BFLOAT8_B packs 1 sign + 7
+// shared-group mantissa bits per element with one 8-bit exponent per
+// 16-element group (tt_metal/impl/data_format/blockfloat_common.cpp,
+// `convert_bfp_to_u32`, Bfp8_b arm) — the rounding IS the precision contract.
+namespace vt::tenstorrent {
+// Residency probes (tenstorrent_internal.h); declared here so the test TU
+// never includes internal headers.
+uint64_t Bfp8ResidentWeights();
+uint64_t Bfp8MatmulUses();
+uint64_t Bfp8Refusals();
+const char* Bfp8LastRefusal();
+}  // namespace vt::tenstorrent
+
+namespace {
+
+uint16_t F32ToBf16Bits(float v) {
+  uint32_t b;
+  std::memcpy(&b, &v, 4);
+  const uint32_t lsb = (b >> 16) & 1u;
+  b += 0x7fffu + lsb;
+  return static_cast<uint16_t>(b >> 16);
+}
+float Bf16BitsToFloat(uint16_t h) {
+  const uint32_t b = static_cast<uint32_t>(h) << 16;
+  float v;
+  std::memcpy(&v, &b, 4);
+  return v;
+}
+
+// CPU test-ONLY mirror of the BFLOAT8_B quantization: per 16-element group,
+// shared exponent = biased exponent of the group max; each element keeps
+// 1 sign + 7 mantissa bits relative to that shared exponent. This is the
+// DEQUANTIZED reference operand for the quantize-then-compare gate — never a
+// runtime path.
+float Bfp8MirrorDequant(float v, uint8_t shared_exp) {
+  if (v == 0.0f) return 0.0f;
+  const float scale = std::ldexp(1.0f, static_cast<int>(shared_exp) - 127);
+  float x = std::fabs(v) / scale;  // in (2^-8, 2)
+  if (x >= 2.0f) x = 1.9999999f;
+  float q = std::nearbyintf(x * 128.0f);  // RNE on 7 mantissa bits
+  if (q > 255.0f) q = 255.0f;
+  return (v < 0 ? -1.0f : 1.0f) * (q / 128.0f) * scale;
+}
+
+// Runs `a @ b^T` (bf16 operands, bf16 out) through the production kMatmulBT
+// op and returns the device output widened to f32.
+std::vector<float> RunMatmulBTBF16(Backend& backend, Queue& q, uint32_t M,
+                                   uint32_t K, uint32_t N,
+                                   const std::vector<float>& host_a,
+                                   const std::vector<float>& host_b) {
+  std::vector<uint16_t> a_bits(host_a.size()), b_bits(host_b.size());
+  for (size_t i = 0; i < host_a.size(); ++i) a_bits[i] = F32ToBf16Bits(host_a[i]);
+  for (size_t i = 0; i < host_b.size(); ++i) b_bits[i] = F32ToBf16Bits(host_b[i]);
+
+  void* mem_a = backend.Alloc(a_bits.size() * 2);
+  void* mem_b = backend.Alloc(b_bits.size() * 2);
+  void* mem_out = backend.Alloc(static_cast<size_t>(M) * N * 2);
+  backend.Copy(q, mem_a, a_bits.data(), a_bits.size() * 2);
+  backend.Copy(q, mem_b, b_bits.data(), b_bits.size() * 2);
+  Tensor a = Tensor::Contiguous(mem_a, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b = Tensor::Contiguous(mem_b, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor out = Tensor::Contiguous(mem_out, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+  auto matmul_bt =
+      reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  matmul_bt(q, out, a, b);
+  std::vector<uint16_t> out_bits(static_cast<size_t>(M) * N);
+  backend.Copy(q, out_bits.data(), mem_out, out_bits.size() * 2);
+  backend.Free(mem_a);
+  backend.Free(mem_b);
+  backend.Free(mem_out);
+  std::vector<float> out_f(out_bits.size());
+  for (size_t i = 0; i < out_bits.size(); ++i) out_f[i] = Bf16BitsToFloat(out_bits[i]);
+  return out_f;
+}
+
+struct ScopedEnv {
+  explicit ScopedEnv(const char* v) {
+    const char* old = std::getenv("VT_TT_WEIGHT_RESIDENCY");
+    had_ = old != nullptr;
+    if (had_) old_ = old;
+    if (v != nullptr) ::setenv("VT_TT_WEIGHT_RESIDENCY", v, 1);
+    else ::unsetenv("VT_TT_WEIGHT_RESIDENCY");
+  }
+  ~ScopedEnv() {
+    if (had_) ::setenv("VT_TT_WEIGHT_RESIDENCY", old_.c_str(), 1);
+    else ::unsetenv("VT_TT_WEIGHT_RESIDENCY");
+  }
+  bool had_ = false;
+  std::string old_;
+};
+
+}  // namespace
+
+TEST_CASE("kTENSTORRENT VT_TT_WEIGHT_RESIDENCY default OFF leaves kMatmulBT "
+          "inert (no BFP8 resident, no use)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  // Both the unset default AND the explicit "off" opt-out must leave every
+  // existing path untouched: no conversion, no BFP8 operand consumed, and a
+  // result inside the plain bf16 matmul envelope.
+  for (const char* env_val : {(const char*)nullptr, "off"}) {
+    ScopedEnv guard(env_val);
+    Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+    Queue q = backend.CreateQueue();
+    constexpr uint32_t M = 32, K = 64, N = 32;
+    std::vector<float> host_a(static_cast<size_t>(M) * K),
+        host_b(static_cast<size_t>(N) * K);
+    for (size_t i = 0; i < host_a.size(); ++i) host_a[i] = 0.25f * static_cast<float>(i % 7);
+    for (size_t i = 0; i < host_b.size(); ++i) host_b[i] = 0.125f * static_cast<float>(i % 13);
+    const uint64_t resident_before = vt::tenstorrent::Bfp8ResidentWeights();
+    const uint64_t uses_before = vt::tenstorrent::Bfp8MatmulUses();
+    const std::vector<float> out =
+        RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+    CHECK(vt::tenstorrent::Bfp8ResidentWeights() == resident_before);
+    CHECK(vt::tenstorrent::Bfp8MatmulUses() == uses_before);
+    // Plain bf16-matmul envelope vs the f32 reference.
+    float max_abs = 0.0f;
+    for (uint32_t i = 0; i < M; ++i)
+      for (uint32_t j = 0; j < N; ++j) {
+        float ref = 0.0f;
+        for (uint32_t k = 0; k < K; ++k)
+          ref += Bf16BitsToFloat(F32ToBf16Bits(host_a[i * K + k])) *
+                 Bf16BitsToFloat(F32ToBf16Bits(host_b[j * K + k]));
+        max_abs = std::max(max_abs, std::fabs(out[i * N + j] - ref));
+      }
+    CHECK(max_abs < 0.5f);
+  }
+}
+
+TEST_CASE("kTENSTORRENT VT_TT_WEIGHT_RESIDENCY=bfp8 stages the weight as a "
+          "device-resident BFLOAT8_B operand consumed by the native matmul "
+          "(quantize-then-compare gate)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ScopedEnv guard("bfp8");
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+  constexpr uint32_t M = 32, K = 64, N = 32;
+  std::vector<float> host_a(static_cast<size_t>(M) * K),
+      host_b(static_cast<size_t>(N) * K);
+  for (size_t i = 0; i < host_a.size(); ++i) host_a[i] = 0.25f * static_cast<float>(i % 7);
+  for (size_t i = 0; i < host_b.size(); ++i) host_b[i] = 0.125f * static_cast<float>(i % 13);
+
+  const uint64_t resident_before = vt::tenstorrent::Bfp8ResidentWeights();
+  const uint64_t uses_before = vt::tenstorrent::Bfp8MatmulUses();
+  const std::vector<float> out = RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+  // PATH PIN: the weight became a device-resident BFP8 operand and a matmul
+  // consumed it. Without the arm these counters never move — this is what reds
+  // on the wrong path (the bf16 resident arm computes a similar number).
+  CHECK(vt::tenstorrent::Bfp8ResidentWeights() > resident_before);
+  CHECK(vt::tenstorrent::Bfp8MatmulUses() > uses_before);
+  // A second call allocates a FRESH weight staging buffer (a new host
+  // pointer), so it stages its own BFP8 tensor — the shadow cache is keyed by
+  // the host pointer, which at model load is the stable weight allocation.
+  (void)RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+  CHECK(vt::tenstorrent::Bfp8ResidentWeights() == resident_before + 2);
+  CHECK(vt::tenstorrent::Bfp8MatmulUses() > uses_before + 1);
+
+  // QUANTIZE-THEN-COMPARE: dequantize `b` through the CPU BFP8 mirror (groups
+  // of 16 along K) and take the f32 matmul of THAT as the reference. The
+  // contract is "computes what BFP8 defines", so the envelope is the BFP
+  // quantization step — never a raw-f32 tolerance.
+  std::vector<float> b_deq(host_b.size());
+  float max_b = 0.0f;
+  for (float v : host_b) max_b = std::max(max_b, std::fabs(v));
+  for (size_t row = 0; row < host_b.size(); row += 16) {
+    uint8_t shared = 0;
+    for (size_t e = 0; e < 16 && row + e < host_b.size(); ++e) {
+      int exp = 0;
+      std::frexp(host_b[row + e], &exp);
+      shared = std::max(shared, static_cast<uint8_t>(exp - 1 + 127));
+    }
+    for (size_t e = 0; e < 16 && row + e < host_b.size(); ++e)
+      b_deq[row + e] = Bfp8MirrorDequant(host_b[row + e], shared);
+  }
+  for (uint32_t i = 0; i < M; ++i)
+    for (uint32_t j = 0; j < N; ++j) {
+      float ref = 0.0f;
+      float sum_abs_a = 0.0f;
+      for (uint32_t k = 0; k < K; ++k) {
+        const float a = Bf16BitsToFloat(F32ToBf16Bits(host_a[i * K + k]));
+        ref += a * b_deq[j * K + k];
+        sum_abs_a += std::fabs(a);
+      }
+      // |Δb| ≤ max|b|/128 (half ulp of the 7-bit mantissa) doubled for the
+      // device-side rounding-mode difference, plus the bf16 output store.
+      const float bound = (max_b / 64.0f) * sum_abs_a +
+                          std::fabs(ref) * (1.0f / 256.0f) + 1e-3f;
+      const float diff = std::fabs(out[i * N + j] - ref);
+      CHECK_MESSAGE(diff <= bound,
+                    "BFP8 matmul output outside the quantization envelope at ("
+                        << i << "," << j << "): " << diff << " > " << bound);
+    }
+}
+
+TEST_CASE("kTENSTORRENT VT_TT_WEIGHT_RESIDENCY=bfp8 refuses a non-TILE-aligned "
+          "weight BY NAME and falls through to the bf16 arm") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ScopedEnv guard("bfp8");
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+  constexpr uint32_t M = 32, K = 33, N = 32;  // K=33 is not TILE-aligned
+  std::vector<float> host_a(static_cast<size_t>(M) * K),
+      host_b(static_cast<size_t>(N) * K);
+  for (size_t i = 0; i < host_a.size(); ++i) host_a[i] = 0.25f * static_cast<float>(i % 5);
+  for (size_t i = 0; i < host_b.size(); ++i) host_b[i] = 0.5f * static_cast<float>(i % 3);
+
+  const uint64_t refusals_before = vt::tenstorrent::Bfp8Refusals();
+  const std::vector<float> out = RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+  CHECK(vt::tenstorrent::Bfp8Refusals() > refusals_before);
+  CHECK(std::string(vt::tenstorrent::Bfp8LastRefusal())
+            .find("TILE-aligned") != std::string::npos);
+  // The fall-through is still CORRECT (bf16 envelope vs the f32 reference).
+  float max_abs = 0.0f;
+  for (uint32_t i = 0; i < M; ++i)
+    for (uint32_t j = 0; j < N; ++j) {
+      float ref = 0.0f;
+      for (uint32_t k = 0; k < K; ++k)
+        ref += Bf16BitsToFloat(F32ToBf16Bits(host_a[i * K + k])) *
+               Bf16BitsToFloat(F32ToBf16Bits(host_b[j * K + k]));
+      max_abs = std::max(max_abs, std::fabs(out[i * N + j] - ref));
+    }
+  CHECK(max_abs < 0.5f);
+}
+
+TEST_CASE("kTENSTORRENT VT_TT_WEIGHT_RESIDENCY=bfp4 refuses BY NAME "
+          "(not implemented) and falls through to the bf16 arm") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ScopedEnv guard("bfp4");
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+  constexpr uint32_t M = 32, K = 64, N = 32;
+  std::vector<float> host_a(static_cast<size_t>(M) * K),
+      host_b(static_cast<size_t>(N) * K);
+  for (size_t i = 0; i < host_a.size(); ++i) host_a[i] = 0.25f * static_cast<float>(i % 5);
+  for (size_t i = 0; i < host_b.size(); ++i) host_b[i] = 0.5f * static_cast<float>(i % 3);
+
+  const uint64_t refusals_before = vt::tenstorrent::Bfp8Refusals();
+  const std::vector<float> out = RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+  // bfp4 is a RESERVED lever value: the staging seam refuses it by name, and
+  // no BFP8 conversion happens (the resident counter must not move).
+  CHECK(vt::tenstorrent::Bfp8Refusals() > refusals_before);
+  CHECK(std::string(vt::tenstorrent::Bfp8LastRefusal())
+            .find("bfp4") != std::string::npos);
+  CHECK(std::string(vt::tenstorrent::Bfp8LastRefusal())
+            .find("not implemented") != std::string::npos);
+  // The fall-through is still CORRECT (bf16 envelope vs the f32 reference).
+  float max_abs = 0.0f;
+  for (uint32_t i = 0; i < M; ++i)
+    for (uint32_t j = 0; j < N; ++j) {
+      float ref = 0.0f;
+      for (uint32_t k = 0; k < K; ++k)
+        ref += Bf16BitsToFloat(F32ToBf16Bits(host_a[i * K + k])) *
+               Bf16BitsToFloat(F32ToBf16Bits(host_b[j * K + k]));
+      max_abs = std::max(max_abs, std::fabs(out[i * N + j] - ref));
+    }
+  CHECK(max_abs < 0.5f);
+}
+
+TEST_CASE("kTENSTORRENT BFP8 vs bf16 resident-weight matmul timing (VT_TT_BFP8_BENCH=1)") {
+  if (std::getenv("VT_TT_BFP8_BENCH") == nullptr) {
+    MESSAGE("SKIPPED: set VT_TT_BFP8_BENCH=1");
+    return;
+  }
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+  // 27B-class MLP gate/up shape family: [N,K] = 17408x5120, decode M=1.
+  constexpr uint32_t M = 1, K = 5120, N = 17408;
+  std::vector<float> host_a(static_cast<size_t>(M) * K, 0.5f),
+      host_b(static_cast<size_t>(N) * K);
+  for (size_t i = 0; i < host_b.size(); ++i)
+    host_b[i] = 0.125f * static_cast<float>(i % 13);
+  for (const char* env_val : {(const char*)nullptr, "bfp8"}) {
+    ScopedEnv guard(env_val);
+    // Warm the staging (first call converts/uploads), then time eager calls.
+    (void)RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+    const auto t0 = std::chrono::steady_clock::now();
+    constexpr int kIters = 10;
+    for (int it = 0; it < kIters; ++it)
+      (void)RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+    const auto t1 = std::chrono::steady_clock::now();
+    // RunMatmulBTBF16 includes host<->device copies; report the whole-call cost
+    // as an upper bound on the GEMM delta.
+    const double us_per_call =
+        std::chrono::duration<double, std::micro>(t1 - t0).count() / kIters;
+    MESSAGE("VT_TT_WEIGHT_RESIDENCY=", env_val == nullptr ? "unset(bf16)" : "bfp8",
+            ": ", us_per_call, " us/call whole-op (M=", M, ",K=", K, ",N=", N,
+            "), Bfp8MatmulUses=", vt::tenstorrent::Bfp8MatmulUses());
+  }
+}

@@ -285,6 +285,18 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       static constexpr GgmlTypeTraits t{256, 50, "IQ1_S"};
       return &t;
     }
+    case 29: {
+      // block_iq1_m (llama.cpp @ b10451 ggml-common.h:429-437): QK_K/8 u8 qs
+      // + QK_K/16 u8 qh + QK_K/32 u8 scales = 32 + 16 + 8 = 56, i.e. 1.75 bpw.
+      // ggml type id 29. The one IQ1 block with NO f16 field: the super-block
+      // scale is an f16 spliced out of the four top nibbles of scales[0..3],
+      // and the eight 3-bit sub-block scales share those same bytes. The four
+      // attention-gate tensors of the
+      // `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF` IQ3_XXS artifact are IQ1_M;
+      // this case is what stops `GgufFile::Open` refusing the whole file.
+      static constexpr GgmlTypeTraits t{256, 56, "IQ1_M"};
+      return &t;
+    }
     case 66: {
       // block_iq1_xxxs, from the PINNED FORK oracle `llama-cpp-unsloth`
       // (.agents/oracles/llama-cpp-unsloth.md, ggml-common.h:478-483):

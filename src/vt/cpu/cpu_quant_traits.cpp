@@ -103,6 +103,15 @@ const QuantTypeTraits* FindQuantTraits(DType dtype) {
       static const QuantTypeTraits t = MakeTraits(DType::kIQ3_XXS, DType::kQ8_K);
       return &t;
     }
+    // ggml-cpu.c:355-360 — IQ3_S -> Q8_K activations. The GSQ-RCO
+    // Qwen3.8-27B artifact's largest block dtype (97 tensors, ffn + attn):
+    // keep-quant is the memory enabler. No `from_float` (upstream's row
+    // carries one, `quantize_row_iq3_s`; porting it would be dead code —
+    // nothing quantizes an activation INTO a codebook).
+    case DType::kIQ3_S: {
+      static const QuantTypeTraits t = MakeTraits(DType::kIQ3_S, DType::kQ8_K);
+      return &t;
+    }
     // llama.cpp @ b10451 ggml-cpu.c:342-347 — IQ2_XS -> Q8_K activations. 82 of
     // the staged `unsloth/GLM-5.3-Flash-GGUF UD-Q2_K_XL` artifact's 1412
     // tensors are IQ2_XS, 53.33 GiB on disk against 369.00 GiB as bf16: this
@@ -139,6 +148,14 @@ const QuantTypeTraits* FindQuantTraits(DType dtype) {
     case DType::kIQ1_XXXS: {
       static const QuantTypeTraits t =
           MakeTraits(DType::kIQ1_XXXS, DType::kQ8_K);
+      return &t;
+    }
+    // IQ1_M (1.75 bpw, ggml id 29) is what the 4 attention-gate tensors of
+    // the `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF` IQ3_XXS artifact use. Same
+    // keep-quant contract as IQ1_S (ggml-cpu.c pairs it with Q8_K
+    // activations); the TT keep-quant wiring itself stays owed.
+    case DType::kIQ1_M: {
+      static const QuantTypeTraits t = MakeTraits(DType::kIQ1_M, DType::kQ8_K);
       return &t;
     }
     // ggml-cpu.c:277-282 — MXFP4 -> Q8_0 activations (NOT Q8_K: MXFP4's 32-elem

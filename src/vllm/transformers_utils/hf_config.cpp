@@ -238,7 +238,11 @@ RopeParameters ParseRopeParameters(const nlohmann::json& text,
   params.mrope_section = GetIntArray(*raw, "mrope_section");
   params.mrope_interleaved = GetBool(*raw, "mrope_interleaved", false);
 
-  if (params.rope_type == "yarn") {
+  if (params.rope_type == "linear") {
+    if (!params.factor.has_value() || !std::isfinite(*params.factor) || *params.factor <= 0.) {
+      throw std::runtime_error("hf_config: linear rope requires factor finite and positive in " + path);
+    }
+  } else if (params.rope_type == "yarn") {
     if (!params.factor.has_value() ||
         !params.original_max_position_embeddings.has_value()) {
       throw std::runtime_error(
@@ -304,7 +308,7 @@ RopeParameters ParseRopeParameters(const nlohmann::json& text,
     throw std::runtime_error(
         "hf_config: checkpoint declares rope type '" + params.rope_type +
         "' which vllm.cpp does not implement yet (supported: default, yarn, "
-        "llama3, longrope, dynamic) in " + path);
+        "llama3, longrope, dynamic, linear) in " + path);
   }
 
   if (!params.rope_dim.has_value() &&
@@ -428,8 +432,15 @@ HfConfig ParseHfConfigDoc(nlohmann::json doc, const std::string& path,
   const nlohmann::json& text = ResolveTextConfig(doc);
 
   RequireKey(doc, "model_type", path);
-  RequireKey(text, "hidden_size", path);
-  RequireKey(text, "num_hidden_layers", path);
+
+  // GLiNER2.5 configs (model_type "extractor") carry no encoder fields —
+  // hidden_size and num_hidden_layers are inferred from weight shapes in
+  // gliner2_weights.cpp::InferEncoderParams, so skip the requirement here.
+  const bool is_extractor = GetString(doc, "model_type") == "extractor";
+  if (!is_extractor) {
+    RequireKey(text, "hidden_size", path);
+    RequireKey(text, "num_hidden_layers", path);
+  }
 
   HfConfig cfg;
   try {

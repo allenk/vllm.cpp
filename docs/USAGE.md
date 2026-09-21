@@ -12,6 +12,71 @@ instructions.
 The examples use `/path/to/model` for a local model directory. Replace that
 path with a compatible checkpoint for the workflow you select.
 
+## Diagnose Strix adapter lifecycle
+
+Run the lifecycle diagnostic only inside an exclusive `strix:gpu0` lease.
+It performs one six-request c4 warmup and checks normal shutdown, owned-child
+evidence, process-group absence, restoration, and unchanged artifact bindings.
+It does not establish token parity or accept throughput.
+
+```sh
+python3 tools/bench/strix_four_engine/lifecycle_diagnostic.py \
+  --source /local/reviewed-controller.tar \
+  --source-sha256 EXPECTED_ARCHIVE_SHA256 \
+  --source-revision EXPECTED_SOURCE_REVISION \
+  --manifest /local/bound-diagnostic-manifest.json \
+  --manifest-sha256 EXPECTED_MANIFEST_SHA256 \
+  --output /local/new-lifecycle-output \
+  --engine vLLM
+```
+
+Replace expected values with independently reviewed bindings, not values
+derived from the artifacts being checked. The flat Git archive must retain
+its revision in the PAX comment. It supplies compatible six-request c4
+`qualify`, `child_lifecycle`, and `audit` modules; the command verifies their
+origins and records source and driver provenance. Use the existing schema-1
+qualification manifest with all four model/engine/environment bindings, even
+when selecting one engine. This diagnostic does not adopt the separate v2
+c1/c4/c32 workload.
+
+Repeat `--engine` to select engines in order. Valid names are `vLLM`,
+`patched SGLang`, `vllm.cpp`, and `llama.cpp`; quote names containing spaces.
+Without `--engine`, the command uses that order. It stops before another
+engine launches after an engine or engine-publication failure.
+In ordinary c4 mode, the first selected engine must be `vLLM` or `patched SGLang`,
+which establishes canonical token IDs. Other first-engine selections are refused before launch.
+
+For the native first-c1 control, add these arguments to the command and omit `--engine vLLM`:
+
+```sh
+  --native-first-c1 \
+  --canonical-reference /local/retained-qualification/result.json \
+  --canonical-reference-sha256 EXPECTED_REFERENCE_SHA256
+```
+
+This mode selects only `vllm.cpp`. An explicit `--engine vllm.cpp` is allowed.
+Other selections and duplicate selections are refused before launch.
+The reference must be a bound schema-1 qualification result with the identical manifest,
+pinned vLLM configuration, six canonical prompt arrays, and matching workload hash.
+The reference supplies input tokenization. Its output-token acceptance status grants no tolerance.
+The command verifies the reference hash before parsing and after execution.
+It configures native with those IDs and runs one c1 qualification corpus at repetition 0.
+The corpus retains the six prompts, 128 tokens, greedy sampling, and four-slot configuration.
+There is no warmup, second corpus, or preceding Python engine launch.
+The result identifies `native-first-c1` and retains the reference identity, prompt arrays, commands, and replies, including shutdown.
+Each configure and run exchange has a 180-second cap or the stricter manifest timeout.
+The exchange cap is not a whole-job deadline. Bound the resource-controller job to 15 minutes, including binding verification.
+Retain kernel messages before and after the control. Stop after a fault without an automatic retry or device reset.
+A successful control establishes execution, structure, teardown, and unchanged bindings only.
+It does not establish fault cause, token parity, repaired inference, or a performance advantage.
+
+Each engine writes one finalized `<engine>/result.json`; spaces in the
+directory name become hyphens. One terminal `result.json` contains those same
+records. Exit 0 requires all selected engines and final publication to pass.
+Publication never replaces an existing result. Inspect stderr if publication
+fails and retain previous evidence. Any separately authorized run needs a fresh output directory.
+The command installs nothing and requires the compatible artifacts in advance.
+
 ## Run a local completion
 
 Run one completion with `vllm-cli`:
@@ -297,6 +362,258 @@ vllm_engine_load(&mp, &engine);
 ```
 
 `vllm-cli` takes the same `--kv-cache-dtype` flag the server takes.
+
+## Gemma 3 4B text weights
+
+The BF16 text loader accepts Gemma 3's linear RoPE configuration. Global layers
+use its configured scaling factor; sliding layers use unscaled local RoPE.
+The validated source is [unsloth/gemma-3-4b-it at
+bf46152c47f5dd20b896357cb51abc4c03b8ee8c](https://huggingface.co/unsloth/gemma-3-4b-it/tree/bf46152c47f5dd20b896357cb51abc4c03b8ee8c).
+
+| BF16 source file | Bytes | SHA-256 |
+|---|---:|---|
+| `model-00001-of-00002.safetensors` | 4,961,251,752 | `eb5fd5e97ddd07b56778733e9653c07312529cb00980a318fc3e1c4e3b5a8f1f` |
+| `model-00002-of-00002.safetensors` | 3,639,026,128 | `fdde0e5aa5ced0fa203b3d50f4ab78168b7e3a3e08c6349f5cc9326666e1bb13` |
+
+Download both shards and the configuration/tokenizer files from that revision.
+The source has a vision wrapper. Export its text tensors for the text loader:
+
+```sh
+python3 tools/gemma3_linear_rope/export_text.py /models/gemma3-4b-original /models/gemma3-4b-text
+vllm-cli --model /models/gemma3-4b-text --prompt "Explain how computer memory works." --max-tokens 32
+```
+
+The exporter checks the pinned shard hashes, preserves all retained tensor
+bytes and text parameters, and records output hashes. The resulting text
+weights contain 7,760,526,336 tensor bytes. This recipe covers BF16 safetensors;
+the Gemma 3 text loader does not provide a GGUF quantized arm or the vision tower.
+
+On gfx1100, eligible BF16 attention prefills use rocWMMA by default. The path
+requires head dimension 256, two query heads per KV head, one request, and at
+least 64 query tokens. `VT_ATTN_PREFILL_SHAREDK_WMMA=0` selects scalar prefill.
+The gfx1100 single-query WMMA decoder remains enabled in both prefill controls.
+Both controls pass the declared exact-token gates. Other gfx11 targets remain
+excluded. Eligible single-request Gemma 3 decode uses a HIP graph by default
+with BF16 cache blocks of 16 or 32 tokens. `VLLM_CPP_CUDAGRAPH=0` selects eager
+execution. See the [correctness and performance evidence](bench-evidence/rocm-rdna3-attention-wmma/README.md)
+for the validated workloads, build, and measurements.
+
+The existing Gemma 3 1B regression uses BF16 safetensors from
+[unsloth/gemma-3-1b-it at 5b11413a10db4e486ef16a20101fd028f8f2499c](https://huggingface.co/unsloth/gemma-3-1b-it/tree/5b11413a10db4e486ef16a20101fd028f8f2499c).
+Its `model.safetensors` is 1,999,811,208 bytes, SHA-256
+`3d4ef8d71c14db7e448a09ebe891cfb6bf32c57a9b44499ae0d1c098e48516b6`.
+The regression resolves this pinned snapshot through the local HuggingFace cache.
+
+## Run zero-shot NER and structured extraction (GLiNER2.5)
+
+GLiNER2.5 (`fastino/gliner2.5-multi-v1`, architecture `BoundaryExtractor`)
+is a zero-shot named-entity-recognition model. It extracts spans for
+entity types you supply at inference time — there are no fixed labels
+baked into the checkpoint. It is not a generation model; it has no
+vocabulary head and never produces tokens. A forward pass runs the
+DeBERTa v2 encoder with disentangled attention, a GLiNER2 boundary head,
+and a candidate decoder, and the result is a list of entity spans.
+
+Point the server at a GLiNER2.5 checkpoint directory:
+
+```sh
+build/examples/vllm-server \
+  --model /path/to/gliner2.5-multi-v1 \
+  --port 8000
+```
+
+The model loads from a Hugging Face directory that contains `config.json`,
+`model.safetensors`, `tokenizer.json`, and `tokenizer_config.json`. The
+checkpoint is F32: every encoder and head weight is 32-bit float.
+
+### NER endpoint
+
+`POST /v1/ner` runs one NER pass. The request body carries the text, the
+entity labels, and optional tuning parameters:
+
+```sh
+curl http://localhost:8000/v1/ner \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "Tim Cook is the CEO of Apple Inc., based in Cupertino.",
+    "labels": ["person", "organization", "location"],
+    "threshold": 0.5,
+    "max_width": 12
+  }'
+```
+
+`labels` is the list of entity types to find. `threshold` (default 0.5)
+is the minimum sigmoid probability to keep a span. `max_width` (default
+12) is the maximum span width in tokens. The response is an array of
+entities, each with `label`, `text`, `char_start`, `char_end`, and
+`confidence`:
+
+```json
+{
+  "entities": [
+    {"label": "person", "text": "Tim Cook",
+     "char_start": 0, "char_end": 8, "confidence": 0.99},
+    {"label": "organization", "text": "Apple Inc.",
+     "char_start": 27, "char_end": 36, "confidence": 0.98},
+    {"label": "location", "text": "Cupertino",
+     "char_start": 49, "char_end": 58, "confidence": 0.95}
+  ]
+}
+```
+
+Character offsets are into the original input text; `char_start` is
+inclusive, `char_end` is exclusive, so `text[char_start:char_end]` is the
+entity surface.
+
+### SystemOne API (kev-compatible structured extraction)
+
+The server also exposes the structured-extraction API from the
+[kev](https://github.com/jaredpalmer/kev) project. Three question types
+are supported:
+
+- **noul** — binary entity presence. Runs NER with the question's
+  instruction text as the label. Returns `noul` (a float 0 to 1, the
+  max entity confidence) and the matched `entities`.
+- **choice** — pick one option. Runs NER with each option's rendered text
+  as a label. Returns `choice` (the argmax option), `probabilities` (a
+  map of option to confidence), and `confidence` (the normalized margin).
+- **score** — pick one level. Runs NER with each level description as a
+  label. Returns `score` (a weighted average of level positions),
+  `legend` (level to probability), `probabilities`, and `confidence`.
+
+`POST /v1/systemone` answers all questions in one request:
+
+```sh
+curl http://localhost:8000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "state": "Tim Cook is the CEO of Apple Inc., based in Cupertino.",
+    "questions": {
+      "q1": {
+        "type": "noul",
+        "instructions": "person"
+      },
+      "q2": {
+        "type": "choice",
+        "criteria": {
+          "apple": "the company Apple Inc.",
+          "google": "the company Google LLC"
+        }
+      },
+      "q3": {
+        "type": "score",
+        "criteria": [
+          "no people mentioned",
+          "one person mentioned",
+          "multiple people mentioned"
+        ]
+      }
+    }
+  }'
+```
+
+`state` is the text to extract from. A non-string value is rendered to
+its JSON representation before NER runs. Each question's `instructions`
+(or `instr`, a backward-compatible alias) field is the label for `noul`
+questions. For `choice` questions, `criteria` is a map of option name to
+description; each `name: description` pair is a NER label. For `score`
+questions, `criteria` is an array of level descriptions, each a NER
+label. The response carries one answer per question:
+
+```json
+{
+  "model": "gliner2.5-multi-v1",
+  "answers": {
+    "q1": {
+      "type": "noul",
+      "noul": 0.99,
+      "entities": [{"label": "person", "text": "Tim Cook",
+        "char_start": 0, "char_end": 8, "confidence": 0.99}]
+    },
+    "q2": {
+      "type": "choice",
+      "choice": "apple",
+      "probabilities": {"apple": 0.98, "google": 0.0},
+      "confidence": 0.98
+    },
+    "q3": {
+      "type": "score",
+      "score": 1.0,
+      "legend": {"0": 0.0, "1": 0.99, "2": 0.0},
+      "probabilities": {"0": 0.0, "1": 0.99, "2": 0.0},
+      "confidence": 0.99
+    }
+  },
+  "usage": {"input_tokens": 15, "output_tokens": 0},
+  "latency_ms": 42.5
+}
+```
+
+Two companion endpoints exist:
+
+- `POST /v1/systemone/permute` — re-runs one `choice` question under
+  `n_perm` randomly shuffled option orders and reports whether the argmax
+  is stable. The request body wraps a `SystemOneRequest` in `request` and
+  names the question to permute in `question`. Returns per-order
+  `probabilities`, `argmax_stable` (boolean), and `spread` (max minus
+  min of the winning option's probability across orders).
+
+- `POST /v1/systemone/separate` — answers each question in its own NER
+  pass (N passes for N questions) against the same state. Returns the
+  same `SystemOneResponse` shape, with summed `input_tokens` across all
+  passes.
+
+`GET /v1/models` lists loaded models and works with any model type.
+
+### CLI example
+
+`build/examples/gliner-cli` is a thin client of the C ABI that loads a
+checkpoint and runs one NER query:
+
+```sh
+build/examples/gliner-cli \
+  /path/to/gliner2.5-multi-v1 \
+  "Tim Cook is the CEO of Apple Inc." \
+  person organization location \
+  --threshold 0.5
+```
+
+### Through the C ABI (v27)
+
+`vllm_gliner_ner` (ABI v27) runs the full NER pipeline on an engine
+loaded from a GLiNER2.5 checkpoint. `vllm_ner_result_free` releases the
+library-allocated entities and strings:
+
+```c
+#include "vllm.h"
+
+vllm_model_params model = vllm_model_params_default();
+model.model_path = "/path/to/gliner2.5-multi-v1";
+
+vllm_engine *engine = NULL;
+if (vllm_engine_load(&model, &engine) != VLLM_OK) {
+    fprintf(stderr, "%s\n", vllm_last_error());
+    return 1;
+}
+
+const char *labels[] = {"person", "organization", "location"};
+vllm_ner_result result;
+if (vllm_gliner_ner(engine, "Tim Cook is the CEO of Apple Inc.",
+                    labels, 3, 0.5f, 12, &result) == VLLM_OK) {
+    for (int32_t i = 0; i < result.n_entities; i++) {
+        vllm_ner_entity *e = &result.entities[i];
+        printf("%s: \"%s\" [%d,%d] conf=%.3f\n",
+               e->label, e->text, e->char_start, e->char_end, e->confidence);
+    }
+    vllm_ner_result_free(&result);
+}
+vllm_engine_free(engine);
+```
+
+`vllm_gliner_ner` refuses a non-GLiNER2 engine by name with
+`VLLM_ERR_INVALID_ARGUMENT`. The `labels` array and each entity's
+`label`/`text` strings are library-allocated; free the whole result with
+`vllm_ner_result_free`, not individually.
 
 ## Disabling a model's sliding window
 
@@ -1019,6 +1336,7 @@ repository in this project's history.
 | Qwen3.8-27B GGUF language model | `Qwen3.8-27B-Q4_K_M.gguf` | 17,106,775,008 bytes | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169` | Q4_K_M text model loads through `--model` and decodes on CPU | **The token gate against llama.cpp `b10451` FAILED** on 2026-08-23: tokenizer exact 6/6, generation divergent 5/6 ([evidence](bench-evidence/qwen38-27b-q4km-token-gate-20260823.md), #821). GGUF multimodal forward is missing |
 | Qwen3.8-27B GGUF language model, Tenstorrent arm (STAGED SLICE — the e2e gate is UNMET) | `Qwen3.8-27B-Q4_K_M.gguf`, resolved from local path env `VLLM_CPP_QWEN38_27B_GGUF` | 17,106,775,008 bytes (16,314.3 MiB) | Presumed `unsloth/Qwen3.8-27B-GGUF`, but at revision `4ca720788d1e01f1bff70c033e0d0028fd02e502` no file matches this artifact by size or hash (that revision's `UD-Q4_K_M` is 16,464,440,224 bytes, LFS oid `322e194f…`); the exact upstream file and revision are unresolved, and the pin rests on the sha256 beside this. Reproduce the gate from the hash, not the repo path | `7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169` | Loader wiring and the production MTP-head skip are SHIPPED: arch `qwen35`, DENSE — 64 trunk blocks plus the `blk.64` MTP head, whose 15 tensors (289,527,808 B) the loader's skip message names in full on every non-`mtp` load. The gate TEST_CASE (`tests/parity/test_qwen35_paged_engine.cpp`) is checkpoint-gated and stays inert, printing a loud SKIP, until `VLLM_CPP_QWEN38_27B_GGUF` names the file | **The e2e gate is UNMET — device DRAM residency** ([#3042](https://github.com/mudler/vllm.cpp/issues/3042)): eight gate attempts OOM at first forward (~34 GB allocated against the 32 GB device; the row spec records the evidence). `VT_TT_KEEPQUANT_CHUNK_BYTES` is the kernel-internal keep-quant chunk-plane cap, default 256 MiB surveyed on the 0.8B vehicle; empty/unset keeps the default, and a positive integer is a hard cap in bytes |
 | Qwen3.8-27B GGUF Unsloth-Dynamic language model | `Qwen3.8-27B-UD-Q4_K_M.gguf` | 16,464,440,224 bytes | `unsloth/Qwen3.8-27B-GGUF` @ `4ca720788d1e01f1bff70c033e0d0028fd02e502` | `322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482` | The reader accepts every one of its 866 tensors. This is the artifact `IQ3_S` (ggml id 21) was added for: 4 of those tensors carry it and `GgufFile::Open` refused the whole file over them until #2510, and 4 blocks of `blk.11.ffn_gate.weight` from it are the oracle goldens the decoder is gated on. **The SHA-256 was derived by hashing the local bytes**, not read off a tree API. | The `IQ3_S` keep-quant `vec_dot` is owed, so those 4 tensors EXPAND to bf16 on the GEMM arm of every device (146.13 MiB of blocks against 680.00 MiB of bf16, 3.4 % of the file); no token gate and no throughput number is claimed on this file — #2497 owns the `gfx1151` quant-matched decode number and #2510 owns the `vec_dot` |
+| Qwen3.8-27B-APEX-I GGUF language model, Tenstorrent arm (QUANT-GGUF-IQ-TENSTORRENT wave 1) | `Qwen3.8-27B-APEX-I-Nano.gguf` | 10.7 GB | `mudler/Qwen3.8-27B-APEX-GGUF` @ `98454f31de8ac2e8bc7cd359c526d9db230ca547` | `47b627b7de17c2bcfa9cebb7cf2d9d81e68b4b61f8cad16cf85f839604c694cb` (recomputed at wave start, 2026-09-14) | IQ3_XXS serves on `kTENSTORRENT` through the int8-dot keep-quant kernel's `enc_sel` 4 (`kq_vec_dot_iq3_xxs_q8_K`, `src/vt/tenstorrent/kernels/keepquant_kernel_code.h`), bit-exact vs the CPU `VecDotIQ3_XXSQ8_K` oracle (`src/vt/cpu/cpu_quant_dot.cpp:622`) on the op-level sweep (`tests/vt/test_tenstorrent_backend.cpp`, int8-dot sweep, enc=16); dispatched on the DEFAULT path (no `VT_TT_KEEPQUANT_INT8DOT` gate — the grouped arm has no IQ3_XXS decode). Wave 2: IQ2_XXS (`enc_sel` 5, `kq_vec_dot_iq2_xxs_q8_K`) and IQ2_S (`enc_sel` 6, `kq_vec_dot_iq2_s_q8_K`) join the same way, bit-exact vs `VecDotIQ2_XXSQ8_K` / `VecDotIQ2_SQ8_K` (`src/vt/cpu/cpu_quant_dot.cpp:577` / `:899`). Census (issue record, /tmp/apex-gguf-dump.txt 2026-09-13): 164 IQ3_XXS + 89 IQ2_S + 44 IQ2_XXS + 78 Q3_K + 122 Q4_K + 8 Q8_0 + 1 Q6_K tensors | Q3_K serves on `kTENSTORRENT` too since QUANT-GGUF-IQ-TENSTORRENT wave 3 (`enc_sel` 7, `kq_vec_dot_q3_k_q8_K`, bit-exact vs the CPU `VecDotQ3_KQ8_K` oracle, `src/vt/cpu/cpu_quant_dot.cpp:202`) — every quantized census arm of this artifact is now on-core decodable on `kTENSTORRENT`, and no named refused arm remains; no e2e token gate or throughput number is claimed on this artifact yet — spec Gates 4 owns the APEX `vllm-bench` run |
 | Qwen3.8-27B GGUF projector | `mmproj-BF16.gguf` | 931,146,432 bytes | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53` | BF16 `clip` projector loads and validates through `--mmproj` | No request path runs the loaded projector |
 | Qwen3.6-27B GGUF, the LIMB-3 VEHICLE (a DENOMINATOR, not a capability) | `Qwen3.6-27B-Q4_K_M.gguf` | 16,817,244,384 bytes; 851 tensors | `unsloth/Qwen3.6-27B-GGUF` @ `82d411acf4a06cfb8d9b073a5211bf410bfc29bf` | `5ed60d0af4650a854b1755bd392f9aef4872643dc25a254bc68043fa638392a0`, hashed THREE times and equal each time: by the fetch script as it landed, independently off the staged share afterwards, and a third time on the `strix:gpu0` worker's own copy after the transfer out of `/workspace`. It also equals the digest the forge advertises for that revision. Its vision tower `mmproj-BF16.gguf`, same revision, is 931,146,304 bytes, sha256 `05353347512982ee62317b9d8c89372bc815f4b4043580e7ef3ad411ec1a1cd3`; the tokenizer and config come from `Qwen/Qwen3.6-27B` @ `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9` | ARM: Q4_K_M `qwen35`, `block_count` 64, histogram F32 449 / Q4_K 289 / Q5_K 48 / Q6_K 65 — **pure k-quant, with no non-k-quant weight tier at all**, so it exercises the same `DotQ4K`, `KQuantGemmK`, `QuantizeQ8KK` and `MatmulBTQuantKernelRocm` path the Qwen3.8-27B Q4_K_M ROCm arm runs. It LOADS AND GENERATES on `strix:gpu0`: 3 legs on the shipped default with no knobs, 2 clean and token-identical to each other, 1 `BOARD_FAULT` (GPU Hang, rc 139), zero `[vt reference-tier]` hits. Fetched under authority recorded in `.agents/developer-preferences.md` (developer, 2026-09-04), scoped to ONE vehicle meeting the six conditions [#2864](https://github.com/mudler/vllm.cpp/issues/2864) pre-registered, all six of which it meets ([`docs/bench-evidence/limb3-vehicle-pin-20260904.md`](bench-evidence/limb3-vehicle-pin-20260904.md)) | **THIS CHECKPOINT DID NOT DELIVER LIMB 3, AND THE REASON IS THE ORACLE RATHER THAN THIS FILE.** `STRICT_LIMB3 = NO` ([#2884](https://github.com/mudler/vllm.cpp/issues/2884), [`docs/bench-evidence/limb3-strict-gate-20260904.md`](bench-evidence/limb3-strict-gate-20260904.md)): the pinned vLLM is **not deterministic on this vehicle**, so there is no single denominator to be token-exact against. Its eager and compiled configurations each reproduce themselves exactly and **disagree with each other on 2 of 6 prompts**, and each also disagrees with its own one-pass prefill argmax (eager 3 steps, compiled 2). The strict free-running counts are 3/6 against eager and 3/6 against compiled — **recorded, and NOT usable as a gate result**, and not even the same three prompts. Whether any divergence is an exact tie is **NOT ESTABLISHED**: the run captured `prompt_logprobs=1`, so no runner-up margin exists. **REFUSED AS A CONCLUSION: picking whichever vLLM configuration agrees with us**, which `score_strict.py` forbids in code by short-circuiting on the oracle's self-consistency before it compares our tokens. No throughput, latency or memory figure was taken from this artifact and none may be quoted; `STRIX_ARM_SPEED_RATIFIED_BY` stays unset |
 | Qwen3.8-27B mixed FP8 and NVFP4 | `model.safetensors` | 22,568,192,096 bytes | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` | `c473512c70eace07e2256fe9fd76596ac03e3295bee7d54cfb72676416afcc05` | NVFP4 modules load | FP8 modules and quantized KV cache are refused |

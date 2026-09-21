@@ -274,6 +274,30 @@ struct BlockIQ1_XXXS {
 };
 static_assert(sizeof(BlockIQ1_XXXS) == 38, "wrong iq1_xxxs block size/padding");
 
+// PINNED oracle ggml-org/llama.cpp @ b10451, ggml-common.h:429-437
+// block_iq1_m. 1.75 bpw codebook quant, ggml type id 29, a STANDARD upstream
+// encoding (the fork's IQ1_XXXS is the one that is not). It carries the 4
+// attention-gate tensors inside ISTA-DASLab's Qwen3.8-27B-GSQ-RCO IQ3_XXS
+// artifact.
+//
+// The one IQ1 block with NO f16 field, which is where its extra 0.1875 bpw
+// against IQ1_S comes from: the super-block scale is an f16 assembled from the
+// four TOP nibbles of `scales` —
+//   u16 h = (scales[0] >> 12) | ((scales[1] >> 8) & 0x00f0)
+//         | ((scales[2] >> 4) & 0x0f00) | (scales[3] & 0xf000);
+// — while the LOW 6 bits of the same eight bytes hold the eight 3-bit
+// sub-block scales (two per byte, 6*(ib%2) + {0,3}). `qh` does the same three
+// jobs per 32-element sub-block pair as IQ1_S's qh does per sub-block: the
+// high grid-index bits for two of the four lane groups each, plus the delta
+// signs in bits 0x08 / 0x80.
+struct BlockIQ1_M {
+  uint8_t qs[kQK_K / 8];        // 32: one 8-bit grid-index low byte per group
+  uint8_t qh[kQK_K / 16];       // 16: high index bits + delta signs, two
+                                //     sub-blocks' worth per byte
+  uint8_t scales[kQK_K / 32];   // 8: packed f16 scale + 3-bit sub-block scales
+};
+static_assert(sizeof(BlockIQ1_M) == 56, "wrong iq1_m block size/padding");
+
 // ggml-common.h:204-209 block_mxfp4. OCP micro-scaling fp4: `e` is one E8M0
 // (power-of-two) shared exponent for the whole 32-element block, `qs` packs the
 // 32 e2m1 4-bit elements two-per-byte (element j in the low nibble of qs[j],

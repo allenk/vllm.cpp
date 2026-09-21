@@ -746,6 +746,9 @@ add_library(vllm STATIC
   src/vllm/sampling_params.cpp
   src/vllm/lora/punica_cpu.cpp
   src/vllm/lora/layers.cpp
+  src/vllm/lora/mapping.cpp
+  src/vllm/lora/peft_helper.cpp
+  src/vllm/lora/lora_model.cpp
   src/vllm/config/cache.cpp
   src/vllm/config/scheduler.cpp
   src/vllm/config/device.cpp
@@ -819,6 +822,11 @@ add_library(vllm STATIC
   # radius. W1 only: config descent + registration, every other arm refuses.
   src/vllm/model_executor/models/deepseek_v4_1_registry.cpp
   src/vllm/model_executor/models/deepseek_v4_1.cpp
+  # W3c (indexer arm) + W3d (`kv_source_layer`-keyed KV topology) host
+  # references. Nothing reaches them yet: W4 owns the host forward that
+  # composes W3a-W3f (ISSUE-LOCAL-01M2TMSCJJH7X8WZAM58PB3PMB, and the spec's
+  # `## Owed`).
+  src/vllm/model_executor/models/deepseek_v4_1_indexer.cpp
   src/vllm/model_executor/models/deepseek_v4_weights.cpp
   src/vllm/model_executor/models/deepseek_v4.cpp
   src/vllm/model_executor/models/deepseek_v4_dsa.cpp
@@ -828,6 +836,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_mhc.cpp
   src/vllm/model_executor/models/deepseek_v4_moe.cpp
   src/vllm/model_executor/models/deepseek_v4_device.cpp
+  src/vllm/model_executor/models/deepseek_v4_1_engram.cpp
+  src/vllm/model_executor/models/deepseek_v4_1_mxfp8.cpp
   src/vllm/model_executor/models/dots3_note.cpp
   src/vllm/model_executor/models/dots3_note_attn.cpp
   src/vllm/model_executor/models/dots3_note_device.cpp
@@ -895,6 +905,11 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_music3_llm.cpp
   src/vllm/model_executor/models/minimax_music3_speech.cpp
   src/vllm/model_executor/models/gpt2.cpp
+  src/vllm/model_executor/models/deberta_v2.cpp
+  src/vllm/model_executor/models/gliner2.cpp
+  src/vllm/model_executor/models/gliner2_weights.cpp
+  src/vllm/model_executor/models/gliner2_registry.cpp
+  src/vllm/model_executor/models/gliner2_ner.cpp
   src/vllm/multimodal/speech_engine.cpp
   src/vllm/model_executor/models/indextts2.cpp
   src/vllm/model_executor/models/campplus.cpp
@@ -1013,10 +1028,10 @@ add_library(vllm STATIC
   # FP8 and torchao-NVFP4 DiT arms, the torchao-NVFP4 text encoder, and the
   # load-time device staging GB10's ATS penalty makes the default.
   src/vllm/model_executor/models/ltx2_loader.cpp
-  # LTX-2.5 (ROW LTX25-IC-LORA, issue #923): reading an IC-LoRA adapter and its
-  # `__metadata__`, and the bf16 delta the loader fuses into every arm. Its own
-  # TU for the same reason as the two above.
-  src/vllm/model_executor/models/ltx2_lora.cpp
+  # DiT LoRA (ROW ROAD-V1-DIT-LORA): the shared load-time-fusion seam for
+  # diffusion transformers. Generalized from the LTX-2.5 implementation so both
+  # LTX-2.5 and MiniMax-H3 use it. Its own TU to avoid locking the loader.
+  src/vllm/model_executor/models/dit_lora.cpp
   src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/entrypoints/openai/speech_api.cpp
   src/vllm/entrypoints/openai/speech_api_synthesize.cpp
@@ -1265,6 +1280,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/layers/rotary_embedding/dynamic_ntk_alpha_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/dynamic_ntk_scaling_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/llama3_rope.cpp
+  src/vllm/model_executor/layers/rotary_embedding/linear_scaling_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/phi3_long_rope_scaled_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/mrope.cpp
@@ -1369,6 +1385,8 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_backend.cpp
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
+  src/vt/compiled_gemma.cpp
+  src/vt/cpu/cpu_compiled_gemma.cpp
   src/vt/cpu/cpu_residual_rmsnorm.cpp
   src/vt/cpu/cpu_minimax_h3.cpp
   src/vt/cpu/cpu_ltx2.cpp
@@ -1759,7 +1777,10 @@ if(VLLM_CPP_TENSTORRENT)
     src/vllm/platforms/tenstorrent.cpp
     src/vt/tenstorrent/tenstorrent_device.cpp
     src/vt/tenstorrent/tenstorrent_backend.cpp)
-  add_library(vllm_tenstorrent_ops OBJECT src/vt/tenstorrent/tenstorrent_ops.cpp)
+  add_library(vllm_tenstorrent_ops OBJECT
+    src/vt/tenstorrent/tenstorrent_ops.cpp
+    src/vt/tenstorrent/tenstorrent_residency.cpp
+    src/vt/tenstorrent/tenstorrent_keepquant.cpp)
   target_include_directories(vllm_tenstorrent_ops PRIVATE
     ${CMAKE_SOURCE_DIR}/include ${CMAKE_BINARY_DIR}/include ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(vllm_tenstorrent_ops PRIVATE TTNN::TTNN)
@@ -1783,6 +1804,7 @@ if(VLLM_CPP_HIP)
     src/vllm/platforms/rocm.cpp
     src/vt/rocm/rocm_backend.hip
     src/vt/rocm/rocm_rmsnorm.hip
+    src/vt/rocm/rocm_compiled_gemma.hip
     src/vt/rocm/rocm_residual_rmsnorm.hip
     src/vt/rocm/rocm_embedding.hip
     src/vt/rocm/rocm_embedding_quant.hip
@@ -1790,6 +1812,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_attn_gate_split.hip
     src/vt/rocm/rocm_matmul_hipblaslt.hip
     src/vt/rocm/rocm_paged_attn.hip
+    src/vt/rocm/rocm_rdna3_attn_decode.hip
     src/vt/rocm/rocm_gemma4_experts.hip
     src/vt/rocm/rocm_gemma4_fused_experts.hip
     src/vt/rocm/rocm_gemma4_expert_geglu.hip
@@ -1818,11 +1841,13 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_qwen4_exp_qsa.hip
     src/vt/rocm/rocm_dsa_indexer.hip
     src/vt/rocm/rocm_rms_norm_group.hip
-    src/vt/rocm/rocm_quant_dot.hip)
+    src/vt/rocm/rocm_quant_dot.hip
+    src/vt/rocm/rocm_deepseek_v4.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
     set_source_files_properties(
       src/vt/rocm/rocm_backend.hip
       src/vt/rocm/rocm_rmsnorm.hip
+      src/vt/rocm/rocm_compiled_gemma.hip
       src/vt/rocm/rocm_residual_rmsnorm.hip
       src/vt/rocm/rocm_embedding.hip
       src/vt/rocm/rocm_embedding_quant.hip
@@ -1830,6 +1855,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_attn_gate_split.hip
       src/vt/rocm/rocm_matmul_hipblaslt.hip
       src/vt/rocm/rocm_paged_attn.hip
+      src/vt/rocm/rocm_rdna3_attn_decode.hip
       src/vt/rocm/rocm_gemma4_experts.hip
       src/vt/rocm/rocm_gemma4_fused_experts.hip
       src/vt/rocm/rocm_gemma4_expert_geglu.hip
@@ -1859,6 +1885,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_dsa_indexer.hip
       src/vt/rocm/rocm_rms_norm_group.hip
       src/vt/rocm/rocm_quant_dot.hip
+      src/vt/rocm/rocm_deepseek_v4.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
   endif()
   # Prefer the absolute path inside ${ROCM_PATH}/lib, fall back to the bare name,

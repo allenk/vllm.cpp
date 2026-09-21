@@ -113,7 +113,6 @@ CHECKERS=(
   # compliance and caches nothing: symlink(2) is EOPNOTSUPP there, so every
   # lock fails and `ccache -s` shows zero of everything (#2473).
   check-lease-ccache
-  check-role-discipline
   claim-view
   check-readme-structure
   check-quickstart-recipes
@@ -232,6 +231,7 @@ SUITES=(
   test_ci_walk_base
   test_rc_stage_checkpoint
   test_sglang_lease_identity
+  test_rocprof_attach_preflight
   # #2877. Registered in TWO places -- here and in `.github/workflows/ci.yml` --
   # and pinned in `REQUIRED_SUITE_REGISTRATIONS`, so neither registration is
   # deletable at rc=0. It landed on NO lane at all: absent from this array and

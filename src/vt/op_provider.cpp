@@ -294,6 +294,12 @@ const char* OpNameImpl(OpId op) {
       return "RmsNorm";
     case OpId::kResidualRmsNorm:
       return "ResidualRmsNorm";
+    case OpId::kScaledRmsNorm:
+      return "ScaledRmsNorm";
+    case OpId::kSandwichRmsNorm:
+      return "SandwichRmsNorm";
+    case OpId::kCompiledGeluErfMul:
+      return "CompiledGeluErfMul";
     case OpId::kSiluAndMul:
       return "SiluAndMul";
     case OpId::kRopeNeox:
@@ -416,6 +422,8 @@ const char* OpNameImpl(OpId op) {
       return "MoeSiluMul";
     case OpId::kMoeRelu2:
       return "MoeRelu2";
+    case OpId::kClampedSwiGLU:
+      return "ClampedSwiGLU";
     case OpId::kCastBf16:
       return "CastBf16";
     case OpId::kCastF16:
@@ -472,6 +480,8 @@ const char* OpNameImpl(OpId op) {
       return "IndexSelect";
     case OpId::kIndexCopy:
       return "IndexCopy";
+    case OpId::kVHeadPermute:
+      return "VHeadPermute";
     case OpId::kMoeGroupedGemmBf16:
       return "MoeGroupedGemmBf16";
     case OpId::kLayerNorm:

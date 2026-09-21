@@ -43,6 +43,7 @@
 #include <iterator>
 
 #include "iq1_golden_vectors.h"  // oracle-produced IQ1_S / IQ1_XXXS goldens
+#include "iq1m_golden_vectors.h"  // oracle-produced IQ1_M goldens
 #include "iq2xs_iq4xs_dot_golden.h"  // oracle-produced IQ2_XS / IQ4_XS dots
 #include "iq2xs_iq4xs_golden_vectors.h"  // the same artifact bytes, decoded
 #include "vt/cpu/cpu_threadpool.h"  // Threadpool::SwapForTesting (via -I src)
@@ -169,6 +170,13 @@ const WeightCase kWeightCases[] = {
     // one.
     {vt::DType::kIQ1_S, 256, 50, 0, -1, -1, "iq1_s", 6e-4},
     {vt::DType::kIQ1_XXXS, 256, 38, 0, -1, -1, "iq1_xxxs", 6e-4},
+    // IQ1_M (1.75 bpw, ggml id 29) is a STANDARD llama.cpp encoding, but this
+    // tree gained it for one artifact: 4 attention-gate tensors inside
+    // `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF`'s IQ3_XXS file, which `GgufFile::Open`
+    // refused whole on the unknown id. Its block carries NO f16 field at all —
+    // the super-block scale is spliced out of four nibbles of `scales` — so
+    // d_off is -1 and RandomBlocks pins the packed scale directly.
+    {vt::DType::kIQ1_M, 256, 56, -1, -1, -1, "iq1_m", 6e-4},
     {vt::DType::kMXFP4, 32, 17, -1, -1, 0, "mxfp4"},
     // MODEL-MM-QWEN4-EXP W6a. `unsloth/Qwen3.8-Flash-Next-GGUF UD-IQ1_S` stores
     // all 48 `ffn_down_exps` as IQ4_NL, so those GEMMs run `VecDotIQ4_NLQ8_0`;
@@ -245,6 +253,19 @@ std::vector<uint8_t> RandomBlocks(const WeightCase& c, int64_t nblocks,
         qh = static_cast<uint16_t>((qh & 0x8FFFU) | (ls << 12));
         std::memcpy(blk + 34 + 2 * ib, &qh, sizeof(qh));
       }
+    }
+    // IQ1_M splices its super-block scale from the u16* view of scales:
+    // h = (sc[0]>>12) | ((sc[1]>>8)&0xf0) | ((sc[2]>>4)&0xf00) | (sc[3]&0xf000),
+    // i.e. the nibbles live in scales[1] hi, scales[3] lo, scales[5] hi,
+    // scales[7] hi. All other scales bits stay random (they are the eight
+    // 3-bit sub-block scales), as do qs, qh and every delta sign.
+    if (c.dtype == vt::DType::kIQ1_M) {
+      const uint16_t h = static_cast<uint16_t>(0x2C00U + 13U * (i % 4));
+      uint8_t* sc = blk + 48;
+      sc[1] = static_cast<uint8_t>((sc[1] & 0x0FU) | ((h & 0xFU) << 4));
+      sc[3] = static_cast<uint8_t>((sc[3] & 0xF0U) | ((h >> 4) & 0xFU));
+      sc[5] = static_cast<uint8_t>((sc[5] & 0x0FU) | ((h >> 8) & 0xF0U));
+      sc[7] = static_cast<uint8_t>((sc[7] & 0x0FU) | ((h >> 12) & 0xF0U));
     }
     // IQ1_XXXS packs the same scale, plus the delta sign, into one NIBBLE of
     // sc (bits 0-2 scale, bit 3 sign), two sub-blocks per byte. Same narrowing
@@ -718,9 +739,12 @@ TEST_CASE("kIq3sGrid is the pinned 512-entry table, not kIq3xxsGrid") {
   // Two u32 codebooks, both read four bytes at a time, one 256 rows and one
   // 512. A decoder pointed at the sibling indexes in range for the first 256
   // rows and returns plausible magnitudes, so nothing but a digest over the
-  // bytes we actually ported separates them. IQ3_S carries no `vec_dot` and so
-  // no golden DOT case, which makes this seal the whole of its table evidence
-  // beyond the decode golden in tests/vt/iq3s_golden_vectors.h.
+  // bytes we actually ported separates them. IQ3_S carried no `vec_dot` until
+  // the TT GSQ-RCO keep-quant wave 1 added the CPU oracle `VecDotIQ3_SQ8_K`
+  // (cpu_quant_dot.cpp, quants.c:1094) beside this table seal; the DOT
+  // evidence is the device sweep in tests/vt/test_tenstorrent_backend.cpp,
+  // which runs the on-core decode against that oracle bit-exactly, and the
+  // decode golden in tests/vt/iq3s_golden_vectors.h.
   CHECK(std::size(vt::cpu::kIq3sGrid) == 512);
   CHECK(std::size(vt::cpu::kIq3xxsGrid) == 256);
 
@@ -959,8 +983,9 @@ TEST_CASE("kIq1sDelta is upstream IQ1S_DELTA, not a value this tree chose") {
   // `ggml/src/ggml-common.h:1121` at the pinned 237ad9b96 is
   // `#define IQ1S_DELTA 0.125f`. The FORK reuses that same macro for IQ1_XXXS
   // (`dequantize_row_iq1_xxxs` and `ggml_vec_dot_iq1_xxxs_q8_K` both spell
-  // IQ1S_DELTA), so one constant serves BOTH encodings here and one wrong value
-  // corrupts both at once.
+  // IQ1S_DELTA), and upstream's IQ1_M reuses it too as IQ1M_DELTA
+  // (ggml-common.h:1133 at b10451, the same 0.125f), so one constant serves
+  // all THREE encodings here and one wrong value corrupts all of them at once.
   //
   // Sealed by value for exactly the reason the two grids are sealed by digest:
   // `DequantIQ1_S`, `DequantIQ1_XXXS`, `VecDotIQ1_SQ8_K` and
@@ -1026,6 +1051,24 @@ TEST_CASE("IQ1_XXXS decodes REAL checkpoint bytes as the PINNED FORK does") {
   CheckAgainstOracle(vt::DType::kIQ1_XXXS, vllm_test::kIq1xxxsGoldenBlocks,
                      vllm_test::kIq1xxxsGoldenBits,
                      std::size(vllm_test::kIq1xxxsGoldenBits));
+}
+
+TEST_CASE("IQ1_M decodes synthetic blocks as the PINNED ORACLE does") {
+  // The oracle is ggml-org/llama.cpp @ b10451, the pinned upstream build. The
+  // inputs are synthetic (the GSQ-RCO artifact was still downloading when the
+  // fixture was written; real checkpoint bytes are owed), but they exercise
+  // every field the decode reads: both delta polarities, all eight 3-bit
+  // sub-block scales per block, and arbitrary 11-bit grid indices. Provenance
+  // and the reproduction recipe are in iq1m_golden_vectors.h.
+  //
+  // This seals the DEQUANT arm. The vec_dot arm is tied to it by the G3
+  // "vec_dot matches f64 dequantize-then-dot" case above, so a defect injected
+  // into either one alone now fails somewhere.
+  CHECK(std::size(vllm_test::kIq1mGoldenBlocks) == 4 * 56);  // 4 blocks
+  CHECK(std::size(vllm_test::kIq1mGoldenBits) == 4 * 256);
+  CheckAgainstOracle(vt::DType::kIQ1_M, vllm_test::kIq1mGoldenBlocks,
+                     vllm_test::kIq1mGoldenBits,
+                     std::size(vllm_test::kIq1mGoldenBits));
 }
 
 TEST_CASE("G3 vec_dot is bit-exact run to run (fixed reduction order)") {

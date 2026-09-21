@@ -1,34 +1,10 @@
-# (VT_ASYNC_EXECUTOR_TRACE). Never set in production.
-# Gemma-4 MoE expert-execution tuning (#154, gemma4_moe.cpp / gemma4.cpp). Each
-# Inherited ROCm/Gemma-4 bring-up tactics. These are default-off diagnostic,
-# Kernel-internal env vars (deferred from docs/ENVIRONMENT.md).
-# Kernel-internal, so allowlisted rather than documented as user knobs.
-# ROCm GEMM/GEMV tactic selection (rocm_matmul_hipblaslt.hip). Same class: they
-# SEES the logits/input reuse hazard (a RED arm). Never set in production.
-# Test-only escape hatch: skip the depth-2 drain (VT_ASYNC_EXECUTOR=1) while
-# Test-only: deterministic RED for Option A — poison the PINNED H2D source right
-# These are kernel implementation / micro-tuning / bisect switches whose
-# after StageStepInputs enqueues the async copy (a true-async DMA reads the garbage),
-# defaults to the measured-best path; none changes an API contract or an output.
-# docs/BENCHMARKS.md, not on the deployment surface. scripts/check-env-doc.py
-# fallback, or experimental kernel behavior, not supported deployment knobs.
-# forcing the decode-graph parity ring OFF (single slot), so the async-serving gate
-# meaning is tied to a specific kernel; they are recorded in the ledger and
-# measured on gfx1201.
-# pick between hipBLASLt and our own kernels, all defaulting to the faster arm
-# proving the input-staged event boundary is load-bearing. Also a drain-skip counter
-# selects a kernel or a batching strategy for the expert GEMMs and each
-# treats a name here as a known kernel-internal knob. A NEW production env
-# var must be documented in docs/ENVIRONMENT.md OR added here.
 VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH
-VLLM_CPP_TRITON_CPU_MM_MAX_M
-VLLM_CPP_TRITON_CPU_PROBE
-VLLM_CPP_TRITON_CPU_SHADOW
-VLLM_CPP_TRITON_CPU_STRICT_GATES
 VLLM_GEMMA4_MM_DEBUG
 VLLM_MM_TOWER_PROFILE
 VT_ACT_F32
 VT_ARCH_TACTIC_STATS
+VT_ARGMAX_SPLIT
+VT_ASYNC_DEBUG
 VT_ASYNC_EXECUTOR_NO_DBUF
 VT_ASYNC_EXECUTOR_POISON
 VT_ASYNC_EXECUTOR_TRACE
@@ -40,7 +16,6 @@ VT_ATTN_GQA
 VT_ATTN_PREFILL_BM
 VT_ATTN_PREFILL_NOSYNC
 VT_ATTN_PREFILL_VEC
-VT_ATTN_SELECT_LOG
 VT_ATTN_WMMA
 VT_BF16_GEMM_OUT
 VT_BF16_RESIDUAL
@@ -55,12 +30,6 @@ VT_DENSE_NATIVE
 VT_DIRECT_DEVICE_LOAD
 VT_DSV4_EXL3_MOE_TRACE
 VT_DUMP_ACT
-VT_DUMP_ACT_SUB
-VT_DUMP_ATTN
-VT_DUMP_LOGITS
-VT_DUMP_QKVZ
-VT_DUMP_TRUST
-VT_ENGINE_STEP_STATS
 VT_EXL3_GEMV
 VT_EXL3_GEMV_SMEM
 VT_FA2_DECODE_35B
@@ -115,6 +84,7 @@ VT_GDN_MERGED_BA
 VT_GDN_MERGED_PROJ
 VT_GDN_MERGED_QKVZ
 VT_GDN_MERGED_QKVZ_FP8
+VT_GDN_NORMGATED_COOP
 VT_GDN_OCC_BLOCK
 VT_GDN_OUT_FP8_FUSE
 VT_GDN_PACKED_DECODE_FP8_TOWER
@@ -129,7 +99,6 @@ VT_GDN_TILE_PIPE
 VT_GDN_TILE_PIPE_CPASYNC
 VT_GDN_TMA
 VT_GDN_TRITON_CHUNK_POOL
-VT_GDN_TRITON_STATS
 VT_GDN_TRITON_WU_POOL
 VT_GDN_WU_TRITON
 VT_GDN_WU_WMMA
@@ -151,6 +120,7 @@ VT_GLUE_FUSE
 VT_INTERNLM2_WRONG_SPLIT
 VT_KDA_CHUNK_TRITON
 VT_KV_ALLOC_LOG
+VT_ATTN_SELECT_LOG
 VT_LAGUNA_DECODE_GRAPH
 VT_LAGUNA_FAST_NORM
 VT_LAGUNA_GLUE_FUSED
@@ -214,15 +184,14 @@ VT_ROCM_HIPBLASLT
 VT_ROCM_LT_ALGO
 VT_ROCM_MANAGED_ALLOC
 VT_ROCM_Q6K_SMALL_PRIVATE
-VT_ROCM_SKINNY
 VT_ROCM_SPLIT_N
 VT_ROCM_WMMA_GEMM
+VT_ROCM_SKINNY
 VT_SAMPLE_SPLIT
 VT_SILU_FP4_FAST
 VT_SPEC_TEST_SELECT_SPIN_MS
 VT_SPEC_TRACE
 VT_SWIZZLE_IN_QUANT
-VT_SYNC_LOG
 VT_TT_ALLOC_TRACE
 VT_TT_DUMP_KV
 VT_TT_KEEPQUANT_CHUNK_BYTES
@@ -233,7 +202,6 @@ VT_TT_NO_ROPE_REFRESH
 VT_TT_RECAPTURE_EVERY
 VT_TT_SDPA_TEST
 VT_TT_SHARD_Q
-VT_TT_SLOT_TRACE
 VT_TT_TRACE_REGION_MB
 VT_V4_DECODE_GRAPH
 VT_V4_DEVICE_ATTN
@@ -258,39 +226,35 @@ VT_V4_RESIDENT_EXPERTS
 VT_V4_RESIDENT_W
 VT_V4_ROPE_FLOAT
 VT_V4_ROUTE_WARP_TOPK
-VT_VULKAN_ASYNC_READBACK
-VT_VULKAN_ATTN_CM2
-VT_VULKAN_CONV_FWD
-VT_VULKAN_COOPMAT2_DIRECT_STORE
-VT_VULKAN_COOPMAT2_GROUP_M
-VT_VULKAN_COOPMAT2_KUNROLL
-VT_VULKAN_COOPMAT2_N
-VT_VULKAN_COOPMAT2_ONLY_N
-VT_VULKAN_COOPMAT2_WGK
-VT_VULKAN_COOPMAT2_WGM
-VT_VULKAN_COOPMAT_LIST
-VT_VULKAN_COOPMAT_MIN_M
-VT_VULKAN_COOPMAT_MR
-VT_VULKAN_COOPMAT_NR
-VT_VULKAN_COOPMAT_NR4_MIN_M
-VT_VULKAN_COOPMAT_TILED
-VT_VULKAN_COPY_LOG
-VT_VULKAN_DEV_COPY
-VT_VULKAN_GDN_BV
-VT_VULKAN_GDN_REG
-VT_VULKAN_GEMV_BATCH
-VT_VULKAN_GEMV_BROWS
-VT_VULKAN_GEMV_MAX_M
-VT_VULKAN_GEMV_REDUCE
-VT_VULKAN_GEMV_SMALL_M
-VT_VULKAN_GEMV_WG
-VT_VULKAN_LOGITS_DUMP
-VT_VULKAN_LOGITS_DUMP_STEPS
-VT_VULKAN_MATMUL_KUNROLL
-VT_VULKAN_MATMUL_MROWS
-VT_VULKAN_PIN_TOKEN
-VT_VULKAN_PIPELINE_IR
-VT_VULKAN_PIPELINE_STATS
-VT_VULKAN_PROBE_LOG
-VT_VULKAN_SHAPE_STATS
 VT_W4A4_TRUE
+VT_WVSPLIT_PRGRP
+VT_WVSPLIT_YTILE
+# (VT_ASYNC_EXECUTOR_TRACE). Never set in production.
+# Gemma-4 MoE expert-execution tuning (#154, gemma4_moe.cpp / gemma4.cpp). Each
+# Inherited ROCm/Gemma-4 bring-up tactics. These are default-off diagnostic,
+# Kernel-internal env vars (deferred from docs/ENVIRONMENT.md).
+# Kernel-internal, so allowlisted rather than documented as user knobs.
+# ROCm GEMM/GEMV tactic selection (rocm_matmul_hipblaslt.hip). Same class: they
+# SEES the logits/input reuse hazard (a RED arm). Never set in production.
+# Test-only escape hatch: skip the depth-2 drain (VT_ASYNC_EXECUTOR=1) while
+# Test-only: deterministic RED for Option A — poison the PINNED H2D source right
+# These are kernel implementation / micro-tuning / bisect switches whose
+# after StageStepInputs enqueues the async copy (a true-async DMA reads the garbage),
+# defaults to the measured-best path; none changes an API contract or an output.
+# docs/BENCHMARKS.md, not on the deployment surface. scripts/check-env-doc.py
+# fallback, or experimental kernel behavior, not supported deployment knobs.
+# forcing the decode-graph parity ring OFF (single slot), so the async-serving gate
+# meaning is tied to a specific kernel; they are recorded in the ledger and
+# measured on gfx1201.
+# pick between hipBLASLt and our own kernels, all defaulting to the faster arm
+# proving the input-staged event boundary is load-bearing. Also a drain-skip counter
+# selects a kernel or a batching strategy for the expert GEMMs and each
+# treats a name here as a known kernel-internal knob. A NEW production env
+# var must be documented in docs/ENVIRONMENT.md OR added here.
+VT_DUMP_ACT_SUB
+VT_DUMP_ATTN
+VT_TT_SLOT_TRACE
+VT_DUMP_LOGITS
+VT_DUMP_QKVZ
+VT_DUMP_TRUST
+VLLM_CPP_ROCM_STATIC_GRAPH

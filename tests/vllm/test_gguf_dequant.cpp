@@ -511,6 +511,20 @@ TEST_CASE("DequantGgufRowToF32 IQ1_XXXS row matches the pinned FORK oracle") {
                                 std::size(vllm_test::kIq1xxxsGoldenBits));
 }
 
+// --- IQ1_M (29): GSQ-RCO quant arms pair their IQ3_S/IQ3_XXS experts with
+// IQ1_M tensors, so a checkpoint carrying the type refused to load on this
+// expansion path even though vt had decoded IQ1_M since its own landing. The
+// hand-maintained case list above drifted behind `BlockDTypeFromGgmlTypeId` a
+// third time. Gated on the ORACLE-produced goldens in
+// tests/vt/iq1m_golden_vectors.h, not on "does not throw".
+#include "../vt/iq1m_golden_vectors.h"
+
+TEST_CASE("DequantGgufRowToF32 IQ1_M row matches the pinned oracle") {
+  CheckGgufDequantAgainstOracle(29, vllm_test::kIq1mGoldenBlocks,
+                                vllm_test::kIq1mGoldenBits,
+                                std::size(vllm_test::kIq1mGoldenBits));
+}
+
 // --- IQ4_NL (20) / Q5_0 (6): the two 32-element encodings added for
 // `qwen4exp` (Qwen3.8-Flash-Next). IQ4_NL is what the shipped UD-IQ1_S uses for
 // all 48 `ffn_down_exps` AND for the 20M-entry `per_layer_token_embd` n-gram

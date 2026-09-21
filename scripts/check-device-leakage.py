@@ -405,22 +405,28 @@ ALLOWLIST: dict[str, dict[str, tuple[object, str]]] = {
                      "backend.cpp above."),
     },
     "src/vllm/model_executor/models/deepseek_v4_device.cpp": {
-        "kcuda": (8, "the DeepSeek-V4 CUDA device-forward RESOLVER TU (W7-device): "
-                     "4 `GetOp` + 4 `OpRegistered` lookups that fetch the "
-                     "CUDA-registered `kDeepseekV4{Mhc,Dsa,Compressor,Moe}` kernels "
+        "kcuda": (9, "the DeepSeek-V4 CUDA device-forward RESOLVER TU (W7-device): "
+                     "4 `GetOp` + 5 `OpRegistered` lookups that fetch the "
+                     "device-registered `kDeepseekV4{Mhc,Dsa,Compressor,Moe}` kernels "
                      "for `DeepseekV4Model::ForwardDevice`. This TU exists only to "
                      "resolve the device leg — a CPU build registers nothing on "
                      "`(op, kCUDA)` so `GetOp` throws a clean device-only error. "
+                     "O34 (#3198) added one `OpRegistered(kDeepseekV4Mhc, kCUDA)` "
+                     "probe to `MhcDevice()` so it can try kCUDA first and fall back "
+                     "to kROCm; Dsa, Compressor and Moe stay kCUDA-only. "
                      "FOLLOW-UP (deferred, needs a GB10 re-gate — DGX offline "
                      "2026-07-29): thread the runner `DeviceType` through these "
                      "resolvers so they become device-parameterized lookups "
                      "(`GetOp(op, runner.device.type)`) instead of hardcoding kCUDA."),
     },
     "src/vllm/model_executor/models/glm5_next_device.cpp": {
-        "kcuda": (2, "the GLM-5.3-Flash k-pool DSA indexer's device PROBE TU "
+        "kcuda": (3, "the GLM-5.3-Flash k-pool DSA indexer's device PROBE TU "
                      "(W9c-0, #2415) — the SAME shape as laguna_device.cpp below: "
                      "2 `OpRegistered` lookups asking whether cuda_glm5_next.cu "
-                     "registered `kGlm5NextKpool{Compress,Select}` on kCUDA. The TU "
+                     "registered `kGlm5NextKpool{Compress,Select}` on kCUDA, plus "
+                     "the `OpRegistered(kDeepseekV4Mhc, kCUDA)` leg of the mHC "
+                     "pre/post device probe (#3229, O34 #3199), which tries kCUDA "
+                     "first and falls back to kROCm. The TU "
                      "is always compiled and holds NO CUDA code. There is "
                      "deliberately no CPU provider for either op — the CPU answer "
                      "is `glm5_next_dsa.cpp`, which is the ORACLE these kernels are "

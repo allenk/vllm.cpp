@@ -59,6 +59,9 @@ target_compile_definitions(test_version PRIVATE
 vllm_cpp_add_test(test_sampling_params vllm/test_sampling_params.cpp)
 vllm_cpp_add_test(test_punica_cpu vllm/lora/test_punica_cpu.cpp)
 vllm_cpp_add_test(test_lora_layers vllm/lora/test_lora_layers.cpp)
+vllm_cpp_add_test(test_lora_mapping vllm/lora/test_lora_mapping.cpp)
+vllm_cpp_add_test(test_peft_helper vllm/lora/test_peft_helper.cpp)
+vllm_cpp_add_test(test_lora_checkpoints vllm/lora/test_lora_checkpoints.cpp)
 vllm_cpp_add_test(test_plugin_system
   vllm/plugins/test_plugin_system.cpp
   vllm/plugins/toy_model_plugin.cpp)
@@ -192,10 +195,23 @@ target_include_directories(test_w2vbert PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm
 target_include_directories(test_campplus PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_gpt2 vllm/models/test_gpt2.cpp)
 target_include_directories(test_gpt2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+vllm_cpp_add_test(test_deberta_v2 vllm/models/test_deberta_v2.cpp)
+target_include_directories(test_deberta_v2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+vllm_cpp_add_test(test_gliner2 vllm/models/test_gliner2.cpp)
+target_include_directories(test_gliner2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+vllm_cpp_add_test(test_gliner2_e2e vllm/models/test_gliner2_e2e.cpp)
+target_compile_definitions(test_gliner2_e2e PRIVATE
+  GLINER2_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/gliner2_e2e")
+vllm_cpp_add_test(test_gliner2_ner vllm/models/test_gliner2_ner.cpp)
 vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 # VT-CONV1D-MODEL-BLOCK (#1684): the time-block case reads `Conv1dTimeBlock` so
 # it asserts the geometry it claims. Same reach as test_vocoder1d.
 target_include_directories(test_minimax_h3 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ROAD-V1-DIT-LORA: H3-specific contract name rewriting (model.diffusion_model.
+# prefix) and load-time fusion through the shared dit_lora seam.
+vllm_cpp_add_test(test_h3_lora vllm/models/test_h3_lora.cpp)
+# ROAD-V1-LORA-RUNTIME: prompt tag parsing and name resolution for runtime LoRA.
+vllm_cpp_add_test(test_dit_runtime_lora vllm/models/test_dit_runtime_lora.cpp)
 # MiniMax-Music3 W1 (#672): the six-component diffusers-arm loader, gated against
 # the REAL checkpoint's headers (minimax_music3_manifest.inc, 1012 tensors, no
 # weight bytes) so CI never needs the 28.5 GB asset.
@@ -598,6 +614,12 @@ vllm_cpp_add_test(test_qwen3_5_gdn_spec_routing vllm/models/test_qwen3_5_gdn_spe
 vllm_cpp_add_test(test_qwen3_5_gguf_mtp vllm/models/test_qwen3_5_gguf_mtp.cpp)
 vllm_cpp_add_test(test_qwen3_dflash_gguf vllm/models/test_qwen3_dflash_gguf.cpp)
 target_include_directories(test_qwen3_5_gdn_spec_routing PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MODEL-MM-QWEN4-EXP (ISSUE-LOCAL-01M2ENTH6YA5FWEDY6CFHF4NAM): the deferred GDN
+# V-head permutation. Same reason for the src/ include — it drives the block
+# through `GdnBlockPagedForTest`.
+vllm_cpp_add_test(test_gdn_v_head_permute vllm/models/test_gdn_v_head_permute.cpp)
+target_include_directories(test_gdn_v_head_permute PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_dense_forward vllm/models/test_qwen27_dense_forward.cpp)
 # MODEL-GDN-OUTPUT-GATE-TYPE (#489): `GlueFuseEnabled()` defaults ON and is read
 # ONCE per process into a function-local static, so one run of these two suites
@@ -807,6 +829,16 @@ target_include_directories(test_deepseek_v4_1_scaffold PRIVATE ${CMAKE_SOURCE_DI
 # `gguf_builder.h` is the shared in-memory GGUF fixture builder under tests/vllm.
 target_include_directories(test_deepseek_v4_1_scaffold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 
+# DeepSeek-V4.1-Flash W3c (indexer arm) + W3d (`kv_source_layer`-keyed KV
+# topology) host-reference gate. Ports the three upstream `indexer_k_store`
+# cases and the `fused_q_kv_rmsnorm` case at `e77daef89e`, and gates the
+# topology -- which has NO upstream test at all -- against the real published
+# config.json. No checkpoint / GPU.
+vllm_cpp_add_test(test_deepseek_v4_1_indexer vllm/models/test_deepseek_v4_1_indexer.cpp)
+target_compile_definitions(test_deepseek_v4_1_indexer PRIVATE
+  DEEPSEEK_V4_1_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/deepseek_v4_1")
+target_include_directories(test_deepseek_v4_1_indexer PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # DeepSeek-V4-Pro shape-generality gate (#504): the Pro config descends through
 # the SAME ParseDeepseekV4Params with zero new keys, and compress_ratios alone
 # reproduces the compressor/indexer layer counts of BOTH real checkpoints
@@ -853,6 +885,14 @@ vllm_cpp_add_test(test_deepseek_v4_compressor vllm/models/test_deepseek_v4_compr
 # from-first-principles double-precision derivation. Full-model gate multi-Spark-
 # blocked; MoE/device-kernel are W6/W7 (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_mhc vllm/models/test_deepseek_v4_mhc.cpp)
+# DeepSeek-V4.1-Flash W3a — Engram: the n-gram hash over a compressed token
+# vocabulary, the prime bucket layout, the sharded fp8 / ue8m0 table lookup and
+# the sigmoid gate that injects the lookup into the hyper-connection manifold.
+# Ports tests/kernels/test_engram.py @ vLLM e77daef89e (778 lines), including
+# its two scalar oracles and their rtol=0/atol=0 tolerances; adds the ue8m0
+# byte-0 case its own fixtures cannot reach, and the prime-layout case upstream
+# leaves ungated (.agents/specs/deepseek-v4-1-flash.md, wave W3a).
+vllm_cpp_add_test(test_deepseek_v4_1_engram vllm/models/test_deepseek_v4_1_engram.cpp)
 # DeepSeek-V4-Flash W6 — the sqrtsoftplus + hash-routed MoE: the V4 router score
 # function (sqrt∘softplus), the noaux_tc bias-for-selection top-k, the hash
 # `tid2eid` route that bypasses top-k, and the clamped SwiGLU expert activation.
@@ -861,6 +901,13 @@ vllm_cpp_add_test(test_deepseek_v4_mhc vllm/models/test_deepseek_v4_mhc.cpp)
 # references. Full-model gate multi-Spark-blocked (156.7 GiB); device-kernel +
 # forward assembly are W7 (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_moe vllm/models/test_deepseek_v4_moe.cpp)
+# DeepSeek-V4.1-Flash W3b — the MXFP8 32x32 UE8M0 linear family host reference.
+# Ports tests/quantization/test_fp8.py:67-238 @ vLLM e77daef89e (a BIT-EXACT
+# oracle for the scale expansion) and derives the quantizer / emulation-linear
+# cases from first principles in double precision, because every upstream mxfp8
+# linear test is CUDA/ROCm-gated. No e2e gate exists: no published V4.1 artifact
+# fits any device this project reaches (.agents/specs/deepseek-v4-1-flash.md).
+vllm_cpp_add_test(test_deepseek_v4_1_mxfp8 vllm/models/test_deepseek_v4_1_mxfp8.cpp)
 # DeepSeek-V4-Flash W7 — the DeepseekV4Model::Forward ASSEMBLY: composes the four
 # landed host primitives (W3 DSA/MLA seams, W4 compressor + fp8_ds_mla KV, W5 MHC
 # + Sinkhorn, W6 sqrtsoftplus/hash MoE) into an end-to-end logits producer at a
@@ -910,6 +957,13 @@ target_include_directories(test_deepseek_v4_mtp PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # kernels match the references. NOT a real-checkpoint token gate (W8, multi-Spark).
 vllm_cpp_add_test(test_cuda_deepseek_v4 vllm/models/test_cuda_deepseek_v4.cpp)
 target_include_directories(test_cuda_deepseek_v4 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# O34: the ROCm/HIP arm of the DeepSeek-V4 MHC device-kernel family. A 1:1 mirror
+# of the CUDA MHC cases above, run against the ROCm provider registered in
+# rocm_deepseek_v4.hip. The device cases SKIP on a build without a ROCm backend
+# (exit 77 — "assertions: 0 ... SUCCESS!" is not a pass, tests/CMakeLists.txt:30-38).
+vllm_cpp_add_test(test_rocm_deepseek_v4_mhc vt/test_rocm_deepseek_v4_mhc.cpp)
+target_include_directories(test_rocm_deepseek_v4_mhc PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_rocm_deepseek_v4_mhc PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 # KIMI-K3 W2/W5 SCAFFOLDING (KimiK3ForConditionalGeneration) — the DERIVE-AND-SHIP
 # structural gate: registry-resolve + nested-config descent + text-backbone
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;
@@ -2158,6 +2212,8 @@ vllm_cpp_add_test(test_chunked_local_attention
   vllm/v1/attention/test_chunked_local_attention.cpp)
 vllm_cpp_add_test(test_rotary_embedding
   vllm/model_executor/layers/rotary_embedding/test_rotary_embedding.cpp)
+vllm_cpp_add_test(test_linear_scaling_rope
+  vllm/model_executor/layers/rotary_embedding/test_linear_scaling_rope.cpp)
 vllm_cpp_add_test(test_pooler
   vllm/model_executor/layers/pooler/test_pooler.cpp)
 vllm_cpp_add_test(test_pooler_heads
@@ -2623,6 +2679,7 @@ target_compile_definitions(test_capi PRIVATE
   PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e"
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold"
   LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e"
+  GLINER2_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/gliner2_e2e"
   # #1681: the real published Qwen3.8 chat template, rendered through the C
   # ABI's own vllm_chat path. Absolute so it resolves from whatever working
   # directory ctest runs the suite in.
@@ -2792,6 +2849,14 @@ else()
     vllm::vllm vllm_test_main)
 endif()
 vllm_cpp_set_warnings(test_ops_paged_attn_sharedk_wmma_p1_gpu)
+# GFX1100-TG200-T2b: ROCm decode-graph capture through ModelRegistry::Forward.
+# Self-skips without a ROCm device (vt::rocm::DeviceAvailable()) and on non-
+# gfx1100 arches (per-arch opt-in keeps the path eager). On gfx1100 it enters
+# the production forward and exercises the captured decode-graph path.
+vllm_cpp_add_test(test_rocm_decode_graph_forward
+  vllm/models/test_rocm_decode_graph_forward.cpp)
+target_include_directories(test_rocm_decode_graph_forward PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
 endif()
 if(VLLM_CPP_METAL)
   vllm_cpp_add_test(test_metal_backend vt/test_metal_backend.cpp)
@@ -2986,6 +3051,8 @@ vllm_cpp_add_test(test_cuda_embedding_quant vt/test_cuda_embedding_quant.cpp)
 target_include_directories(test_cuda_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # BACKEND-ROCM-QUANT-GATHER: the production gate starts at the public loader.
 vllm_cpp_add_test(test_capi_rocm_embedding_quant capi/test_rocm_embedding_quant.cpp)
+# Quantized WMMA reaches both formats through the public completion API.
+vllm_cpp_add_test(test_capi_rocm_quant_wmma capi/test_rocm_quant_wmma.cpp)
 vllm_cpp_add_test(test_rocm_embedding_quant vt/test_rocm_embedding_quant.cpp)
 target_include_directories(test_rocm_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(VLLM_CPP_HIP)
@@ -2997,6 +3064,8 @@ endif()
 add_executable(rocm_quant_gather_capture ../tools/rocm_quant_gather/capture.cpp)
 target_link_libraries(rocm_quant_gather_capture PRIVATE vllm)
 target_include_directories(rocm_quant_gather_capture PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+add_executable(rocm_quant_wmma_capture ../tools/rocm_quant_wmma/capture.cpp)
+target_link_libraries(rocm_quant_wmma_capture PRIVATE vllm)
 # CPU-ELEM-GEMM: the specialized + SIMD elementwise (bf16/f16/f32) GEMM. The
 # gate is BYTE-IDENTITY against an independent scalar reference across every
 # dtype combination, both weight orientations, ragged K/N, row-strided
@@ -3340,6 +3409,7 @@ vllm_cpp_add_test(test_ops_activation vt/test_ops_activation.cpp)
 vllm_cpp_add_test(test_ops_rope vt/test_ops_rope.cpp)
 vllm_cpp_add_test(test_ops_rope_cache vt/test_ops_rope_cache.cpp)
 vllm_cpp_add_test(test_ops_fused_norm_rope vt/test_ops_fused_norm_rope.cpp)
+vllm_cpp_add_test(test_compiled_gemma vt/test_compiled_gemma.cpp)
 vllm_cpp_add_test(test_ops_gdn vt/test_ops_gdn.cpp)
 target_include_directories(test_ops_gdn PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(VLLM_CPP_TRITON)

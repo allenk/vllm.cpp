@@ -118,6 +118,17 @@ const BlockGeometry* FindBlockGeometry(DType dtype) {
       static constexpr BlockGeometry g{256, 38, 66, "iq1_xxxs"};
       return &g;
     }
+    case DType::kIQ1_M: {
+      // block_iq1_m (llama.cpp @ b10451 ggml-common.h:429-437): QK_K/8 u8 qs
+      // + QK_K/16 u8 qh + QK_K/32 u8 scales = 56, i.e. 1.75 bpw. ggml type
+      // id 29 (ggml/include/ggml.h). NO f16 field anywhere in the block: the
+      // super-block scale is an f16 assembled from the four TOP nibbles of
+      // scales[0..3], and the same bytes carry the eight 3-bit sub-block
+      // scales in their low 6 bits. Codebook (iq1s_grid, 2048 entries) decode
+      // on an 11-bit index, like IQ1_S.
+      static constexpr BlockGeometry g{256, 56, 29, "iq1_m"};
+      return &g;
+    }
     case DType::kIQ4_NL: {
       // block_iq4_nl (llama.cpp @ b10451 ggml/src/ggml-common.h:447-452):
       // f16 d + u8 qs[QK4_NL/2] = 2 + 16 = 18, QK4_NL = 32. ggml type id 20
@@ -201,7 +212,7 @@ bool BlockDTypeFromGgmlTypeId(uint32_t ggml_type, DType* out) {
       DType::kQ4_0, DType::kQ5_0,  DType::kQ8_0,     DType::kQ2_K, DType::kQ3_K,
       DType::kQ4_K, DType::kQ5_K,  DType::kQ6_K,     DType::kQ8_K,
       DType::kIQ2_XXS, DType::kIQ3_XXS, DType::kIQ2_S, DType::kMXFP4,
-      DType::kIQ1_S, DType::kIQ1_XXXS, DType::kIQ4_NL,
+      DType::kIQ1_S, DType::kIQ1_M, DType::kIQ1_XXXS, DType::kIQ4_NL,
       DType::kIQ2_XS, DType::kIQ4_XS, DType::kIQ3_S};
   for (DType d : kBlockDTypes) {
     if (FindBlockGeometry(d)->ggml_type == ggml_type) {
@@ -260,6 +271,7 @@ const char* Name(DType dtype) {
     case DType::kIQ2_S: return "iq2_s";
     case DType::kIQ1_S: return "iq1_s";
     case DType::kIQ1_XXXS: return "iq1_xxxs";
+    case DType::kIQ1_M: return "iq1_m";
     case DType::kIQ4_NL: return "iq4_nl";
     case DType::kMXFP4: return "mxfp4";
     case DType::kIQ2_XS: return "iq2_xs";

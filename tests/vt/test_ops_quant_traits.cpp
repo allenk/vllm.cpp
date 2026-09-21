@@ -283,10 +283,10 @@ TEST_CASE("the decode-only class is Q8_K and IQ3_S: exactly one FILE type expand
     vt::DType d = vt::DType::kF32;
     if (!vt::BlockDTypeFromGgmlTypeId(id, &d)) continue;
     if (d == vt::DType::kQ8_K) continue;
-    // IQ3_S is the ONE file encoding that decodes without dotting. Skipped from
-    // the sweep and asserted explicitly below, so "it expands" is a written
-    // claim rather than a hole in a loop.
-    if (d == vt::DType::kIQ3_S) continue;
+    // IQ3_S dotted with aa85e9484 (tenstorrent-gsq-keepquant wave 1), which
+    // landed the CPU oracle `VecDotIQ3_SQ8_K` alongside the TT on-core decode,
+    // so it now sweeps like every other file weight and is asserted explicitly
+    // below as well.
     CAPTURE(id);
     CAPTURE(vt::Name(d));
     ++swept;
@@ -300,17 +300,24 @@ TEST_CASE("the decode-only class is Q8_K and IQ3_S: exactly one FILE type expand
   }
   // The sweep found something. A `BlockDTypeFromGgmlTypeId` that started
   // refusing every id would otherwise pass the loop above vacuously.
+  // IQ1_M (ggml id 29) joined with BOTH a decoder and a dot kernel, so the
+  // sweep count moved 17 -> 18 when it landed.
+  // 18 -> 19 when IQ3_S gained its dot kernel with aa85e9484
+  // (tenstorrent-gsq-keepquant wave 1).
   CAPTURE(swept);
-  CHECK(swept == 17);
+  CHECK(swept == 19);
 
   // The decode-only FILE member, named and asserted in BOTH directions. Sizes
   // written out from llama.cpp @ b10451 ggml-common.h:413-422, NOT copied from
   // either table under test:
   //   iq3_s :413-422  f16 d + 256/4 qs + 256/32 qh + 256/8 signs
   //                   + 256/64 scales                    = 2+64+8+32+4 = 110
+  // IQ1_M (e71f6d6fd) moved the sweep count 17 -> 18; IQ3_S dotting moved it
+  // 18 -> 19 with aa85e9484, so the old "decode-only" claim is INVERTED here:
+  // the dot kernel is asserted present, not absent.
   CHECK(vt::cpu::BlockToFloat(vt::DType::kIQ3_S) != nullptr);
-  CHECK(vt::cpu::BlockVecDot(vt::DType::kIQ3_S) == nullptr);
-  CHECK_FALSE(vt::cpu::HasQuantDotKernel(vt::DType::kIQ3_S));
+  CHECK(vt::cpu::BlockVecDot(vt::DType::kIQ3_S) != nullptr);
+  CHECK(vt::cpu::HasQuantDotKernel(vt::DType::kIQ3_S));
   CHECK(vt::cpu::BlockFromFloat(vt::DType::kIQ3_S) == nullptr);
   CHECK(vt::BlockElems(vt::DType::kIQ3_S) == 256);
   CHECK(vt::BlockBytes(vt::DType::kIQ3_S) == 2 + 64 + 8 + 32 + 4);

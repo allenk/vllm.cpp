@@ -196,8 +196,12 @@ TEST_CASE("the CPU row-decoder set is PINNED, because the device gate is dtype-b
       DType::kQ3_K,   DType::kQ4_K,     DType::kQ5_K,     DType::kQ6_K,
       DType::kQ8_K,   DType::kIQ2_XXS,  DType::kIQ3_XXS,  DType::kIQ2_S,
       DType::kIQ2_XS, DType::kIQ1_S,    DType::kIQ1_XXXS, DType::kIQ4_NL,
-      DType::kIQ4_XS, DType::kMXFP4,    DType::kIQ3_S,
+      DType::kIQ4_XS, DType::kMXFP4,    DType::kIQ3_S,    DType::kIQ1_M,
   };
+  // IQ1_M (ggml id 29) joined with a CPU row decoder in e71f6d6fd
+  // (feat(quant): IQ1_M — reader traits, dtype, CPU dequant arm), so the
+  // pinned set grows to 20. It sits between kIQ1_S and kIQ1_XXXS in the enum,
+  // inside this loop's bound.
   // The bound is the LAST enumerator, and it has to move with the enum: while
   // it read `kIQ4_XS` this loop stopped one short of `kIQ3_S`, so a MISSING
   // decoder for the newest dtype would have read as present. QUANT-IQ3S

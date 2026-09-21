@@ -131,12 +131,23 @@ const char* Name(GgufResidency residency) {
     case GgufResidency::kKeepQuant: return "keep_quant";
     case GgufResidency::kKeepF16: return "keep_f16";
     case GgufResidency::kNvfp4Fp4: return "nvfp4_fp4";
+    case GgufResidency::kBfp8Device: return "bfp8_device";
   }
   return "?";
 }
 
 // ggml type id 1 is F16 (IEEE half); see gguf_dequant.cpp case 1.
 bool KeepF16DType(uint32_t ggml_type) { return ggml_type == 1; }
+
+bool GgufResidencyKeepsBlockWeights(GgufResidency residency) {
+  return residency == GgufResidency::kKeepQuant ||
+         residency == GgufResidency::kKeepF16;
+}
+
+bool GgufResidencyExpandsBf16(GgufResidency residency) {
+  return residency == GgufResidency::kExpandBf16 ||
+         residency == GgufResidency::kBfp8Device;
+}
 
 // ggml type id 40 is the NVFP4 fork extension; see gguf_dequant.cpp case 40.
 bool KeepNvfp4DType(uint32_t ggml_type) { return ggml_type == 40; }
@@ -181,13 +192,58 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
       // (the q4km artifact: token_embd Q6_K, attn_qkv/ssm_out Q5_K,
       // ssm_alpha/ssm_beta Q8_0) is what pulled Q5_K/Q6_K/Q8_0 from W4 into
       // W3 — kernels and predicate widened IN THE SAME CHANGE. kQ4_0 has no
-      // TT arm at all and kQ2_K/kQ3_K stay owed; admitting an encoding
+      // TT arm at all and kQ2_K stays owed (Q3_K joined in
+      // QUANT-GGUF-IQ-TENSTORRENT wave 3); admitting an encoding
       // without its kernel throws at first forward with the model resident,
       // the exact failure this predicate exists to prevent.
+      // QUANT-GGUF-IQ-TENSTORRENT wave 1: kIQ3_XXS joins the set — its
+      // on-core decode is the int8-dot kernel's enc_sel 4
+      // (kq_vec_dot_iq3_xxs_q8_K, keepquant_kernel_code.h), staged as the
+      // same resident i32 word shadow (32 words = 98 B zero-padded to
+      // 128 B), and dispatched on the DEFAULT path (no env gate — the
+      // grouped arm has no IQ3_XXS decode to fall through to). The APEX
+      // I-Nano vehicle's 164 IQ3_XXS tensors are the artifact this admits.
       // tests/vllm/test_gguf_keep_quant.cpp pins the set; widening the arm
       // without widening the kernel reds it.
+      // QUANT-GGUF-IQ-TENSTORRENT wave 2: kIQ2_XXS (enc_sel 5) and kIQ2_S
+      // (enc_sel 6) join the set the same way — on-core decodes
+      // kq_vec_dot_iq2_xxs_q8_K / kq_vec_dot_iq2_s_q8_K
+      // (keepquant_kernel_code.h), staged as the same resident i32 word
+      // shadow (32 words = 66 B / 82 B zero-padded to 128 B), dispatched on
+      // the DEFAULT path. The APEX I-Nano vehicle's 44 IQ2_XXS + 89 IQ2_S
+      // tensors are the artifacts this admits.
+      // QUANT-GGUF-IQ-TENSTORRENT wave 3: kQ3_K (enc_sel 7) closes the
+      // census — kq_vec_dot_q3_k_q8_K (keepquant_kernel_code.h), 32 words
+      // = 110 B zero-padded to 128 B, dispatched on the DEFAULT path. The
+      // vehicle's 78 Q3_K tensors are the artifact this admits, and no
+      // named missing arm remains in the census.
+      // tenstorrent-gsq-keepquant wave 1: kIQ3_S (enc_sel 8) joins the set —
+      // its on-core decode is kq_vec_dot_iq3_s_q8_K
+      // (keepquant_kernel_code.h), staged as the same resident i32 word
+      // shadow (32 words = 110 B zero-padded to 128 B), dispatched on the
+      // DEFAULT path. The GSQ-RCO Qwen3.8-27B vehicle's 97 IQ3_S tensors
+      // (ffn + attn, the largest census gap) are the artifact this admits.
+      // tenstorrent-gsq-keepquant wave 2: kIQ4_XS (enc_sel 9) joins the set
+      // the same way — its on-core decode is kq_vec_dot_iq4_xs_q8_K
+      // (keepquant_kernel_code.h), staged as a resident i32 word shadow
+      // (48 words = the 136-B block zero-padded to the 192-B word grid),
+      // dispatched on
+      // the DEFAULT path. The GSQ-RCO Qwen3.8-27B vehicle's 33 IQ4_XS tensors
+      // (ssm_out + attn) are the artifact this admits: ssm_out residency is
+      // what keeps the state path on-device.
+      // tenstorrent-gsq-keepquant wave 3: kIQ2_XS (enc_sel 10) joins the set
+      // the same way — its on-core decode is kq_vec_dot_iq2_xs_q8_K
+      // (keepquant_kernel_code.h), staged as a resident i32 word shadow
+      // (32 words = the 74-B block zero-padded to the 128-B word grid, the
+      // IQ2_XXS/IQ2_S footprint), dispatched on the DEFAULT path. The
+      // GSQ-RCO Qwen3.8-27B vehicle's 32 IQ2_XS tensors (ffn) are the
+      // artifact this admits.
       return dt == vt::DType::kQ4_K || dt == vt::DType::kQ5_K ||
-             dt == vt::DType::kQ6_K || dt == vt::DType::kQ8_0;
+             dt == vt::DType::kQ6_K || dt == vt::DType::kQ8_0 ||
+             dt == vt::DType::kIQ3_XXS || dt == vt::DType::kIQ2_XXS ||
+             dt == vt::DType::kIQ2_S || dt == vt::DType::kQ3_K ||
+             dt == vt::DType::kIQ3_S || dt == vt::DType::kIQ4_XS ||
+             dt == vt::DType::kIQ2_XS;
     default:
       // CUDA falls back to the CPU kernel for anything it lacks
       // (cuda_quant_dot.cu:1841-1846); the CPU list IS the CPU capability.
@@ -261,7 +317,8 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
                               uint32_t ggml_type,
                               const std::vector<int64_t>& shape,
                               vt::DeviceType dev,
-                              std::optional<vt::DType> weight_value_dtype) {
+                              std::optional<vt::DType> weight_value_dtype,
+                              TtWeightResidency tt_residency) {
   // The oracle switch wins over everything (spec gate 2).
   if (cpu_ref) return GgufResidency::kExpandBf16;
 
@@ -317,6 +374,30 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
   if (keep_f16 && f16_consumer && KeepF16DType(ggml_type) &&
       KeepF16KDim(role, shape) > 0) {
     return GgufResidency::kKeepF16;
+  }
+
+  // 3. Tenstorrent BFP weight residency (spec
+  // .agents/specs/tenstorrent-bfp-weight-residency.md). Admits exactly the
+  // population that would otherwise fall through to kExpandBf16: an
+  // UNQUANTIZED F32/BF16 ggml weight in a verbatim GEMM/expert role. Every
+  // other role refuses by falling through — kTransformedWeight bytes are
+  // rewritten, the gather table is not a GEMM operand, vectors/conv filters
+  // have no BFP consumer — and a keep-quant/f16-eligible encoding never
+  // reaches this point (those returned above). The alignment rule is the ttnn
+  // TILE, 32 elements on BOTH dims (K via `KeepQuantKDim`, N the remaining
+  // dim), because the device conversion packs BFP tiles and the staging seam
+  // refuses a ragged shape by name — the route must agree with the seam. A
+  // ragged shape keeps the bf16 residency. The
+  // loader expands kBfp8Device exactly like kExpandBf16 — admission here
+  // decides only whether the Tenstorrent staging seam converts the staged
+  // weight to device-resident BFLOAT8_B.
+  if (tt_residency == TtWeightResidency::kBfp8 && shape.size() >= 2 &&
+      (role == GgufTensorRole::kMatmulWeight ||
+       role == GgufTensorRole::kStackedExpertWeight) &&
+      (ggml_type == 0 /* F32 */ || ggml_type == 30 /* BF16 */) &&
+      KeepQuantKDim(role, shape) > 0 && KeepQuantKDim(role, shape) % 32 == 0 &&
+      shape[shape.size() - 2] % 32 == 0) {
+    return GgufResidency::kBfp8Device;
   }
 
   return GgufResidency::kExpandBf16;
@@ -416,6 +497,17 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(
   // what the sibling compressed-tensors container of the same model runs, and
   // the GGUFs carry the `<stem>.input_scale` activation sidecars it needs.
   p.nvfp4_w4a4 = EnvOnOr("VT_GGUF_NVFP4_W4A4", true) && p.nvfp4_fp4;
+  // BACKEND-TENSTORRENT weight residency — DEFAULT OFF, opt in with
+  // VT_TT_WEIGHT_RESIDENCY=bfp8 (bfp4 is reserved and refused by name at the
+  // staging seam), and only on a load the ENGINE resolved onto
+  // kTENSTORRENT (the residency has no consumer on any other device, so
+  // electing it there would change the load for nothing). Forced off by the
+  // oracle switch like every other residency, so VT_CPU_REF=1 reproduces the
+  // historical bf16 load byte for byte.
+  p.tt_weight_residency =
+      dev == vt::DeviceType::kTENSTORRENT && !p.cpu_ref
+          ? ParseTtWeightResidency(std::getenv("VT_TT_WEIGHT_RESIDENCY"))
+          : TtWeightResidency::kOff;
   // L5. Both ride the same availability condition as the residency they refine,
   // and both are forced off by the oracle switch, so VT_CPU_REF=1 keeps
   // reproducing the historical load byte for byte and allocation for allocation.
@@ -511,7 +603,8 @@ GgufResidency GgufLoadPolicy::Route(const GgufTensorInfo& tensor,
                                     GgufTensorRole role) const {
   const GgufResidency r = RouteGgufTensor(
       keep_quant, keep_f16, nvfp4_fp4, cpu_ref, role, tensor.ggml_type,
-      tensor.shape, ComputeDeviceFor(tensor.name, role), weight_value_dtype);
+      tensor.shape, ComputeDeviceFor(tensor.name, role), weight_value_dtype,
+      tt_weight_residency);
   if (audit) audit(tensor.name, role, r);
   return r;
 }
@@ -533,7 +626,8 @@ GgufResidency PeekRoute(const GgufLoadPolicy& policy, const GgufTensorInfo& tens
   return RouteGgufTensor(policy.keep_quant, policy.keep_f16, policy.nvfp4_fp4,
                          policy.cpu_ref, role, tensor.ggml_type, tensor.shape,
                          policy.ComputeDeviceFor(tensor.name, role),
-                         policy.weight_value_dtype);
+                         policy.weight_value_dtype,
+                         policy.tt_weight_residency);
 }
 
 }  // namespace vllm

@@ -380,3 +380,273 @@ close them):**
   `output_ids_` but not `output_sizes_`. No ported case has
   `total_num_kv_heads < tp_size`, so nothing catches it; the replicated-kv TP
   case lands with the TP row that can actually run it.
+
+## W3 as specified
+
+W3 ports the LoRA metadata and mapping layer: `LoRAMapping`,
+`convert_mapping`, `compute_meta`, the sgmv prefill segmentation, and the
+`PunicaWrapperBase` state machine. W1+W2 own the kernel apply (the
+shrink/expand GEMM); W3 owns the index arithmetic that FEEDS those kernels.
+
+### Port map
+
+| New file | Ports FROM (pinned vLLM) |
+|---|---|
+| `include/vllm/lora/mapping.h` | `layers/utils.py:27-42` (`LoRAMappingType`, `LoRAMapping`), `punica_wrapper/utils.py:15-50` (`compute_meta`), `punica_wrapper/utils.py:54-160` (`convert_mapping`), `punica_wrapper/punica_base.py:124-299` (`PunicaWrapperBase` state + `update_metadata` + property accessors) |
+| `src/vllm/lora/mapping.cpp` | the same ranges |
+| `tests/vllm/lora/test_lora_mapping.cpp` | `tests/lora/utils.py:108-200` (`PunicaTensors`, `generate_data_for_nslices` — the sgmv metadata structure), `tests/lora/test_punica_ops.py:36-290` (sgmv segment clustering + reference), `tests/lora/test_layers.py:310-465` (`LoRAMapping` + `update_metadata` integration) |
+| `CMakeLists.txt` (+) | add `src/vllm/lora/mapping.cpp` to the LoRA source list (line ~736) |
+
+### Deviations (recorded per discipline)
+
+- **torch tensors → `std::vector<int64_t>`.** The four index arrays
+  (`base_indices`, `sampler_indices`, `sampler_indices_padded`,
+  `embeddings_indices`) and the sgmv metadata (`b_seq_start`, `seq_lengths`,
+  `lora_indices_per_batch`) are integer index vectors, not float compute. We
+  store them as `std::vector<int64_t>` (matching vLLM's `torch.long` dtype).
+  The pre-allocated buffer pattern (`torch.empty(max_num_batched_tokens)`)
+  becomes a `std::vector<int64_t>` sized to `max_num_batched_tokens` at
+  construction, with a length field (`indices_len`) tracking the live prefix.
+- **`async_tensor_h2d` removed.** vLLM wraps the H2D transfer in
+  `async_tensor_h2d`; we are CPU-only, so the list-to-tensor conversion is a
+  plain copy into the `std::vector`.
+- **`PunicaWrapperBase` is metadata-only.** In vLLM, `PunicaWrapperBase`
+  (punica_base.py:124) declares abstract methods `add_shrink` / `add_expand`
+  / `add_lora_linear` / `add_lora_logits` (:301-449) that the concrete
+  `PunicaWrapperCPU` implements. In vllm.cpp, the apply ops are already free
+  functions from W1+W2 (`punica.h`: `BgmvShrink`, `AddShrink`, `AddExpand`,
+  `AddLoraLinear`, `AddLoraLogits`). The W3 class owns ONLY the metadata state
+  (`update_metadata`, the four index buffers, the sgmv prefill tensors, and
+  the property accessors). It does NOT re-declare the apply methods. A later
+  wave (W5) will wire the wrapper's `token_lora_indices` accessor into the
+  free-function apply calls, completing the `PunicaWrapperCPU` equivalence.
+- **`_get_lora_device` NOT ported.** `layers/utils.py:45-60` inspects
+  `nn.Module` attributes (`weight`, `weight_packed`, `qweight`) to find the
+  torch device of the base layer's weights. vllm.cpp has no `nn.Module` or
+  `torch.device` abstraction; weight placement is decided at adapter-load time
+  (W4). `test_layers_utils.py` tests only this function, so it is SKIP-with-
+  reason, tracked to W4.
+- **`embeddings_indices` `-1` clamp.** vLLM uses
+  `torch.where(embeddings_indices == -1, max_loras - 1, embeddings_indices)`
+  (utils.py:133-135). We use a plain loop over the vector. Same semantics.
+- **`sampler_indices_padded` arithmetic.** vLLM computes
+  `arange(0, n) + sampler_indices_padded * n` (utils.py:142-144) — a batched
+  scatter index for the sampler. We port this as the same elementwise loop.
+- **`extra_vocab_size` hardcoded to 0.** vLLM's `_update_base_metadata`
+  (punica_base.py:178) sets `extra_vocab_size = 0` with a NOTE that LoRA extra
+  vocab support is removed. We mirror this: `convert_mapping` takes
+  `extra_vocab_size` as a parameter (matching the upstream signature) but
+  `UpdateMetadata` always passes 0.
+
+### Tests to port
+
+Named traceably after the upstream cases.
+
+- `utils.py::PunicaTensors` / `generate_data_for_nslices` (`:108-200`) →
+  test helper that builds a batch with per-segment LoRA indices and the
+  `b_seq_start_loc` / `seq_len_tensor` / `lora_indices_tensor` structure.
+  Ported as a C++ helper in the test file.
+- `test_punica_ops.py` sgmv segment clustering → `compute_meta` tests:
+  consecutive identical LoRA IDs collapse into one segment; `-1` sentinel
+  produces `no_lora = true` when the whole batch is `-1`; `batch_size`,
+  `max_length`, `token_nums` are computed correctly. The upstream tests reach
+  this through `generate_data_for_nslices` + `check_lora_shrink_kernel` /
+  `check_lora_expand_kernel` (`:142-290`); we test `compute_meta` directly
+  since the kernel apply is already gated in W1.
+- `test_layers.py::LoRAMapping` + `update_metadata` integration (`:310-465`)
+  → `convert_mapping` tests: a `LoRAMapping` with known `index_mapping` /
+  `prompt_mapping` produces the correct `base_indices`, `sampler_indices`,
+  `sampler_indices_padded`, `embeddings_indices`; `-1` sentinel maps to
+  `max_loras - 1` in the padded/embedding indices; `is_prefill` triggers the
+  sgmv prefill path.
+- `test_layers_utils.py` → SKIP-with-reason (`_get_lora_device` not
+  portable; tracked to W4).
+
+### Gate
+
+```sh
+cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF
+cmake --build build-cpu -j 18
+ctest --test-dir build-cpu -R 'test_lora_mapping|test_punica_cpu|test_lora_layers' --output-on-failure
+```
+
+- CPU `-Werror` clean build; `test_lora_mapping` all cases green.
+- RED-first: the absent `mapping.h` / `mapping.cpp` produces a compile
+  failure; `compute_meta` with the wrong segment count produces a test
+  failure.
+- `test_punica_cpu` (8/8) + `test_lora_layers` (16/16) still green — no
+  regressions from the new files.
+
+## W4 as specified
+
+W4 ports the LoRA adapter loading layer: `PEFTHelper`
+(adapter_config.json parsing, scaling computation, feature validation),
+`parse_fine_tuned_lora_name` (weight-name parsing with optional
+`WeightsMapper`), and `LoRAModel.from_local_checkpoint` (safetensors
+reading, unexpected-module check, tensor-to-LoRALayerWeights assignment).
+W1+W2 own the per-layer weight container and the kernel apply; W3 owns
+the index arithmetic that feeds those kernels; W4 owns the adapter
+checkpoint → `LoRAModel` path that produces the per-layer containers.
+
+### Port map
+
+| New file | Ports FROM (pinned vLLM) |
+|---|---|
+| `include/vllm/lora/peft_helper.h` | `lora/peft_helper.py:19-132` (`PEFTHelper` dataclass, `from_dict`, `from_local_dir`, `validate_legal`, `_validate_features`) |
+| `src/vllm/lora/peft_helper.cpp` | the same range |
+| `include/vllm/lora/lora_model.h` | `lora/utils.py:155-207` (`parse_fine_tuned_lora_name`), `lora/utils.py:210-216` (`is_base_embedding_weights`), `lora/lora_model.py:60-307` (`LoRAModel`, `from_lora_tensors`, `from_local_checkpoint`), `model_executor/models/utils.py` (`WeightsMapper` subset: `orig_to_new_prefix`, `orig_to_new_substr`, `_map_name`) |
+| `src/vllm/lora/lora_model.cpp` | the same ranges |
+| `tests/vllm/lora/test_peft_helper.cpp` | `tests/lora/test_peft_helper.py:1-116` (3 test functions, 5 error cases, 3 invalid-rank cases) |
+| `tests/vllm/lora/test_lora_checkpoints.cpp` | `tests/lora/test_lora_checkpoints.py:1-156` (`parse_fine_tuned_lora_name` cases, `test_load_checkpoints`, `test_lora_weights_mapping`, `test_gemma4_lora_weights_mapping`, `test_gemma4_moe_lora_weights_mapping`) |
+| `CMakeLists.txt` (+) | add `src/vllm/lora/peft_helper.cpp` and `src/vllm/lora/lora_model.cpp` to the LoRA source list |
+| `tests/CMakeLists.txt` (+) | add `test_peft_helper` and `test_lora_checkpoints` test registrations |
+
+### Deviations (recorded per discipline)
+
+- **`tensorizer_config` NOT ported.** vLLM's `from_local_dir`
+  (peft_helper.py:83-116) and `from_local_checkpoint`
+  (lora_model.py:244-258) accept a `tensorizer_config_dict` for
+  tensorizer-streamed checkpoints. Tensorizer is a Python-only
+  serialization library with no C++ equivalent in this tree. The plain
+  `adapter_config.json` file-read path is ported; the tensorizer branch
+  is not. A caller that needs it gets a clear "not supported" error.
+
+- **`.bin` / `.pt` checkpoint loading NOT ported.** vLLM's
+  `from_local_checkpoint` (lora_model.py:278-294) falls back to
+  `torch.load` for `.bin`/`.pt` files. These are Python pickle format
+  and have no C++ reader here. Only `adapter_model.safetensors` is
+  supported, which is the format PEFT writes by default. A missing
+  safetensors file raises `std::runtime_error`, mirroring upstream's
+  "doesn't contain tensors" error (lora_model.py:296).
+
+- **`LoRAConfig` NOT ported; `validate_legal` takes `max_lora_rank`
+  directly.** vLLM's `validate_legal` (peft_helper.py:118-132) takes a
+  `LoRAConfig` object and checks `self.r > lora_config.max_lora_rank`.
+  The typed `LoRAConfig` lands with the manager (W5). W4's
+  `ValidateLegal` takes `int max_lora_rank` and performs the same check.
+  This is a narrowing, not a behavior change.
+
+- **`get_lora_id()` ported as `GetLoraId()`.** vLLM's
+  `from_local_checkpoint` (lora_model.py:299) auto-assigns a model id
+  when `lora_model_id` is `None` via a global counter (`get_lora_id`).
+  The counter is ported as `GetLoraId()` (a monotonic static local). W4
+  still requires the caller to supply `lora_model_id` explicitly; the
+  auto-assign path that uses `GetLoraId()` when no id is given is wired
+  in W5 with the manager. A non-positive id raises
+  `std::invalid_argument`, mirroring upstream's `assert lora_model_id >
+  0` (lora_model.py:83) but as a runtime check so it survives a
+  Release build.
+
+- **`device` / `dtype` / `pin_memory` NOT ported.** vLLM moves tensors
+  to a device and casts dtype during load (lora_model.py:129, 155-162).
+  vllm.cpp is CPU-only and stores weights as `float`; there is no device
+  placement or dtype cast. The `device` parameter is dropped from the
+  C++ signature. `pin_memory` is a CUDA host-allocation concern that
+  does not apply.
+
+- **`weights_mapper` simplified.** vLLM's `WeightsMapper`
+  (models/utils.py) supports prefix, suffix, and regex mappings. W4
+  ports only `orig_to_new_prefix` and `orig_to_new_substr` (the two
+  kinds the LoRA tests exercise). Regex mapping is not needed for any
+  LoRA checkpoint format.   The `_map_name` method applies substring
+  replacement then prefix replacement, matching upstream's order
+  (models/utils.py:108-113 substr first, 121-126 prefix second).
+
+- **`target_modules` as `std::vector<std::string>`.** vLLM's
+  `target_modules` can be a `str` or `list[str]`
+  (peft_helper.py:30). PEFT writes it as a list in
+  adapter_config.json. The C++ port stores `std::vector<std::string>`
+  and handles a JSON string by wrapping it in a one-element list, so a
+  single-module config works.
+
+- **`model_vocab_size` embedding check kept.** vLLM's
+  `from_lora_tensors` (lora_model.py:146-154) raises `RuntimeError`
+  when the embedding LoRA's input size does not match the model vocab
+  size. This check is ported: `FromLoraTensors` takes an optional
+  `model_vocab_size` and raises on mismatch.
+
+- **`MoEEPLoadSpec` NOT ported.** The `moe_ep_spec` parameter
+  (lora_model.py:180, 273-294) skips non-local expert tensors during
+  expert-parallel loading. FusedMoE LoRA is W7. The parameter is absent
+  from the C++ signature.
+
+- **`skip_prefixes` ported.** The `skip_prefixes` parameter
+  (lora_model.py:126, 195, 220-224) skips modules like MTP layers
+  during loading. `ShouldSkipModule` checks whether a tensor name
+  starts with any skip prefix. `FromLoraTensors` and
+  `FromLocalCheckpoint` both accept `skip_prefixes` and skip matching
+  tensors. No vllm.cpp model defines skip prefixes yet, but the
+  parameter is wired and tested.
+
+- **`is_base_embedding_weights` ported but always returns false in
+  practice.** vLLM skips tensors whose names end in
+  `.embed_tokens.base_layer.weight` or `.lm_head.base_layer.weight`
+  (utils.py:210-216) because the base embedding weights are not LoRA
+  weights. A PEFT safetensors checkpoint never contains these keys
+  (they are base-model weights, not adapter weights). The function is
+  ported for parity and exercised by a test, but the skip branch never
+  fires on a real adapter checkpoint.
+
+### Tests to port
+
+Named traceably after the upstream cases.
+
+- `test_peft_helper_pass` (`:30-72`) → `FromLocalDir` with a synthetic
+  `adapter_config.json` written to a temp directory. Verify `r`,
+  `lora_alpha`, `target_modules`, `vllm_max_position_embeddings`.
+  Test rsLoRA scaling (`alpha / sqrt(r)`) by modifying the config and
+  reloading. Test normal scaling (`alpha / r`).
+
+- `test_peft_helper_error` (`:75-101`) → 5 parametric error cases:
+  rank > max_lora_rank, use_dora, modules_to_save, r=0, r=-8. Each
+  writes a modified config to a temp dir and expects `ValidateLegal`
+  (or construction) to throw with the upstream error message.
+
+- `test_peft_helper_invalid_rank_direct` (`:104-116`) → direct
+  construction with `r` ∈ {0, -1, -8}, expecting a "must be a positive
+  integer" error.
+
+- `test_load_checkpoints` (`:29-102`) → create a synthetic
+  `adapter_model.safetensors` with known lora_A/lora_B tensors, load it
+  via `FromLocalCheckpoint`, verify the `LoRAModel` has the expected
+  modules. Test the unexpected-modules error path with mismatched
+  `expected_lora_modules`.
+
+- `test_lora_weights_mapping` (`:105-135`) → load with a `WeightsMapper`
+  that does prefix and substring substitution, verify the loaded module
+  names reflect the mapping.
+
+- `test_gemma4_lora_weights_mapping` (`:138-144`) → call
+  `ParseFineTunedLoraName` with a `WeightsMapper` and verify the
+  `(module_name, is_lora_a)` result.
+
+- `test_gemma4_moe_lora_weights_mapping` (`:147-156`) → same but with a
+  MoE expert name pattern.
+
+### Gate
+
+```sh
+cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF
+cmake --build build-cpu -j 18
+ctest --test-dir build-cpu -R 'test_peft_helper|test_lora_checkpoints|test_lora_mapping|test_punica_cpu|test_lora_layers' --output-on-failure
+```
+
+- CPU `-Werror` clean build; `test_peft_helper` + `test_lora_checkpoints`
+  all cases green.
+- RED-first: the absent `peft_helper.h` / `lora_model.h` produces a
+  compile failure; `PEFTHelper` with `r=0` produces a runtime error.
+- `test_punica_cpu` (8/8) + `test_lora_layers` (16/16) +
+  `test_lora_mapping` (18/18) still green — no regressions from the new
+  files.
+
+### Owed
+
+- `_get_lora_device` (layers/utils.py:45-60): needs `nn.Module` /
+  `torch.device`; tracked to W5 (the manager decides placement).
+- `LoRAConfig` (config/lora.py): typed config object; tracked to W5.
+- `get_lora_id()` global counter: tracked to W5.
+- `skip_prefixes`: tracked to W5.
+- `ExpandPackedLora` test: needs a checkpoint with fewer groups than
+  slices, which `FromLocalCheckpoint` can now produce. The test belongs
+  with the layer test suite (W2 territory) but the checkpoint comes
+  from W4. Recorded as a gap; not closed in W4.

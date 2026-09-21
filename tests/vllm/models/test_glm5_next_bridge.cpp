@@ -460,9 +460,11 @@ TEST_CASE("glm5_next bridge: EVERY block dtype this build knows has a decoder") 
     CHECK(vt::cpu::BlockToFloat(d) != nullptr);
   }
   // A loop that found nothing would pass vacuously, which is the mute-switch
-  // shape this repository names. The build carries 19 block encodings (IQ3_S
-  // joined with QUANT-IQ3S, #2510).
-  CHECK(block_dtypes == 19);
+  // shape this repository names. The build carries 20 block encodings: IQ3_S
+  // joined with QUANT-IQ3S (#2510), and IQ1_M — which sits between kIQ1_S and
+  // kIQ1_XXXS in the enum, inside this loop's bound — joined with e71f6d6fd
+  // (feat(quant): IQ1_M), moving the census 19 -> 20.
+  CHECK(block_dtypes == 20);
   MESSAGE("block dtypes with a CPU decoder: " << block_dtypes);
 }
 
