@@ -1892,13 +1892,21 @@ void GdnTokenStep(Tensor& out, const Tensor& q_in, const Tensor& k_in, const Ten
 // the allocation is once per thread, not once per chunk.
 struct GdnChunkScratch {
   std::vector<float> G, eG, A, Ai, vb, kbg, u, w, hb, vnew, vdec, Ao;
+  // VT-CPU-ELEM-DISPATCH for GDN: the chunk's q/k/v rows widened to f32 once.
+  // Every read of them below was a `LoadF32`, i.e. a per-element switch on
+  // `t.dtype` plus a per-element recomputation of a loop-invariant base offset.
+  // Sized bt*d rather than n*d so the buffers are allocated once with the rest
+  // of the scratch and never resized inside the chunk loop.
+  std::vector<float> qf, kf, vf;
   GdnChunkScratch(int64_t bt, int64_t dk, int64_t dv)
       : G(static_cast<size_t>(bt)), eG(static_cast<size_t>(bt)),
         A(static_cast<size_t>(bt * bt), 0.0f), Ai(static_cast<size_t>(bt * bt), 0.0f),
         vb(static_cast<size_t>(bt * dv)), kbg(static_cast<size_t>(bt * dk)),
         u(static_cast<size_t>(bt * dv)), w(static_cast<size_t>(bt * dk)),
         hb(static_cast<size_t>(dv * dk)), vnew(static_cast<size_t>(bt * dv)),
-        vdec(static_cast<size_t>(bt * dv)), Ao(static_cast<size_t>(bt * bt), 0.0f) {}
+        vdec(static_cast<size_t>(bt * dv)), Ao(static_cast<size_t>(bt * bt), 0.0f),
+        qf(static_cast<size_t>(bt * dk)), kf(static_cast<size_t>(bt * dk)),
+        vf(static_cast<size_t>(bt * dv)) {}
 };
 
 // ===========================================================================
@@ -1994,8 +2002,29 @@ void GdnChunkedHeadPrefill(Tensor& out, const Tensor& q_in, const Tensor& k_in,
                            int64_t hk_n, int64_t hv_n, int64_t dk, int64_t dv, float scale,
                            GdnChunkScratch& s) {
   const int64_t bt = kGdnChunk;
+  // Refuse EXACTLY as the per-element path did, and before anything is read:
+  // `WidenRowToF32` says "matmul: unsupported elementwise dtype" while
+  // `LoadF32` says "LoadF32: unsupported dtype", and the message is part of the
+  // behaviour. This is the same reason `AttnResolveOrRefuse` exists (:129-134).
+  {
+    AttnDotFn dot_unused;
+    AttnAccumFn accum_unused;
+    AttnResolveOrRefuse(q_in, &dot_unused, &accum_unused);
+    AttnResolveOrRefuse(k_in, &dot_unused, &accum_unused);
+    AttnResolveOrRefuse(v_in, &dot_unused, &accum_unused);
+  }
   for (int64_t c0 = t0; c0 < t1; c0 += bt) {
     const int64_t n = std::min(bt, t1 - c0);
+    // ONE dtype branch per row instead of one per element, and the base offset
+    // resolved once instead of inside every innermost loop.
+    for (int64_t i = 0; i < n; ++i) {
+      WidenRowToF32(q_in.dtype, ElemPtr(q_in, ((c0 + i) * hk_n + hk) * dk), dk,
+                    s.qf.data() + i * dk);
+      WidenRowToF32(k_in.dtype, ElemPtr(k_in, ((c0 + i) * hk_n + hk) * dk), dk,
+                    s.kf.data() + i * dk);
+      WidenRowToF32(v_in.dtype, ElemPtr(v_in, ((c0 + i) * hv_n + hv) * dv), dv,
+                    s.vf.data() + i * dv);
+    }
     // --- chunk_local_cumsum (cumsum.py): inclusive prefix sum of g, f32.
     float acc = 0.0f;
     for (int64_t i = 0; i < n; ++i) {
@@ -2012,9 +2041,9 @@ void GdnChunkedHeadPrefill(Tensor& out, const Tensor& q_in, const Tensor& k_in,
       const float b_i = beta.Ptr<float>()[(c0 + i) * hv_n + hv];
       for (int64_t j = 0; j < i; ++j) {
         float d = 0.0f;
-        for (int64_t x = 0; x < dk; ++x)
-          d += LoadF32(k_in, ((c0 + i) * hk_n + hk) * dk + x) *
-               LoadF32(k_in, ((c0 + j) * hk_n + hk) * dk + x);
+        const float* krow_i = s.kf.data() + i * dk;
+        const float* krow_j = s.kf.data() + j * dk;
+        for (int64_t x = 0; x < dk; ++x) d += krow_i[x] * krow_j[x];
         s.A[static_cast<size_t>(i * bt + j)] =
             b_i * d * std::exp(s.G[static_cast<size_t>(i)] - s.G[static_cast<size_t>(j)]);
       }
@@ -2043,10 +2072,10 @@ void GdnChunkedHeadPrefill(Tensor& out, const Tensor& q_in, const Tensor& k_in,
       const float b_i = beta.Ptr<float>()[(c0 + i) * hv_n + hv];
       for (int64_t x = 0; x < dv; ++x)
         s.vb[static_cast<size_t>(i * dv + x)] =
-            Bf16(LoadF32(v_in, ((c0 + i) * hv_n + hv) * dv + x) * b_i);
+            Bf16(s.vf[static_cast<size_t>(i * dv + x)] * b_i);
       for (int64_t x = 0; x < dk; ++x)
         s.kbg[static_cast<size_t>(i * dk + x)] =
-            Bf16(LoadF32(k_in, ((c0 + i) * hk_n + hk) * dk + x) * b_i *
+            Bf16(s.kf[static_cast<size_t>(i * dk + x)] * b_i *
                  s.eG[static_cast<size_t>(i)]);
     }
     for (int64_t i = 0; i < n; ++i) {
@@ -2092,7 +2121,7 @@ void GdnChunkedHeadPrefill(Tensor& out, const Tensor& q_in, const Tensor& k_in,
         float a = hrow[ki] * decay_last;
         for (int64_t i = 0; i < n; ++i)
           a += s.vdec[static_cast<size_t>(i * dv + vi)] *
-               LoadF32(k_in, ((c0 + i) * hk_n + hk) * dk + ki);
+               s.kf[static_cast<size_t>(i * dk + ki)];
         hrow[ki] = a;
       }
     }
@@ -2104,9 +2133,9 @@ void GdnChunkedHeadPrefill(Tensor& out, const Tensor& q_in, const Tensor& k_in,
     for (int64_t i = 0; i < n; ++i) {
       for (int64_t j = 0; j <= i; ++j) {
         float d = 0.0f;
-        for (int64_t x = 0; x < dk; ++x)
-          d += LoadF32(q_in, ((c0 + i) * hk_n + hk) * dk + x) *
-               LoadF32(k_in, ((c0 + j) * hk_n + hk) * dk + x);
+        const float* qrow_i = s.qf.data() + i * dk;
+        const float* krow_j = s.kf.data() + j * dk;
+        for (int64_t x = 0; x < dk; ++x) d += qrow_i[x] * krow_j[x];
         s.Ao[static_cast<size_t>(i * bt + j)] =
             Bf16(d * std::exp(s.G[static_cast<size_t>(i)] - s.G[static_cast<size_t>(j)]));
       }
@@ -2114,9 +2143,9 @@ void GdnChunkedHeadPrefill(Tensor& out, const Tensor& q_in, const Tensor& k_in,
     for (int64_t i = 0; i < n; ++i) {
       for (int64_t vi = 0; vi < dv; ++vi) {
         float cross = 0.0f;
+        const float* qrow_c = s.qf.data() + i * dk;
         for (int64_t ki = 0; ki < dk; ++ki)
-          cross += LoadF32(q_in, ((c0 + i) * hk_n + hk) * dk + ki) *
-                   s.hb[static_cast<size_t>(vi * dk + ki)];
+          cross += qrow_c[ki] * s.hb[static_cast<size_t>(vi * dk + ki)];
         float intra = 0.0f;
         for (int64_t j = 0; j <= i; ++j)
           intra += s.Ao[static_cast<size_t>(i * bt + j)] * s.vnew[static_cast<size_t>(j * dv + vi)];
