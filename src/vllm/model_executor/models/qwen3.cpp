@@ -365,9 +365,11 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
     *out_hidden = std::move(dhid);
   }
 
-  // lm_head. Tied (Qwen3-0.6B): logits = hidden @ embed_tokens^T via MatmulBT
-  // over the [vocab,H] embed table (== [N=vocab,K=H]). Untied: the loaded
-  // Matmul-B [H,vocab] lm_head via vt::Matmul.
+  // lm_head. Tied (Qwen3-0.6B safetensors): logits = hidden @ embed_tokens^T via
+  // MatmulBT over the [vocab,H] embed table (== [N=vocab,K=H]). Untied: it
+  // depends on WHICH LOADER built the head -- safetensors gives [H,vocab]
+  // ([K,N], nk=false) and GGUF gives [vocab,H] ([N,K], nk=true) -- so the
+  // dispatch below reads the layout rather than assuming one.
   // QUANT-EXL3 (#2181): an EXL3 checkpoint ships a REAL quantized head and does
   // not tie it. Its width is its own -- 6-bit against a 3-bit body in the
   // published 3.0bpw quant -- which is why nothing here reads a config scalar.
@@ -378,7 +380,27 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   Tensor lm = tied ? ResidentWeight(d, weights.embed_tokens, {vocab, H})
                    : ResidentWeight(d, weights.lm_head);
   DBuf logits(d, DType::kF32, {n_out, vocab});
-  if (tied)
+  // Dispatch on the WEIGHT'S LAYOUT, not on whether the head is tied.
+  //
+  // `tied` and "[N,K]" used to be the same question here because only one
+  // loader reached this line: safetensors hands an untied head over as
+  // [H,vocab] = [K,N], so `tied` predicted the layout exactly. The GGUF loader
+  // does not -- `OwnMatmulWeight` sets nk=true on the expand path, so its
+  // untied head arrives as [vocab,H] = [N,K] -- and the two disagreed silently
+  // until a real file was fed in:
+  //   vt: matmul: inner dims mismatch: a[1, 1024] x b[151936, 1024]
+  // That is Qwen3-0.6B's lm_head, sent to the [K,N] op with an [N,K] weight.
+  //
+  // The sibling arm already dispatches this way (qwen3_5.cpp:3323,
+  // `lm_head.nk ? ... : ...`), so this is the family's own convention arriving
+  // here rather than a new rule.
+  //
+  // Read it from the OwnedTensor: `lm` is a vt::Tensor view and carries no nk.
+  // `tied ||` stays and is load-bearing: the tied head is the EMBED TABLE,
+  // which is [vocab,H] and carries nk=false by construction
+  // (LoadEmbedAndHead sets it), so layout alone would misroute it. Untied
+  // safetensors keeps nk=false and keeps taking vt::Matmul, unchanged.
+  if (tied || weights.lm_head.nk)
     vt::MatmulBT(d.q, logits.t(), src, lm);
   else
     vt::Matmul(d.q, logits.t(), src, lm);

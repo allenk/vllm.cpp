@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 // CheckConvCommon asks the BACKEND whether it can address a compressed
@@ -137,6 +138,24 @@ KernelTensorDesc Describe(const Tensor& tensor, ScalarTypeId semantic_type,
   return desc;
 }
 
+// Render a tensor's shape as "[a, b]" for an error message.
+//
+// WHY THIS EXISTS: the four guards below used to say only "inner dims mismatch",
+// which names the KIND of fault and nothing about the fault. Diagnosing one then
+// meant rebuilding with prints, and on a remote board that is a whole round trip
+// per question. Found while chasing a Qwen3 GGUF that died at `matmul: inner
+// dims mismatch` with no way to tell WHICH matmul or with what. The message is
+// the cheapest place to put the answer, and every future shape fault anywhere in
+// the engine now carries it.
+std::string ShapeStr(const Tensor& t) {
+  std::string s = "[";
+  for (int i = 0; i < t.rank; ++i) {
+    if (i != 0) s += ", ";
+    s += std::to_string(t.shape[i]);
+  }
+  return s + "]";
+}
+
 WorkspaceKey MakeWorkspaceKey(const Queue& q, OpId op, WorkspaceSlot slot) {
   VT_CHECK(q.id != 0, "workspace key requires a live queue identity");
   return WorkspaceKey{q.device, q.id, reinterpret_cast<uintptr_t>(q.handle), op, slot};
@@ -145,9 +164,12 @@ WorkspaceKey MakeWorkspaceKey(const Queue& q, OpId op, WorkspaceSlot slot) {
 void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   ValidateWeightValues(b, a, out, q);
   VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2, "matmul: rank-2 tensors required");
-  VT_CHECK(a.shape[1] == b.shape[0], "matmul: inner dims mismatch");
+  VT_CHECK(a.shape[1] == b.shape[0],
+           "matmul: inner dims mismatch: a" + ShapeStr(a) + " x b" +
+               ShapeStr(b) + " (a.shape[1] must equal b.shape[0])");
   VT_CHECK(out.shape[0] == a.shape[0] && out.shape[1] == b.shape[1],
-           "matmul: output shape mismatch");
+           "matmul: output shape mismatch: out" + ShapeStr(out) +
+               " for a" + ShapeStr(a) + " x b" + ShapeStr(b));
   VT_CHECK(IsFloat(a.dtype) && IsFloat(b.dtype) && IsOutFloat(out.dtype),
            "matmul: float inputs and f32/bf16 output required");
   VT_CHECK(a.IsContiguous() && b.IsContiguous() && out.IsContiguous(),
@@ -194,9 +216,12 @@ void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
     return;
   }
   VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2, "matmul_bt: rank-2 tensors required");
-  VT_CHECK(a.shape[1] == b.shape[1], "matmul_bt: inner dims mismatch (b is [N,K])");
+  VT_CHECK(a.shape[1] == b.shape[1],
+           "matmul_bt: inner dims mismatch (b is [N,K]): a" + ShapeStr(a) +
+               " x b" + ShapeStr(b) + " (a.shape[1] must equal b.shape[1])");
   VT_CHECK(out.shape[0] == a.shape[0] && out.shape[1] == b.shape[0],
-           "matmul_bt: output shape mismatch");
+           "matmul_bt: output shape mismatch: out" + ShapeStr(out) +
+               " for a" + ShapeStr(a) + " x bT, b" + ShapeStr(b));
   VT_CHECK(IsFloat(a.dtype) && IsFloat(b.dtype) && IsOutFloat(out.dtype),
            "matmul_bt: float inputs and f32/bf16 output required");
   // The ACTIVATION may be ROW-STRIDED (relaxed at MLA campaign W6): upstream's
