@@ -54,12 +54,15 @@ REGISTER_RE = re.compile(
 )
 
 # Every registrable architecture string ends in one of these HF class suffixes
-# (or the GLiNER2 "Extractor" suffix); the arch key in the FEATURES table is
-# written verbatim in backticks. If a future registered arch stops matching this,
-# the self-check below fails loudly rather than silently dropping it.
+# (or the GLiNER2 "Extractor" / cua-s1 "Forms" suffixes); the arch key in the
+# FEATURES table is written verbatim in backticks. If a future registered arch
+# stops matching this, the self-check below fails loudly rather than silently
+# dropping it -- which is exactly what happened when "CuaS1Forms" arrived with
+# the 2026-09-23 upstream sync, so the loud-failure branch is load-bearing and
+# has now been exercised once in anger.
 ARCH_TOKEN_RE = re.compile(
     r"`([A-Za-z0-9_]+(?:For(?:CausalLM|ConditionalGeneration|CTC|RNNT|TDT)"
-    r"|Model|Extractor))`"
+    r"|Model|Extractor|Forms))`"
 )
 
 

@@ -60,7 +60,7 @@ by #2794 (goldens predate the pin) and #2817 (the advance).
 | Embeddable behind a C ABI | ✅ | ☐ | ☐ | ✅ |
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
-| Architectures | 44 registered, 27 gated | 130+ | 100+ | 100+ |
+| Architectures | 47 registered, 27 gated | 130+ | 100+ | 100+ |
 | Downloadable server binaries | ✅ v0.0.2: eight indexed archives with checksums, provenance, manifests, and SBOMs. Windows ZIP downloads do not exist; native CPU/Vulkan lanes await hosted runtime, dry-run, prerelease, and authenticated audit gates | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
 | Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, central `NOMINMAX`, UTF-8, aligned allocation, C++20 `std::numbers` pi, runtime ISA dispatch. Local closure includes the float-domain DeepSeek probe; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
 
@@ -137,7 +137,7 @@ by #2794 (goldens predate the pin) and #2817 (the advance).
 The supported set is exactly what the C++ registry registers: every
 architecture self-registers via `REGISTER_VLLM_MODEL`, and
 `scripts/check-supported-models.py` gates this list against the source so it
-cannot drift. Today that is **44 registered architectures**. Each row names the
+cannot drift. Today that is **47 registered architectures**. Each row names the
 checkpoint it was gated against and the verdict; caveats are in
 [Project status](../README.md#project-status), agent detail in `.agents/model-matrix.md`. A mergeable
 gate/up MLP routes through one shared merged-GEMM method, so a tuned arm added
@@ -197,6 +197,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `LlamaModel` | landed tiny synthetic embedding fixture (engine path == direct pooler path, identical vectors; f64 LAST+normalize reference); real checkpoint (e5-mistral class) is a NAMED residual | pooling/embed only, text paths refuse by task; `vllm_embed` + `/v1/embeddings` | n/a (CPU correctness-grade embeddings) |
 | `ParakeetForCTC`, `ParakeetForRNNT`, `ParakeetForTDT` | nvidia/parakeet-ctc-0.6b/-1.1b, -rnnt-0.6b, -tdt-0.6b-v3 (transcribed, ids exact vs HF `generate()`, P4/P6 2026-08-07; not retained) + committed synthetic fold fixture | ASR transcription-only (`SupportsTranscription` mirror; text paths refuse by task); fold gate byte-identical to the pre-refactor pipeline | n/a (CPU correctness-grade ASR via `vllm_transcribe` + `/v1/audio/transcriptions`) |
 | `CohereForCausalLM` | Command-R / Cohere (and Cohere2) | scaffold: W0 tiny-random oracle run-verified; real-checkpoint gate blocked | no run |
+| `CuaS1Forms` | `cua-ai/cua-s1-forms` (TinyTransformerScorer option scorer, 706,048 params / 2.8 MB; POOLING model — `/v1/score`, not generation) | gate per [spec](../.agents/specs/cua-s1-forms.md): logits and probabilities within `1e-5` of the reference Python model on the published checkpoint (`tests/vllm/models/test_cua_s1.cpp` + `cua_s1_goldens.inc`) | no speed claim; the forward function throws by design — scoring runs through `CuaS1ScoreInference`, not a decode loop. **No upstream vLLM registration exists** (vLLM has no TinyTransformerScorer), so this arm has no vLLM oracle and is gated against the `trycua/cua` reference instead |
 | `BoundaryExtractor` | `fastino/gliner2.5-multi-v1` (GLiNER2.5 zero-shot NER; POOLING model — `vllm_embed`, not generation) | gate per [spec](../.agents/specs/gliner2.5.md): entity-exact vs the `vllm-factory` oracle (e2e test `tests/vllm/models/test_gliner2_e2e.cpp`) | forward-only encoder; no decode-loop speed claim |
 | `DeepseekV41ForCausalLM` | none loadable yet | **REGISTERED AND VALIDATING; NOT LOADABLE** (W1, 2026-09-13) per [model-matrix](../.agents/model-matrix.md) and [spec](../.agents/specs/deepseek-v4-1-flash.md): the architecture resolves through the registry while the load plan is validated; no token claim | not measured |
 <!-- supported-arch-table:end -->
@@ -263,7 +264,7 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 
 27 of the 40 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
-(The 44 registered total also covers 3 Parakeet ASR entry points and the
+(The 47 registered total also covers 3 Parakeet ASR entry points and the
 `LlamaModel` embedding arch, which are not text generation.)
 vLLM registers 130+ text architectures, so this is a curated, gated subset, not
 a breadth claim. The first EMBEDDING architecture is registered and live
