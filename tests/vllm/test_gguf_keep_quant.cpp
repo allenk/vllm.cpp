@@ -725,7 +725,7 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
             type == kQ2_K || type == kQ4_K || type == kQ5_K ||
             type == kQ6_K || type == kIQ2_XXS || type == kIQ2_XS ||
             type == kIQ3_XXS || type == kIQ1_S || type == kIQ4_NL ||
-            type == kIQ2_S || type == kIQ4_XS ||
+            type == kIQ2_S || type == kIQ4_XS || type == kIQ3_S ||
             type == kMXFP4 || type == kIQ1_XXXS;
         const bool rocm = kRouteDev == vt::DeviceType::kROCM;
         // QUANT-GGUF-IQ4_NL adds kIQ4_NL to the ROCm set. It is the one entry
@@ -766,13 +766,10 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
         // actually registered. It cannot be hand-enumerated like `cpu_capable`
         // above, because whether the CUDA registrar is linked is a property of
         // the build and not of the encoding.
-        // IQ3_S has a `to_float` and NO `vec_dot`, so it is gather-capable and
-        // GEMM-incapable — the surplus Q8_K used to hold alone. It is a FILE
-        // encoding, which Q8_K is not, so this is the term that decides whether
-        // 4 of an 866-tensor artifact's weights stay compressed on the gather
-        // while expanding on the GEMM (#2510).
+        // IQ3_S dotted with aa85e9484, so it left the gather-only surplus and
+        // Q8_K holds that role alone again.
         const bool gather_cpu_capable =
-            cpu_capable || type == kQ8_K || type == kIQ3_S;
+            cpu_capable || type == kQ8_K;
         // THE MERGED FORM, which was in neither branch. #2396 made the gather
         // build-dependent and asked the OP REGISTRY instead of hard-coding
         // "CPU only" — correct, and this row keeps it. But it asked about
