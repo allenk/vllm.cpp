@@ -487,11 +487,35 @@ Qwen3DenseWeights LoadQwen3FromGguf(const GgufFile& gguf,
                   GgufTensorRole::kTransformedWeight);
     layer.input_layernorm =
         OwnBf16(gguf, Blk(il, "attn_norm.weight"), {config.hidden_size});
-    RequireExpand(pol, gguf, Blk(il, "post_attention_norm.weight"),
+    // The post-attention layernorm has TWO spellings, and this arm read only
+    // the one no published Qwen3 GGUF uses. llama.cpp's converter -- which is
+    // what every `Qwen3-*.gguf` on the hub comes out of -- names it
+    // `blk.N.ffn_norm.weight`; `post_attention_norm.weight` is this tree's own
+    // renaming, applied by its converters (muse_glimmer_gguf_weights.cpp:568
+    // maps `post_attention_layernorm.weight` to it).
+    //
+    // MEASURED against a real file, not inferred: `Qwen3-0.6B-BF16.gguf`,
+    // 311 tensors, `general.architecture = qwen3`, refused with
+    //   gguf: no tensor named "blk.0.post_attention_norm.weight"
+    // Its blk.0 carries exactly eleven tensors and this loader asks for exactly
+    // eleven, and the two sets differ in this ONE element; the three non-block
+    // names (token_embd, output_norm, output) match exactly. A Qwen3 layer has
+    // exactly two layernorms, `attn_norm` is already claimed as the input one,
+    // so `ffn_norm` is the only tensor `post_attention_layernorm` can be.
+    //
+    // WHY THE TEST DID NOT CATCH IT: test_qwen3_gguf_weights.cpp builds a
+    // SYNTHETIC GGUF and writes whichever name this file reads (line 109), so
+    // it agrees with the loader by construction and is blind to the question.
+    // A control that shares the bug is not a control. The test now builds both
+    // spellings.
+    const std::string post_attn_norm =
+        HasTensor(gguf, Blk(il, "ffn_norm.weight"))
+            ? Blk(il, "ffn_norm.weight")
+            : Blk(il, "post_attention_norm.weight");
+    RequireExpand(pol, gguf, post_attn_norm,
                   GgufTensorRole::kTransformedWeight);
     layer.post_attention_layernorm =
-        OwnBf16(gguf, Blk(il, "post_attention_norm.weight"),
-                {config.hidden_size});
+        OwnBf16(gguf, post_attn_norm, {config.hidden_size});
 
     // Attention: load q/k/v separately, then merge into one qkv_proj.
     // The merged weight is ALWAYS bf16 expand (no keep-quant for merged

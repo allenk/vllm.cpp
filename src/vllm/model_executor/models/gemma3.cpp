@@ -576,7 +576,15 @@ ForwardLogits Gemma3DecodeGraph::Step(const ModelForwardInput& in) {
   }
   if (new_inputs) {
     s.Reset();
-    s.columns = std::max<int64_t>(in.attn_meta.block_table_num_cols, in.attn_kv.front().num_blocks);
+    // `s.columns` is int (line 535) and feeds `block_table_num_cols`, which is
+    // int too, so the narrowing is inherent to the destination rather than a
+    // loss this line invents -- but it must be SPELLED, because MSVC raises
+    // C4244 at /W3 and this tree compiles warnings as errors. GCC and Clang
+    // say nothing by default, which is why all three Linux lanes were green
+    // while all three Windows lanes died here (run 35855557148). The cast
+    // matches what line 583 already does two lines below.
+    s.columns = static_cast<int>(std::max<int64_t>(
+        in.attn_meta.block_table_num_cols, in.attn_kv.front().num_blocks));
     s.cache = in.attn_kv;
     s.metadata = in.attn_meta;
     s.metadata.block_table_num_cols = s.columns;

@@ -81,7 +81,15 @@ void AddF32(GgufModelBuilder& b, const std::string& name,
 const int64_t kQOff = 0, kKOff = 1, kVOff = 2;
 const int64_t kGateOff = 3, kUpOff = 4;
 
-std::string BuildGguf(const Dims& d, bool tied, bool with_qk_norm) {
+// `stock_norm_name` picks which spelling of the post-attention layernorm the
+// fixture writes. TRUE is llama.cpp's `blk.N.ffn_norm.weight`, which is what
+// every published Qwen3 GGUF actually contains; FALSE is this tree's own
+// `post_attention_norm.weight`. Before 2026-09-23 this fixture only ever wrote
+// the second one -- the same name the loader read -- so the suite agreed with
+// the loader by construction and could not see that no real file loads. A
+// control that shares the bug is not a control.
+std::string BuildGguf(const Dims& d, bool tied, bool with_qk_norm,
+                      bool stock_norm_name = true) {
   GgufModelBuilder b;
   const std::string p = "qwen3.";
   b.AddKv(StrKv("general.architecture", "qwen3"));
@@ -106,7 +114,8 @@ std::string BuildGguf(const Dims& d, bool tied, bool with_qk_norm) {
 
   for (int64_t l = 0; l < d.n_layer; ++l) {
     AddF32(b, Blk(l, "attn_norm.weight"), {d.H});
-    AddF32(b, Blk(l, "post_attention_norm.weight"), {d.H});
+    AddF32(b, Blk(l, stock_norm_name ? "ffn_norm.weight"
+                                     : "post_attention_norm.weight"), {d.H});
     AddF32(b, Blk(l, "attn_q.weight"), {q_rows, d.H}, kQOff);
     AddF32(b, Blk(l, "attn_k.weight"), {kv_rows, d.H}, kKOff);
     AddF32(b, Blk(l, "attn_v.weight"), {kv_rows, d.H}, kVOff);
@@ -171,6 +180,30 @@ TEST_CASE("Qwen3HfConfigFromGguf: rejects wrong architecture") {
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   CHECK_THROWS(vllm::Qwen3HfConfigFromGguf(g));
   CHECK_FALSE(vllm::IsQwen3Gguf(g));
+}
+
+// Both spellings of the post-attention layernorm load. The stock name is the
+// one that matters -- a real Qwen3-0.6B-BF16.gguf
+// (311 tensors) was REFUSED by this loader with
+//   gguf: no tensor named "blk.0.post_attention_norm.weight"
+// until it learned `ffn_norm`. The old fixture could never have caught that,
+// because it wrote whichever name the loader read.
+TEST_CASE("LoadQwen3FromGguf: reads llama.cpp's ffn_norm AND this tree's post_attention_norm") {
+  const Dims d;
+  for (const bool stock : {true, false}) {
+    CAPTURE(stock);
+    TempFile f(BuildGguf(d, /*tied=*/false, /*with_qk_norm=*/true, stock));
+    const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+    const vllm::HfConfig c = vllm::Qwen3HfConfigFromGguf(g);
+    const vllm::Qwen3DenseWeights w =
+        vllm::LoadQwen3FromGguf(g, c, &kExpandAll);
+    REQUIRE(static_cast<int64_t>(w.layers.size()) == d.n_layer);
+    for (const auto& layer : w.layers) {
+      REQUIRE(layer.post_attention_layernorm.rank == 1);
+      CHECK(layer.post_attention_layernorm.shape[0] == d.H);
+      CHECK(layer.post_attention_layernorm.dtype == vt::DType::kBF16);
+    }
+  }
 }
 
 // ── weights ───────────────────────────────────────────────────────────────
