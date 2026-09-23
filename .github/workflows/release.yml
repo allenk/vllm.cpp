@@ -508,14 +508,46 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
       # Linux gets nvcc from `container: nvidia/cuda:...-devel`. GitHub refuses
       # container jobs on Windows, so this lane installs the toolkit instead.
-      # nvcc plus the VS integration only: the full toolkit is several GB and the
-      # runner has neither the disk nor the minutes to spare.
+      #
+      # It used to install four sub-packages only -- nvcc, visual_studio_integration,
+      # cudart, nvrtc -- to save disk and minutes. That install produced an
+      # nvcc.exe that RUNS and a toolkit that cannot COMPILE:
+      #
+      #   cuda_runtime.h(82): fatal error C1083: Cannot open include file:
+      #   'crt/host_config.h': No such file or directory
+      #
+      # `include/crt/` was simply absent. Every symptom above it was downstream
+      # of that, and each one looked like a different bug: run #1 "no CUDA
+      # compiler" (PATH), run #2 "no CUDA compiler" (the VS generator reads
+      # MSBuild props, not PATH), run #3 "no CUDA compiler" WITH the props
+      # installed. `check_language(CUDA)` reports every one of those as the same
+      # four words, which is how a missing header spent three runs impersonating
+      # three different configuration faults.
+      #
+      # So: no sub-package restriction. A complete toolkit costs minutes; an
+      # incomplete one costs runs, and this lane has now spent four.
       - name: Install the CUDA toolkit this lane compiles against
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: '13.3.0'
-          sub-packages: '["nvcc", "visual_studio_integration", "cudart", "nvrtc"]'
           method: 'network'
+      # And prove the install can actually be compiled against, at the door,
+      # rather than 40 minutes later through a message that names none of this.
+      - name: Prove the toolkit has the headers nvcc needs
+        shell: pwsh
+        run: |
+          $inc = Join-Path $env:CUDA_PATH 'include'
+          $need = @('cuda_runtime.h', 'crt\host_config.h', 'crt\common_functions.h')
+          $missing = @()
+          foreach ($f in $need) {
+            $full = Join-Path $inc $f
+            if (Test-Path $full) { Write-Host "ok   $f" } else { Write-Host "MISS $f"; $missing += $f }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host "--- $inc ---"
+            Get-ChildItem $inc -Directory | ForEach-Object { Write-Host "  [dir] $($_.Name)" }
+            throw "the CUDA toolkit installed without $($missing -join ', '); nvcc will run and refuse to compile"
+          }
       # The installer above sets CUDA_PATH but does NOT put nvcc on PATH, and
       # `check_language(CUDA)` looks on PATH (or at $CUDACXX) and nowhere else.
       # MEASURED, run 35855557148: the toolkit installed for four minutes, the
