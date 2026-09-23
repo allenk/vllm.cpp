@@ -89,7 +89,7 @@ const int64_t kGateOff = 3, kUpOff = 4;
 // the loader by construction and could not see that no real file loads. A
 // control that shares the bug is not a control.
 std::string BuildGguf(const Dims& d, bool tied, bool with_qk_norm,
-                      bool stock_norm_name = true) {
+                      bool stock_norm_name = true, bool with_rope_dim = true) {
   GgufModelBuilder b;
   const std::string p = "qwen3.";
   b.AddKv(StrKv("general.architecture", "qwen3"));
@@ -101,7 +101,7 @@ std::string BuildGguf(const Dims& d, bool tied, bool with_qk_norm,
   b.AddKv(U32Kv(p + "feed_forward_length", d.inter));
   b.AddKv(U32Kv(p + "vocab_size", d.vocab));
   b.AddKv(U32Kv(p + "context_length", d.context_len));
-  b.AddKv(U32Kv(p + "rope.dimension_count", d.head_dim));
+  if (with_rope_dim) b.AddKv(U32Kv(p + "rope.dimension_count", d.head_dim));
   b.AddKv(F32Kv(p + "rope.freq_base", d.rope_theta));
   b.AddKv(F32Kv(p + "attention.layer_norm_rms_epsilon", d.rms_eps));
 
@@ -204,6 +204,24 @@ TEST_CASE("LoadQwen3FromGguf: reads llama.cpp's ffn_norm AND this tree's post_at
       CHECK(layer.post_attention_layernorm.dtype == vt::DType::kBF16);
     }
   }
+}
+
+// A real Qwen3 GGUF does not carry `qwen3.rope.dimension_count` -- llama.cpp's
+// converter omits it -- and the reader used to default it to 0, which is not a
+// rotary width but a landmine: vt::ops.cpp:1804 requires rotary_dim > 0, so the
+// engine died mid-forward instead of at load. Qwen3 has no partial rotary
+// factor, so the default is head_dim.
+TEST_CASE("Qwen3HfConfigFromGguf: rope.dimension_count absent defaults to head_dim") {
+  const Dims d;
+  TempFile f(BuildGguf(d, /*tied=*/false, /*with_qk_norm=*/true,
+                       /*stock_norm_name=*/true, /*with_rope_dim=*/false));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::Qwen3HfConfigFromGguf(g);
+  CHECK(c.head_dim == d.head_dim);
+  CHECK(c.rotary_dim == d.head_dim);
+  CHECK(c.rotary_dim > 0);
+  CHECK(c.rotary_dim % 2 == 0);
+  CHECK(c.rotary_dim <= c.head_dim);
 }
 
 // ── weights ───────────────────────────────────────────────────────────────

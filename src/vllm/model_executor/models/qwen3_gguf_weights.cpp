@@ -433,7 +433,23 @@ HfConfig Qwen3HfConfigFromGguf(const GgufFile& gguf) {
   // RoPE / norm / context.
   const GgufValue* freq = gguf.FindKv(p + "rope.freq_base");
   c.rope_theta = freq ? KvFloat(*freq, p + "rope.freq_base") : 10000.0;
-  c.rotary_dim = OptInt(gguf, p + "rope.dimension_count", 0);
+  // Default to head_dim, NOT 0. llama.cpp's Qwen3 converter does not write
+  // `qwen3.rope.dimension_count` -- the real Qwen3-0.6B-BF16.gguf carries ten
+  // of the eleven keys read here and not this one -- and Qwen3 has no partial
+  // rotary factor, so the rotary width IS the head dim. A 0 here reaches
+  // `vt::ops.cpp:1804`, whose guard is `rotary_dim > 0 && even && <= head_dim`,
+  // and the engine dies mid-forward with
+  //   vt: rope: rotary_dim must be even and <= head_dim
+  // rather than at load, which is the worst place to learn it.
+  //
+  // This tree already believed rotary_dim == head_dim: its own test asserts
+  // exactly that (test_qwen3_gguf_weights.cpp, "parses all metadata"). What it
+  // did not have was a file where the key is ABSENT -- the fixture writes
+  // `rope.dimension_count` at its line 104, so the default was never exercised.
+  // Same shape of blindness as the post_attention_norm/ffn_norm name above: a
+  // synthetic fixture that supplies whatever the reader wants cannot discover
+  // what real files omit.
+  c.rotary_dim = OptInt(gguf, p + "rope.dimension_count", c.head_dim);
   c.rms_norm_eps = ReqFloat(gguf, p + "attention.layer_norm_rms_epsilon");
   c.max_position_embeddings = OptInt(gguf, p + "context_length", 0);
   c.torch_dtype = "bfloat16";
