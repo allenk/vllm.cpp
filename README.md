@@ -158,11 +158,20 @@ And we hold every other engine to the same treatment: same model, same workload,
 
 ### vs llama.cpp, on CPU, from the same GGUF file
 
-| | vllm.cpp | llama.cpp | ratio |
-|---|--:|--:|--:|
-| prefill | **223.8 tok/s** | 177.3 | **1.18x** |
-| decode | 24.7 tok/s | 25.4 | 0.97x (tie) |
-| peak memory | 2.83 GiB | 2.80 GiB | 1.01x |
+| | vllm.cpp | llama.cpp | ratio | |
+|---|--:|--:|--:|---|
+| prefill | **223.8 tok/s** | 177.3 | **1.18x** | denominator SUPERSEDED |
+| decode | 24.7 tok/s | 25.4 | 0.97x (tie) | denominator SUPERSEDED |
+| peak memory | 2.83 GiB | 2.80 GiB | 1.01x | denominator SUPERSEDED |
+
+> **SUPERSEDED**, per cell and not only in the note further down this page: the
+> llama.cpp column was built from `237ad9b96`, our own local-only fork 65
+> performance commits deep. The pin is now stock `b10451`, so each figure is owed
+> a re-take that can move it either way
+> ([#1003](https://github.com/mudler/vllm.cpp/issues/1003),
+> [source table](docs/benchmarks/llama-cpp-cpu.md)). The **byte-identical** claim
+> below is unaffected -- it is an equality against that build's tokens, not a
+> ratio against its speed.
 
 Decode lands inside llama.cpp's own spread, and the memory gap is 30 MiB. Tokens are
 **byte-identical to llama.cpp's greedy decode**.
