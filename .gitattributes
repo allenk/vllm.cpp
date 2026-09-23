@@ -1,3 +1,18 @@
 # Vendored Triton AOT artifacts are generated code (embedded cubins): collapse
 # in diffs/review and exclude from language stats. Regen: scripts/regen-triton-aot.sh
 src/vt/cuda/triton_aot_vendored/** linguist-generated=true
+
+# The Triton AOT MANIFESTs pin `generator scripts/triton-aot-compile.py
+# sha256=<hash>`, and cmake/TritonAOT.cmake:591 recomputes that hash from the
+# WORKING TREE. A content hash over a text file is only meaningful if the bytes
+# are the same everywhere, and without this line they are not: a Windows
+# checkout with core.autocrlf gets CRLF and hashes to
+# 8b76c5d7c0575783859bf36ee04d0d520581f865a309b482548a3f483021621a where the
+# committed LF bytes -- and all seven MANIFESTs -- say
+# eba7b92b36dc898d3dabdca462eac23632a380003dcfd61078a8058750d3b79f.
+#
+# MEASURED: the same repository content passes this check on both Linux CUDA
+# lanes and fails on cuda_windows, which is the only lane that both checks out
+# on Windows and consumes the vendored trees (the other Windows lanes build with
+# CUDA off and never reach triton_aot_finalize).
+scripts/triton-aot-compile.py text eol=lf

@@ -591,9 +591,18 @@ else:
     file(SHA256 "${CMAKE_SOURCE_DIR}/scripts/triton-aot-compile.py" _generator_hash)
     if(NOT
        "generator scripts/triton-aot-compile.py sha256=${_generator_hash}" IN_LIST _mlines)
+      # Print BOTH hashes. This fired once with neither of them in the message,
+      # and the cause was not a stale tree at all: the file is committed as LF
+      # and a Windows checkout hashed it as CRLF. "They differ" sends the reader
+      # to regenerate cubins; "they differ, and here are the two values" sends
+      # them to compare the bytes, which is where the answer was.
       message(FATAL_ERROR
-        "Triton AOT MANIFEST generator shim differs from scripts/triton-aot-compile.py; "
-        "regenerate")
+        "Triton AOT MANIFEST generator shim differs from scripts/triton-aot-compile.py.\n"
+        "  working tree: ${_generator_hash}\n"
+        "  MANIFEST (${_adir}/MANIFEST) records a different one.\n"
+        "If the tree is unchanged, check line endings before regenerating: this "
+        "hash is over the file as CHECKED OUT, so CRLF and LF give different "
+        "answers for identical content (.gitattributes pins it to LF).")
     endif()
     set(_manifest_bases "")
     foreach(_line IN LISTS _mlines)
