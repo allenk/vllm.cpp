@@ -236,6 +236,13 @@ rather than hardcode it, as `check-triton-aot-multiarch.py` now does.
 ## 5. Operational traps, each paid for once
 
 ```
+a NEW lane has never run       Before adding a release lane, check whether that
+                               COMBINATION has ever been built anywhere. ci.yml
+                               has two Windows jobs and neither builds CUDA, and
+                               cuda-fat-build is ubuntu-latest, so Windows x CUDA
+                               was new the day the lane was. "Windows passed" and
+                               "CUDA passed" do not compose. Its five straight
+                               reds were a first look, not a regression.
 a dry run is HALF a rehearsal   `workflow_dispatch` on `release` says nothing
                                about `containers.yml`, which the same tag fires.
                                See the box in §2. Found the hard way: containers
