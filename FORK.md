@@ -83,6 +83,40 @@ upstream to emit, with no change to any file upstream also maintains.
 lane means no release at all — and a tag, once pushed, is public and cannot be
 taken back. The first dry run on this pipeline had eight of eleven lanes red.
 
+### ⚠ The dry run covers ONE of the two workflows a tag fires
+
+A `workflow_dispatch` on `release` proves `release.yml` and says nothing at all
+about `containers.yml`, which the same tag also fires. Reading the box above and
+stopping there is the trap: it names both workflows and teaches you to rehearse
+only the first.
+
+**`containers.yml` cannot be rehearsed the same way.** Its dispatch stops after
+`verify` by design, so it can prove a lane builds and can never prove `publish`,
+`manifest`, `attest` or `promote`. Those four are gated on every publish lane
+being green, so a single red lane skips them silently — and on 2026-09-23 that
+was the standing state: **five consecutive runs red, and `manifest`, `attest`
+and `promote` had never executed on this fork at all.** A tag would have been
+their debut.
+
+What rehearses it instead is the **nightly cron on `main`** (`0 4 * * *`), which
+runs the whole chain including the registry writes. So before tagging:
+
+```
+1. dispatch `release`        rehearses release.yml           (every lane green)
+2. wait for a nightly        rehearses containers.yml        (manifest/attest/
+   `containers` run on main                                   promote EXECUTED,
+                                                              not skipped)
+3. only then push the tag
+```
+
+⚠ And note **why the nightly is the thing to wait for rather than a push**:
+`containers.yml`'s push trigger is deliberately narrow — `docker/**`, the
+container matrix, four named scripts and its own file — because `main` takes
+dozens of pushes a day. A fix elsewhere, `scripts/release_manifest.py` included,
+does NOT rebuild containers. The cron is what closes that window, and its own
+comment says so: *"a main image is never more than a day behind the tree."* That
+is the design working; widening the filter buys hours at a standing cost.
+
 ---
 
 ## 3. Contributing back to mudler/vllm.cpp
@@ -202,6 +236,21 @@ rather than hardcode it, as `check-triton-aot-multiarch.py` now does.
 ## 5. Operational traps, each paid for once
 
 ```
+a dry run is HALF a rehearsal   `workflow_dispatch` on `release` says nothing
+                               about `containers.yml`, which the same tag fires.
+                               See the box in §2. Found the hard way: containers
+                               had been red for five runs and three of its stages
+                               had never executed.
+two tables, one updated        The most expensive shape of red on this pipeline.
+                               The sm_120a AOT tree was vendored and
+                               `check-triton-aot-multiarch.py` was taught about
+                               it; `release_manifest.py` was not. The build audit
+                               then printed "7 exact trees and namespaces OK" and
+                               the archive validator refused the same binary for
+                               "fabricates unavailable AOT namespace for sm_120a"
+                               — two hours in, because everything passes until
+                               the last gate. If a fact lives in two files, write
+                               the test that computes their agreement.
 gh resolves to UPSTREAM        `gh workflow run` in this tree dispatched to
                                mudler/vllm.cpp; only a 403 stopped it. Pass
                                --repo allenk/vllm.cpp on every gh command that
