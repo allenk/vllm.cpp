@@ -24,7 +24,7 @@ pin = 9bbfa7dd3e27ca7f1861ede70aaca390174493f9
 pin_label = main, 2026-09-19
 pinned_on = 2026-09-21
 gateable = no
-evidence = MODEL-CUA-S1-FORMS spec owes the measurement
+evidence = #3290
 ```
 
 `gateable = no` because the oracle has not yet been run against this tree. The
