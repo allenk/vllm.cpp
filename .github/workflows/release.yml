@@ -516,6 +516,26 @@ jobs:
           cuda: '13.3.0'
           sub-packages: '["nvcc", "visual_studio_integration", "cudart", "nvrtc"]'
           method: 'network'
+      # The installer above sets CUDA_PATH but does NOT put nvcc on PATH, and
+      # `check_language(CUDA)` looks on PATH (or at $CUDACXX) and nowhere else.
+      # MEASURED, run 35855557148: the toolkit installed for four minutes, the
+      # step env showed CUDA_PATH=...\CUDA\v13.3, and configure still said
+      #   -- Looking for a CUDA compiler - NOTFOUND
+      #   CMake Error at CMakeLists.txt:222 (message):
+      #     VLLM_CPP_CUDA=ON but no CUDA compiler was found.
+      # A present toolkit that the build cannot see fails identically to an
+      # absent one, so this step makes the hand-off explicit and refuses if the
+      # compiler really is missing -- the two cases must not look alike again.
+      - name: Hand nvcc to CMake explicitly, and prove it is there
+        shell: pwsh
+        run: |
+          if (-not $env:CUDA_PATH) { throw "CUDA_PATH is unset after the toolkit install" }
+          $bin = Join-Path $env:CUDA_PATH 'bin'
+          $nvcc = Join-Path $bin 'nvcc.exe'
+          if (-not (Test-Path $nvcc)) { throw "no nvcc.exe at $nvcc" }
+          & $nvcc --version
+          "CUDACXX=$nvcc"  | Out-File -FilePath $env:GITHUB_ENV  -Append -Encoding utf8
+          $bin             | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Prove Windows PowerShell and CRT rejection contracts
         env:
           EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
