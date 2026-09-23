@@ -300,15 +300,15 @@
         "sm": "110"
       },
       {
-        "aot_available": false,
+        "aot_available": true,
         "aot_evidence": {
           "command": "",
-          "reason": "synthetic cross-build has no matching runtime host",
+          "reason": "synthetic fixture has not run this gate",
           "result": "",
-          "state": "not-applicable",
+          "state": "absent",
           "url": ""
         },
-        "portable_fallback": true,
+        "portable_fallback": false,
         "runtime_evidence": {
           "command": "",
           "reason": "synthetic fixture has not run this gate",

@@ -18,8 +18,38 @@ ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "scripts" / "release_manifest.py"
 SCHEMA = ROOT / "release" / "manifest-v1.schema.json"
 FIXTURES = ROOT / "tests" / "scripts" / "fixtures" / "release_manifest" / "v1"
+_TOOL_MODULE = None
 PRIMARY_SMS = ["80", "86", "87", "89", "90a", "100a", "103a", "110", "120a", "121a"]
-AOT_SMS = {"80", "86", "89", "90a", "100a", "121a"}
+def _load_tool():
+    """Import scripts/release_manifest.py as a module, once."""
+    global _TOOL_MODULE
+    if _TOOL_MODULE is None:
+        spec = importlib.util.spec_from_file_location("release_manifest", TOOL)
+        if spec is None or spec.loader is None:
+            raise AssertionError(f"cannot import {TOOL}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _TOOL_MODULE = module
+    return _TOOL_MODULE
+
+
+# DERIVED, not restated. This used to be a literal set, and it was the THIRD
+# copy of the same fact: scripts/release_manifest.py has AOT_AVAILABILITY,
+# scripts/check-triton-aot-multiarch.py has TREE_FLAGS, and this line had a set.
+# When the fork vendored an sm_120a tree (3e9de4e62) two of the three were
+# updated and this one was not, so flipping the flag to match reality turned
+# seven of these tests red -- they were asserting the old world from their own
+# private copy of it.
+#
+# The independent check that keeps this honest is not here: it is
+# `test_aot_availability_matches_the_vendored_trees` below, which compares the
+# table against the DIRECTORIES ON DISK. That is ground truth no table can fake,
+# and deriving this constant from the module is therefore safe rather than
+# circular -- these cases are about manifest generation and schema conformance,
+# not about which SMs have a tree.
+AOT_SMS = {
+    sm for sm, available in _load_tool().AOT_AVAILABILITY.items() if available
+}
 EVIDENCE_KEYS = (
     "build",
     "archive_smoke",
@@ -293,6 +323,54 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertTrue(errors, "mutation unexpectedly validated")
         if needle:
             self.assertTrue(any(needle in error for error in errors), errors)
+
+    def test_aot_availability_matches_the_vendored_trees(self) -> None:
+        """AOT_AVAILABILITY must agree with the trees that exist on disk.
+
+        This is the check that did not exist on 2026-09-23, and its absence cost
+        two CUDA lanes 2h21m and 2h09m before they were refused at packaging with
+
+            CUDA archive fabricates unavailable AOT namespace for sm_120a
+
+        The tree had been vendored (3e9de4e62, consumer Blackwell) and the flag
+        had not been flipped, so the build audit and the archive validator
+        asserted OPPOSITE things about the same binary. Everything passed until
+        the last gate.
+
+        The directory listing is ground truth: it is what the build compiles
+        against and what puts `vt_aot_sm_<sm>_` into the binary, and no
+        declaration table can fake it. Asserting BOTH directions matters --
+        a flag without a tree fabricates a namespace, and a tree without a flag
+        ships device code the manifest denies having.
+        """
+        tool = _load_tool()
+        vendored = ROOT / "src" / "vt" / "cuda" / "triton_aot_vendored"
+        self.assertTrue(vendored.is_dir(), f"missing AOT tree root: {vendored}")
+        on_disk = {
+            d.name[len("sm_"):]
+            for d in vendored.iterdir()
+            if d.is_dir() and d.name.startswith("sm_")
+        }
+        declared = {
+            sm for sm, available in tool.AOT_AVAILABILITY.items() if available
+        }
+        self.assertEqual(
+            declared,
+            on_disk,
+            "AOT_AVAILABILITY disagrees with src/vt/cuda/triton_aot_vendored/. "
+            f"declared-but-absent={sorted(declared - on_disk)} "
+            f"present-but-undeclared={sorted(on_disk - declared)}. "
+            "Both directions are release-fatal: the first is refused by "
+            "validate-release-archive.py as a fabricated namespace, the second "
+            "ships device code the manifest denies.",
+        )
+        # Every vendored tree must also be an SM this build actually compiles,
+        # or the agreement above would be satisfiable by two matching mistakes.
+        self.assertTrue(
+            on_disk.issubset(set(tool.PRIMARY_CUDA_SMS)),
+            f"vendored trees outside PRIMARY_CUDA_SMS: "
+            f"{sorted(on_disk - set(tool.PRIMARY_CUDA_SMS))}",
+        )
 
     def test_cpu_and_cuda_generation_is_deterministic_and_matches_goldens(self) -> None:
         for stem, facts in (("cpu", cpu_facts()), ("cuda", cuda_facts())):
