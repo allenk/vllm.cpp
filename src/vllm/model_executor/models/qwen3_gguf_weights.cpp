@@ -463,6 +463,22 @@ HfConfig Qwen3HfConfigFromGguf(const GgufFile& gguf) {
   return c;
 }
 
+std::string Qwen3GgufRefusal() {
+  return "Model architecture Qwen3ForCausalLM: this build does not accept a "
+         "`qwen3` GGUF. The arm exists and LOADS a BF16 file -- it is gated "
+         "OFF, not missing. Upstream shipped it (3c2fcca33) without an "
+         "end-to-end run: four separate defects stood between it and any "
+         "published file, and the last one was not even in its own "
+         "translation unit. The BF16 path is fixed and tested here; the "
+         "quantized and F16 paths are refused by the loader's own "
+         "keep-quant guard and were never implemented upstream. Rather than "
+         "ship one working container out of three on a feature this tree has "
+         "not owned, the dispatch entry is withheld for this release. Use the "
+         "safetensors checkpoint, which is token-identical. Re-enable by "
+         "restoring the `qwen3` row in `kGgufArchArms` "
+         "(src/vllm/entrypoints/model_loader.cpp) -- ONE line, nothing else.";
+}
+
 bool IsQwen3Gguf(const GgufFile& gguf) {
   const GgufValue* arch_v = gguf.FindKv("general.architecture");
   if (arch_v == nullptr || arch_v->TypeId() != kGgufString) return false;

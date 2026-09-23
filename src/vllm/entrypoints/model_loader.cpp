@@ -1271,7 +1271,11 @@ constexpr GgufArchArm kGgufArchArms[] = {
     {"qwen35", &vllm::HfConfigFromGguf},
     {"qwen35moe", &vllm::HfConfigFromGguf},
     {"qwen3next", &vllm::HfConfigFromGguf},
-    {"qwen3", &vllm::Qwen3HfConfigFromGguf},
+    // WITHHELD for v0.0.3-vk.1, and withheld rather than deleted: the arm,
+    // its four fixes and its tests all stay, and `Qwen3GgufRefusal()` in the
+    // OWED block below says so by name. Restoring this ONE line re-enables it.
+    // Rationale and evidence: `Qwen3GgufRefusal()`.
+    // {"qwen3", &vllm::Qwen3HfConfigFromGguf},
     {vllm::kQwen4ExpGgufArch, &vllm::Qwen4ExpHfConfigFromGguf},
     {vllm::kGlm5NextGgufArch, &vllm::Glm5NextHfConfigFromGguf},
     {vllm::kGlmMoeDsaGgufArch, &vllm::GlmMoeDsaHfConfigFromGguf},
@@ -1326,6 +1330,13 @@ HfConfig HfConfigFromGgufDispatch(const vllm::GgufFile& gguf) {
   // it. The GGUF arm itself is OWED to W8.
   if (vllm::IsDeepseekV41Gguf(gguf)) {
     throw std::runtime_error(vllm::DeepseekV41GgufRefusal());
+  }
+  // Qwen3 is the one entry here that is WITHHELD rather than OWED: the arm
+  // loads a BF16 file today and is gated off on purpose. It belongs in this
+  // block for exactly the reason the block exists -- the generic refusal below
+  // would call it "unrecognized", and this file IS one this project knows.
+  if (vllm::IsQwen3Gguf(gguf)) {
+    throw std::runtime_error(vllm::Qwen3GgufRefusal());
   }
   throw std::runtime_error(
       "GGUF architecture '" + arch +

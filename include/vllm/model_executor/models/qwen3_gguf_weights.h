@@ -48,6 +48,13 @@ HfConfig Qwen3HfConfigFromGguf(const GgufFile& gguf);
 // model_loader.cpp does not carry a second copy of the arch list.
 bool IsQwen3Gguf(const GgufFile& gguf);
 
+// The refusal this build gives for a `qwen3` GGUF, and the reason it gives one.
+//
+// The arm below WORKS on a BF16 file -- verified on three platforms, token-
+// identical to the same model's safetensors -- and it is deliberately NOT
+// dispatched to. See the note in `model_loader.cpp`'s OWED block.
+std::string Qwen3GgufRefusal();
+
 // Load the whole Qwen3 dense model from a GGUF file into owned host tensors,
 // matching the safetensors loader's layouts and semantics. q/k/v are
 // concatenated into one merged qkv_proj (rows q|k|v); gate/up into one

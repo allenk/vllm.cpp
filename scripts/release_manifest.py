@@ -26,9 +26,31 @@ FEATURE_TABLE = Path("cmake/CudaArchFeatures.cmake")
 PRIMARY_CUDA_SMS = (
     "80", "86", "87", "89", "90a", "100a", "103a", "110", "120a", "121a"
 )
+# FORK: "120a" is True HERE and False upstream. This fork vendors the sm_120a
+# Triton AOT tree (3e9de4e62, consumer Blackwell); upstream has six trees and no
+# sm_120a, so upstream's False is correct FOR UPSTREAM and wrong for this tree.
+#
+# It was wrong here for a while, and the shape of that bug is the reason for this
+# comment. Adding the tree meant updating a declaration table -- and there are
+# TWO. check-triton-aot-multiarch.py got its entry (its own note says so) and
+# this one did not, so the build audit and the archive validator ended up
+# asserting opposite things about the same binary. MEASURED, run 35855557148:
+# both Linux CUDA lanes built 926/926, printed
+#   CUDA fat gencode audit: all ten SMs and per-source intersections OK
+#   Triton AOT multi-arch audit: 7 exact trees and namespaces OK
+# and were then refused two minutes later by
+#   CUDA archive fabricates unavailable AOT namespace for sm_120a
+# after 2h21m and 2h09m of compiling. A disagreement between two tables is the
+# most expensive kind of red: everything passes until the last gate.
+#
+# Nothing here asserts an untested claim. The row this flag generates
+# (release_accelerator_metadata.py:70-90) carries the evidence string "check
+# exact embedded vt_aot_sm_120a_ namespace", and that check is exactly what the
+# validator runs at validate-release-archive.py:589-591 -- which is what found
+# the symbol present in the first place.
 AOT_AVAILABILITY = {
     "80": True, "86": True, "87": False, "89": True, "90a": True,
-    "100a": True, "103a": False, "110": False, "120a": False, "121a": True,
+    "100a": True, "103a": False, "110": False, "120a": True, "121a": True,
 }
 PUBLISHED_EVIDENCE = ("build", "archive_smoke", "dependency_audit")
 STABLE_EVIDENCE = ("runtime", "correctness")
