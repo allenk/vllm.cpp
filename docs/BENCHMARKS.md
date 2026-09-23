@@ -22,5 +22,6 @@ measurement evidence remains in [the benchmark record](../.agents/benchmark-reco
 | `tt-keepquant-27b-decode` | Tenstorrent keep-quant 27B Q4_K_M decode, first end-to-end completion on the P150 | Measured | [Details](benchmarks/tt-keepquant-27b-decode.md) |
 | `how-we-measure` | Benchmark method and acceptance rules | Method | [Details](benchmarks/how-we-measure.md) |
 | `variadic-load-methodology` | How the mixed-length, swept-concurrency serving benchmark works | Method | [Details](benchmarks/variadic-load-methodology.md) |
+| [`vulkan-jetson-orin`](benchmarks/vulkan-jetson-orin.md) | Vulkan on an 8 GB Jetson Orin Nano against llama.cpp Vulkan: 2.41x on the reference axis, 1.65x on a decode-weighted one, and the backend's missing quantized compute tier |
 | `open-gaps` | Pending, failed, void, and superseded measurements | Open | [Details](benchmarks/open-gaps.md) |
 | `reproduce` | Reproduction commands and artifacts | Method | [Details](benchmarks/reproduce.md) |
