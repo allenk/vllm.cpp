@@ -2905,6 +2905,20 @@ vllm_cpp_add_test(test_tensor vt/test_tensor.cpp)
 # — deterministic selection, capability predicates, decline-and-fall-back and the
 # selection stats. Device-independent (registers onto the unused kXPU slots).
 vllm_cpp_add_test(test_op_provider vt/test_op_provider.cpp)
+# The Triton-CPU provider's ladder states. That translation unit is compiled
+# into EVERY platform's binary unconditionally -- Windows included, where
+# LoadKernelSymbol returns nullptr by #ifdef and every op declines forever --
+# so this suite is deliberately NOT guarded to Linux.
+vllm_cpp_add_test(test_triton_cpu_ladder vt/test_triton_cpu_ladder.cpp)
+# Selection is cached for the process lifetime, so one process observes one
+# state. The same binary runs again with the provider ASKED FOR but still
+# given no kernel directory: that is the state a real deployment hits when the
+# artifacts are missing, and the one the 'changes nothing until asked' claim is
+# actually about.
+add_test(NAME test_triton_cpu_ladder_enabled COMMAND test_triton_cpu_ladder)
+set_tests_properties(test_triton_cpu_ladder_enabled PROPERTIES
+  ENVIRONMENT "VLLM_CPP_TRITON_CPU=1")
+
 # S5 portable reference tier (accelerator-seam-audit.md): the unified-memory
 # safety gate, correctness-with-zero-native-kernels via the CPU fallback, and the
 # native-wins / observability contract. Hardware-free — a fake backend on the
