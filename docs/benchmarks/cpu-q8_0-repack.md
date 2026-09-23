@@ -114,6 +114,75 @@ figure describes.
 The prediction written into the script before that run was "repack off drops
 this to about 1.1x". It did.
 
+### 3a. The axis of the table above, and the part of it that was not recorded
+
+Stated plainly because a benchmark without its axis cannot be checked, and this
+index promises reproducibility in [reproduce.md](reproduce.md).
+
+**Recorded:** Snapdragon 8 Gen 3 (Cortex-X4, `i8mm` present), clocks pinned, one
+process with the switch toggled inside it, concurrency 1 / 4 / 16, two legs per
+cell.
+
+**NOT recorded, and not recoverable from what the run left behind:** the thread
+count, the prompt and output lengths, and the name of the switch. The two server
+logs kept from that session are byte-identical, so they do not say which arm was
+which. There is no harness output and there was no script.
+
+⚠️ **Output length is not a detail here, it is the axis.** This engine's tok/s
+divides OUTPUT tokens by TOTAL wall, so prefill sits in the denominator. On the
+same phone, same model, same switch position, only the output length varying:
+
+| `max_tokens` | 32 | 128 | 256 |
+|---|---:|---:|---:|
+| tok/s | 6.94 | 11.55 | 12.54 |
+
+The `9.97` in the table above falls between the 32 and the 128 reading. A
+comparison against it therefore has to state its own output length or it is not
+a comparison.
+
+### 3b. A re-measurement that does carry its axis (2026-09-23)
+
+Not a reproduction of the table above -- a different axis, stated so it can be
+checked and repeated. Script: `benchmarks/android/android_repack_ab_ondevice.sh`, driven on
+the device, A/B interleaved, guards described in §8.
+
+**Axis:** Qwen3.5-2B-Q8_0 · `~128 prompt tokens / 32 output` · concurrency 1 ·
+**6 threads** · `VT_CPU_QUANT_REPACK=0|1` · clocks pinned (all eight cores on
+`performance` at their maximum frequency, verified per core) · unique prompt per
+request · two legs per arm, interleaved.
+
+| `VT_CPU_QUANT_REPACK` | tok/s | cpu/wall | RssAnon | RssFile |
+|---|---:|---:|---:|---:|
+| **1** | 5.44 / 5.19 | 5.85 / 6.12 | **2752 / 2760 MB** | 21 / 21 MB |
+| **0** | 3.47 / 3.44 | 5.78 / 5.84 | 845 / 844 MB | **1925 / 1925 MB** |
+
+**1.54x**, and the switch is proven by residency rather than by throughput: with
+the tier on the weights are a private anonymous copy, with it off they are
+borrowed from the mapping. §4 shows only the off state, on a board where the
+tier cannot engage at all; this shows both states on one device.
+
+`cpu/wall` is 5.8-6.1 on both arms, so the two differ in the kernel and not in
+how much parallelism they got.
+
+**Why six threads and not the usual "logical cores / 2".** That rule was set on
+a homogeneous desktop, where naming a count names a set. This part is 1+5+2 --
+one X4 at 3.30 GHz, five A720 at 2.96-3.15, two A520 at 2.27 -- and swept here:
+
+| threads | 1 | 2 | 4 | 6 | 8 |
+|---|---:|---:|---:|---:|---:|
+| tok/s | 2.53 | 3.94 | 5.14 | **5.43** | 4.81 |
+| cpu/wall | 1.01 | 1.90 | 4.14 | 5.86 | 7.37 |
+
+The optimum is six, exactly the non-LITTLE core count; eight is 12% *worse*,
+because the two A520 join the parallel region and then hold the rest at the
+barrier. Confirmed interleaved (8/6/8/6 reading 4.94 / 5.42 / 4.56 / 5.18)
+rather than trusted to a sweep whose last leg was also its hottest.
+
+⚠️ **Absolutes are not quotable on this device.** The same configuration read
+5.32 tok/s inside a four-leg A/B and 6.94 run fresh: about 25% drift from heat
+and back-to-back legs. The ratio survives that only because the two arms are
+adjacent and interleaved; a blocked run would fold the drift into the result.
+
 ---
 
 ## 4. Arm without i8mm: eligible upstream, not eligible here
@@ -239,3 +308,12 @@ recorded rather than assumed.
 - **Denominators are measured, not looked up.** Host bandwidth on the x86 box
   measures 41.67 GB/s by STREAM triad against a spec-sheet expectation nearly
   twice that.
+- **Write the axis down, not just the number.** §3's table was measured
+  carefully and cannot be checked, because the thread count, the prompt and
+  output lengths and the switch name were never written and the run's own logs
+  are byte-identical between arms. §3a states what is known and §3b adds a
+  re-measurement that carries its axis. A number whose axis is missing is not a
+  weaker result; it is an unverifiable one.
+- **On a heterogeneous CPU, a thread COUNT does not name a thread SET.** The
+  optimum on the 1+5+2 phone is the non-LITTLE core count, and the homogeneous
+  rule undershoots it. Sweep on the platform, and record the choice.
