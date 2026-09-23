@@ -536,6 +536,54 @@ jobs:
           & $nvcc --version
           "CUDACXX=$nvcc"  | Out-File -FilePath $env:GITHUB_ENV  -Append -Encoding utf8
           $bin             | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      # ...and then install the MSBuild integration, which is what this lane
+      # ACTUALLY resolves CUDA through.
+      #
+      # build-windows-release.ps1:43 configures with -G "Visual Studio 17 2022".
+      # With the VS generator, `enable_language(CUDA)` looks for
+      # `CUDA <ver>.props`/`.targets` under the VS installation's
+      # BuildCustomizations directory. It does not consult CUDACXX and it does
+      # not consult PATH. So the step above is necessary and was NOT sufficient,
+      # and the second dry run says so precisely: run 35872523883 printed
+      #   nvcc: ... Cuda compilation tools, release 13.3, V13.3.33
+      #   CUDACXX: C:\...\CUDA\v13.3\bin\nvcc.exe
+      #   -- The CXX compiler identification is MSVC 19.44.35228.0
+      #   -- Looking for a CUDA compiler - NOTFOUND      (in 2.4 seconds)
+      # A 2.4-second NOTFOUND with a working nvcc on PATH is not a search that
+      # failed; it is a search that was never looking there.
+      #
+      # RULED OUT, so it is not re-guessed later: the host-compiler version
+      # gate. CUDA's crt/host_config.h refuses `_MSC_VER < 1920 || >= 1960`
+      # and MSVC 19.44 is 1944, inside the window.
+      #
+      # The toolkit ships the integration under
+      # extras/visual_studio_integration/MSBuildExtensions; the network
+      # installer only places it when it finds VS where it expects. Copying it
+      # is NVIDIA's own documented remedy for VS-installed-after-CUDA, and here
+      # the same asymmetry exists for a different reason.
+      - name: Install the CUDA MSBuild integration the VS generator resolves through
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:CUDA_PATH 'extras\visual_studio_integration\MSBuildExtensions'
+          if (-not (Test-Path $src)) { throw "no MSBuildExtensions under $env:CUDA_PATH" }
+          Write-Host "integration source:"; Get-ChildItem $src | ForEach-Object { Write-Host "  $($_.Name)" }
+          $roots = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022' -Directory -ErrorAction SilentlyContinue
+          if (-not $roots) { throw "no Visual Studio 2022 installation found" }
+          $installed = $false
+          foreach ($r in $roots) {
+            $dst = Join-Path $r.FullName 'MSBuild\Microsoft\VC\v170\BuildCustomizations'
+            if (-not (Test-Path $dst)) { continue }
+            Copy-Item "$src\*" $dst -Force
+            $props = Get-ChildItem $dst -Filter 'CUDA *.props' -ErrorAction SilentlyContinue
+            if ($props) {
+              $installed = $true
+              Write-Host "installed into $dst :"; $props | ForEach-Object { Write-Host "  $($_.Name)" }
+            }
+          }
+          # Prove it, rather than assume the copy took. A silent no-op here
+          # costs the whole lane five minutes later, with a message that points
+          # at a missing toolkit instead of a missing props file.
+          if (-not $installed) { throw "CUDA props did not land in any VS BuildCustomizations directory" }
       - name: Prove Windows PowerShell and CRT rejection contracts
         env:
           EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
