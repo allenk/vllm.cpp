@@ -536,6 +536,16 @@ jobs:
           & $nvcc --version
           "CUDACXX=$nvcc"  | Out-File -FilePath $env:GITHUB_ENV  -Append -Encoding utf8
           $bin             | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          # HYPOTHESIS, labelled as one so the next reader knows which parts of
+          # this lane were proven and which were tried: CMake reads
+          # CMAKE_GENERATOR_TOOLSET from the environment (>= 3.15), and the
+          # `cuda=<path>` toolset field is the documented way to point the VS
+          # generator at a toolkit it did not discover on its own. It is inert
+          # if the BuildCustomizations copy in the next step is already enough.
+          # The probe after it prints CMAKE_VS_PLATFORM_TOOLSET_CUDA either way,
+          # so this does not become an un-attributed change.
+          "CMAKE_GENERATOR_TOOLSET=cuda=$env:CUDA_PATH" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       # ...and then install the MSBuild integration, which is what this lane
       # ACTUALLY resolves CUDA through.
       #
@@ -584,6 +594,46 @@ jobs:
           # costs the whole lane five minutes later, with a message that points
           # at a missing toolkit instead of a missing props file.
           if (-not $installed) { throw "CUDA props did not land in any VS BuildCustomizations directory" }
+      # And then make the toolchain PROVE it works, on the exact generator the
+      # real configure uses, printing the whole failure if it does not.
+      #
+      # `check_language(CUDA)` reports a bare NOTFOUND and swallows the nested
+      # configure's reason, so the lane has now said "no CUDA compiler" three
+      # times for what were two different causes and possibly a third. Each
+      # guess costs a full run. This probe is the same move that has worked all
+      # day: put the answer in the message instead of inferring it.
+      #
+      # It mirrors build-windows-release.ps1:863-871 -- Visual Studio 17 2022,
+      # -A x64 -- because a probe on a different generator would answer a
+      # different question, and the generator IS the variable here.
+      - name: Prove a Visual Studio CUDA configure actually works, or print why not
+        shell: pwsh
+        run: |
+          $probe = Join-Path $env:RUNNER_TEMP 'cudaprobe'
+          New-Item -ItemType Directory -Force -Path $probe | Out-Null
+          # No PowerShell here-string: its closing token must sit at column 0,
+          # which is exactly what a YAML block scalar cannot give it.
+          $cml = @(
+            'cmake_minimum_required(VERSION 3.20)',
+            'project(cudaprobe LANGUAGES CXX CUDA)',
+            'message(STATUS "probe: compiler=${CMAKE_CUDA_COMPILER}")',
+            'message(STATUS "probe: toolset=${CMAKE_VS_PLATFORM_TOOLSET_CUDA}")',
+            'message(STATUS "probe: version=${CMAKE_CUDA_COMPILER_VERSION}")'
+          )
+          Set-Content -Path (Join-Path $probe 'CMakeLists.txt') -Value $cml
+          cmake --version
+          Write-Host "--- probe configure ---"
+          $out = & cmake -S $probe -B (Join-Path $probe 'b') -G "Visual Studio 17 2022" -A x64 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) {
+            $err = Join-Path $probe 'b\CMakeFiles\CMakeError.log'
+            if (Test-Path $err) {
+              Write-Host "--- CMakeError.log ---"
+              Get-Content $err | Select-Object -Last 120 | ForEach-Object { Write-Host $_ }
+            }
+            throw "a Visual Studio CUDA configure fails on this runner; the text above is the reason the real build only reports as NOTFOUND"
+          }
       - name: Prove Windows PowerShell and CRT rejection contracts
         env:
           EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
