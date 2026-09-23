@@ -96,7 +96,7 @@ from pathlib import Path
 # reaches one through `#include`, and is why step 4 exists at all. A build file
 # changes what CMake configures. Anything else is out of scope by construction,
 # and step 2 says so rather than implying it with silence.
-SOURCE_SUFFIXES = {".cpp", ".cc", ".cxx", ".c", ".cu", ".mm", ".m"}
+SOURCE_SUFFIXES = {".cpp", ".cc", ".cxx", ".c", ".cu", ".hip", ".mm", ".m"}
 HEADER_SUFFIXES = {".h", ".hpp", ".hh", ".hxx", ".cuh", ".inc", ".ipp", ".tpp"}
 BUILD_NAMES = {"CMakeLists.txt"}
 BUILD_SUFFIXES = {".cmake"}
@@ -239,6 +239,36 @@ def run_one(entry: dict, extra: list[str]) -> tuple[str, int, str]:
         argv, cwd=entry.get("directory", "."), capture_output=True, text=True, check=False
     )
     return entry["file"], result.returncode, (result.stdout + result.stderr)
+
+
+def syntax_check_gpu(path: str, source: Path) -> tuple[str, int, str]:
+    """Syntax-check a `.hip` or `.cu` file the host configure did not build.
+
+    The host-only CMake configure produces no compile command for GPU source
+    files, so `check-tree-compiles` would silently skip them. A typo in a
+    `.hip` would reach main unbuilt (standing gap, spec line 11577).
+
+    If `hipcc` (for `.hip`) or `nvcc` (for `.cu`) is on PATH, run
+    `-fsyntax-only` with the right offload arch. If the compiler is not
+    available, return CANNOT_VERIFY so the caller can warn that the file is
+    uncovered rather than silently passing.
+    """
+    abs_path = str(source / path)
+    suffix = os.path.splitext(path)[1]
+    if suffix == ".hip":
+        compiler = shutil.which("hipcc")
+        if compiler is None:
+            return abs_path, CANNOT_VERIFY, "hipcc not on PATH"
+        argv = [compiler, "-fsyntax-only", "--offload-arch=gfx1151", abs_path]
+    elif suffix == ".cu":
+        compiler = shutil.which("nvcc")
+        if compiler is None:
+            return abs_path, CANNOT_VERIFY, "nvcc not on PATH"
+        argv = [compiler, "-fsyntax-only", abs_path]
+    else:
+        return abs_path, CANNOT_VERIFY, f"no GPU compiler for {suffix}"
+    result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    return abs_path, result.returncode, result.stdout + result.stderr
 
 
 def dependency_map(
@@ -384,11 +414,37 @@ def main(argv: list[str] | None = None) -> int:
                     affected.add(os.path.realpath(path))
 
         if unbuilt:
-            print(
-                f"  {len(unbuilt)} C++ source(s) in scope that no target in this "
-                f"configuration compiles, so nothing checked them: "
-                + ", ".join(unbuilt)
-            )
+            gpu_sources = [p for p in unbuilt if os.path.splitext(p)[1] in {".cu", ".hip"}]
+            non_gpu_unbuilt = [p for p in unbuilt if p not in gpu_sources]
+            if non_gpu_unbuilt:
+                print(
+                    f"  {len(non_gpu_unbuilt)} C++ source(s) in scope that no target in this "
+                    f"configuration compiles, so nothing checked them: "
+                    + ", ".join(non_gpu_unbuilt)
+                )
+            if gpu_sources:
+                print(
+                    f"  {len(gpu_sources)} GPU source(s) in scope not built by this "
+                    f"configuration; syntax-checking with hipcc/nvcc if available"
+                )
+                gpu_results = [syntax_check_gpu(p, source) for p in gpu_sources]
+                gpu_failures = [(p, t) for p, c, t in gpu_results if c != 0 and c != CANNOT_VERIFY]
+                gpu_cannot = [(p, t) for p, c, t in gpu_results if c == CANNOT_VERIFY]
+                for path, _text in gpu_cannot:
+                    print(
+                        f"  CANNOT-VERIFY: {os.path.relpath(path, source)} — "
+                        f"no GPU compiler on PATH, syntax unchecked"
+                    )
+                for path, text in gpu_failures:
+                    print(f"FAILED to compile {os.path.relpath(path, source)}")
+                    for line in text.rstrip().splitlines():
+                        print(f"    {line}")
+                if gpu_failures:
+                    print(
+                        f"check-tree-compiles: {len(gpu_failures)} of {len(gpu_sources)} "
+                        f"GPU source(s) in scope did not syntax-check."
+                    )
+                    return 1
 
         entries = [by_file[path] for path in sorted(affected)]
         if args.list:

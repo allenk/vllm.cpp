@@ -107,12 +107,53 @@ LayerFpState& LayerFpS() {
   return s;
 }
 
+// ─── Fixed-seed random projections (#2877) ──────────────────────────────
+//
+// `sumabs` is sign-INSENSITIVE: it sums |x_i|, so a zero-mean perturbation
+// (every reassociation, every rounding difference) cancels at O(sqrt(n)),
+// and `rel_sumabs` under-reports the true divergence by a median 75-140x
+// (measured over 400 seeds in test_q4exp_layerfp_diff.py::MetricSpread).
+//
+// A fixed-seed random projection `S w_i x_i` is a LINEAR FUNCTIONAL of the
+// tensor: its difference between two arms is `S w_i (a_i - b_i)`, which
+// cannot cancel because the signs of `w_i` are fixed and independent of the
+// perturbation. Eight projections give 8 independent estimates of `||a-b||`,
+// enough to see a divergence that any single projection might miss by
+// landing near a zero of `w . (a-b)`.
+//
+// The PRNG is a 64-bit LCG with fixed constants. It is seeded from the tap's
+// element count `n`, so two arms tapping the same tensor at the same `n` draw
+// the same `w_i` and the projection difference is meaningful. No env var, no
+// per-process state: the same tap on any run draws the same weights.
+struct ProjRng {
+  uint64_t s;
+  explicit ProjRng(uint64_t seed) : s(seed * 6364136223846793005ULL + 1442695040888963407ULL) {}
+  float next() {
+    s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+    // Map to [-1, 1) via xorshift high bits. Using the high 24 bits gives a
+    // uniform float in [-1, 1); the sign is the bit that makes the projection
+    // sign-sensitive.
+    uint32_t u = static_cast<uint32_t>(s >> 40);
+    return (static_cast<float>(u) / static_cast<float>(1u << 24) - 0.5f) * 2.0f;
+  }
+};
+
 // One tap. `il` is the decoder layer, or -1 for a tap outside the loop.
 //
 // THE COPY GOES THROUGH `Backend::Copy`, which is `cudaMemcpyDefault` on a CUDA
 // queue and a `memcpy` on a CPU one, so ONE spelling reads both arms and neither
 // arm gets a private readback path the other does not have. `Synchronize` after
 // it is what makes the bytes the ones this tap names.
+//
+// THE EIGHT RANDOM PROJECTIONS (#2877). `sumabs` sums |x_i|, which is
+// sign-INSENSITIVE: a zero-mean perturbation cancels at O(sqrt(n)), and
+// `rel_sumabs` under-reports the true divergence by a median 75-140x (measured
+// over 400 seeds in test_q4exp_layerfp_diff.py::MetricSpread). Each `proj_k` is
+// `S w_i x_i` over the whole tensor, with fixed-seed `w_i` (ProjRng seeded
+// from `n`). The difference `proj_k(a) - proj_k(b) = S w_i (a_i - b_i)` is a
+// LINEAR FUNCTIONAL of the difference and CANNOT cancel. Eight independent
+// projections give 8 estimates of `||a-b||`, enough to see a divergence that
+// any single one might miss by landing near a zero of `w . (a-b)`.
 void LayerFp(Dev d, int64_t il, const char* tag, const Tensor& t) {
   LayerFpState& s = LayerFpS();
   if (s.step >= s.budget) return;
@@ -130,6 +171,16 @@ void LayerFp(Dev d, int64_t il, const char* tag, const Tensor& t) {
   double maxabs = 0.0;
   int64_t nonfinite = 0;
   float head[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  // Eight fixed-seed random projections (#2877). The seed is `n`, so two arms
+  // tapping the same shape draw the same `w_i` and the projection difference
+  // is meaningful. ProjRng is deterministic and stateless beyond its seed.
+  constexpr int kNumProj = 8;
+  ProjRng rng(static_cast<uint64_t>(n));
+  float w[kNumProj];
+  for (int k = 0; k < kNumProj; ++k) w[k] = rng.next();
+  double proj[kNumProj] = {0.0};
+
   for (int64_t i = 0; i < n; ++i) {
     float v = 0.0f;
     switch (t.dtype) {
@@ -149,17 +200,26 @@ void LayerFp(Dev d, int64_t il, const char* tag, const Tensor& t) {
     const double a = std::fabs(static_cast<double>(v));
     sumabs += a;
     if (a > maxabs) maxabs = a;
+    // Random projection accumulator. `w[k]` is a fresh weight per element per
+    // projection, so `proj[k] = S w_k_i * x_i` over the whole tensor.
+    for (int k = 0; k < kNumProj; ++k) {
+      proj[k] += static_cast<double>(w[k]) * static_cast<double>(v);
+    }
+    for (int k = 0; k < kNumProj; ++k) w[k] = rng.next();
   }
   ++s.taps;
   std::fprintf(stderr,
                "q4fp step=%lld L%+03lld tag=%-10s dtype=%-4s dev=%d n=%lld "
                "nonfinite=%lld maxabs=%.9g sumabs=%.9g "
-               "v=%.9g,%.9g,%.9g,%.9g\n",
+               "v=%.9g,%.9g,%.9g,%.9g "
+               "proj=%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\n",
                static_cast<long long>(s.step), static_cast<long long>(il), tag,
                vt::Name(t.dtype), static_cast<int>(t.device.type),
                static_cast<long long>(n), static_cast<long long>(nonfinite), maxabs, sumabs,
                static_cast<double>(head[0]), static_cast<double>(head[1]),
-               static_cast<double>(head[2]), static_cast<double>(head[3]));
+               static_cast<double>(head[2]), static_cast<double>(head[3]),
+               proj[0], proj[1], proj[2], proj[3],
+               proj[4], proj[5], proj[6], proj[7]);
 }
 
 // Closes a fingerprinted step. `taps=` is the counted property that says the

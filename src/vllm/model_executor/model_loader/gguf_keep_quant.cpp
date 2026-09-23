@@ -163,22 +163,22 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
   switch (dev) {
     case vt::DeviceType::kROCM:
       // rocm_grouped_gemm.hip implements Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K, while
-      // rocm_quant_dot.hip adds the seven Q8_K-activation formats below on
-      // both grouped and non-grouped arms. IQ4_XS remains with #3029 and is
-      // not admitted by this row; Q4_0/Q5_0/IQ2_XS/IQ3_S/IQ4_XS/MXFP4 stay
-      // on the named expand-or-refuse path.
+      // rocm_quant_dot.hip adds the eight Q8_K-activation formats below on
+      // both grouped and non-grouped arms. IQ4_XS is the last of the eight
+      // (KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT, #1940 in pull request #3029). It
+      // used to fall through to `false` here, and that is the host-RAM SIGSEGV
+      // a real IQ4_XS checkpoint hit on ROCm: the loader chose exactly the
+      // expand-bf16 residency this comment block warns about.
       //
       // IQ4_NL is admitted on BOTH arms or neither. It is the only entry here
-      // whose activation encoding is Q8_0 rather than Q8_K, and it is served by
-      // DotIQ4_NL through IQ4NLGemmK (single) and GroupedIQ4NLK (expert
-      // towers). The grouped arm is the one that matters for the shipped
-      // Qwen3.8-Flash-Next checkpoints, whose 48 ffn_down_exps are IQ4_NL;
-      // admitting the encoding with only the single-matrix arm would throw at
-      // the first expert forward with the model already resident, which is the
-      // exact failure this predicate exists to prevent.
+      // whose activation encoding is Q8_0 rather than Q8_K, served by DotIQ4_NL
+      // through IQ4NLGemmK (single) and GroupedIQ4NLK (expert towers).
+      //
+      // Q4_0/Q5_0/IQ2_XS/IQ3_S/MXFP4 stay on the named expand-or-refuse path.
       return dt == vt::DType::kQ8_0 || dt == vt::DType::kIQ4_NL ||
              dt == vt::DType::kQ4_K ||
              dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K ||
+             dt == vt::DType::kIQ4_XS ||
              dt == vt::DType::kIQ2_XXS || dt == vt::DType::kIQ3_XXS ||
              dt == vt::DType::kQ2_K || dt == vt::DType::kQ3_K ||
              dt == vt::DType::kIQ2_S || dt == vt::DType::kIQ1_S ||
@@ -192,7 +192,8 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
       // (the q4km artifact: token_embd Q6_K, attn_qkv/ssm_out Q5_K,
       // ssm_alpha/ssm_beta Q8_0) is what pulled Q5_K/Q6_K/Q8_0 from W4 into
       // W3 — kernels and predicate widened IN THE SAME CHANGE. kQ4_0 has no
-      // TT arm at all and kQ2_K stays owed (Q3_K joined in
+      // TT arm at all; kQ2_K stayed owed until tenstorrent-gsq-keepquant
+      // wave 4 admitted it (enc_sel 11; Q3_K joined in
       // QUANT-GGUF-IQ-TENSTORRENT wave 3); admitting an encoding
       // without its kernel throws at first forward with the model resident,
       // the exact failure this predicate exists to prevent.
@@ -238,12 +239,22 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
       // IQ2_XXS/IQ2_S footprint), dispatched on the DEFAULT path. The
       // GSQ-RCO Qwen3.8-27B vehicle's 32 IQ2_XS tensors (ffn) are the
       // artifact this admits.
+      // tenstorrent-gsq-keepquant wave 4: kQ2_K (enc_sel 11) joins the set
+      // tenstorrent-gsq-keepquant wave 5: kIQ1_S (enc_sel 12) and kIQ1_M
+      // (enc_sel 13) join the set — on-core decodes
+      // kq_vec_dot_iq1_s_q8_K / kq_vec_dot_iq1_m_q8_K
+      // (keepquant_kernel_code.h), staged as resident i32 word shadows
+      // (16 words = the 50-B / 56-B blocks zero-padded to the 64-B word
+      // grid), dispatched on the DEFAULT path. The GSQ-RCO Qwen3.8-27B
+      // vehicle's 4 + 4 IQ1 tensors (ffn tail) are the artifacts this
+      // admits; this closes the file's block-quant census.
       return dt == vt::DType::kQ4_K || dt == vt::DType::kQ5_K ||
              dt == vt::DType::kQ6_K || dt == vt::DType::kQ8_0 ||
              dt == vt::DType::kIQ3_XXS || dt == vt::DType::kIQ2_XXS ||
              dt == vt::DType::kIQ2_S || dt == vt::DType::kQ3_K ||
              dt == vt::DType::kIQ3_S || dt == vt::DType::kIQ4_XS ||
-             dt == vt::DType::kIQ2_XS;
+             dt == vt::DType::kIQ2_XS || dt == vt::DType::kQ2_K ||
+             dt == vt::DType::kIQ1_S || dt == vt::DType::kIQ1_M;
     default:
       // CUDA falls back to the CPU kernel for anything it lacks
       // (cuda_quant_dot.cu:1841-1846); the CPU list IS the CPU capability.
@@ -570,12 +581,14 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(
 // this GEMM have a `vec_dot` for this encoding", so for a PLACED routed-expert
 // tower it is a question about the placement device, not about the engine.
 //
-// On GLM-5.3 `UD-IQ1_S`, five of the six expert formats now stay quantized on
-// ROCm: IQ1_S/IQ3_XXS/IQ2_XXS/Q2_K/Q3_K. IQ4_XS still routes
-// `kExpandBf16`, so `LoadStackedExperts` can refuse a load for a tower whose
-// bytes never reach the GPU (the model reads a tower only through
-// `GlmExpertSlice`, never through `ResidentWeight`) and which the installed
-// plan has already sent to the CPU. The CPU `vec_dot` table covers all six.
+// On GLM-5.3 `UD-IQ1_S`, all six expert formats now stay quantized on ROCm:
+// IQ1_S/IQ3_XXS/IQ2_XXS/Q2_K/Q3_K, and IQ4_XS since #3029. This seam still
+// matters, because a format ROCm does not admit routes `kExpandBf16` and
+// `LoadStackedExperts` then refuses a load for a tower whose bytes never reach
+// the GPU (the model reads a tower only through `GlmExpertSlice`, never
+// through `ResidentWeight`) and which the installed plan has already sent to
+// the CPU. The CPU `vec_dot` table covers all six, and IQ2_XS, IQ4_NL and
+// IQ3_S are formats where the two answers still differ.
 //
 // THIS IS #1136 AND #2406 ONE SEAM FURTHER ALONG. Both were the same shape: a
 // residency decision resolved against a device other than the one that would

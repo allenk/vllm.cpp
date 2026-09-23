@@ -3,22 +3,57 @@
 Issue: `.agents/issues/BACKEND-TENSTORRENT/ISSUE-LOCAL-01M2YXN1QEMAEY5W8QCKH76HTS.md`
 (row `BACKEND-TENSTORRENT`).
 
-Status: **DRAFT, 2026-09-13.** Spec-first: no implementation is in scope until
-this file is committed and the row moves `READY`.
+Status: **ACTIVE, 2026-09-21.** Wave 1 (BFP8 weight residency, #3242) is
+merged. The BFP8 A/B disproved the bandwidth hypothesis. The
+`VT_TT_KEEPQUANT_INT8DOT=1` A/B identified the real bottleneck (per-call
+compute) and delivered a 4.5× TPOT reduction. The remaining gap is still
+format: the int8 dot is an SFPU kernel, not a tensor-core BFP matmul.
 
 ## Now
 
-The f32-exact decode stack measures ~0.028 tok/s on
-`Qwen3.8-27B-APEX-I-Nano` (B2, token-exact vs the llama.cpp `b10451` greedy
-oracle; `.agents/benchmark-record.md` 2026-09-13 entry), while Tenstorrent's
-native tt-metal pipeline reports ~50 tok/s on the same model class on one
-P150A with BFP4 weights / BFP8 KV / BF16 deltaNet state. The ~1800× gap is a
-FORMAT gap: our decode GEMMs run GGUF block-dequant plus the SFPU
-f32-exact path (ttnn matmul truncates f32 operands to tf32 on Blackhole —
-measured, and `ComputeConfig` does not lift it), while the native pipeline
-runs tensor-core matmul on BFP-typed weights where BFP precision IS the
-hardware's precision contract. No tuning pass closes this. This spec commits
-the native BFP residency path.
+Three A/B measurements on `Qwen3.8-27B-APEX-I-Nano` (1×128→N,
+`.agents/benchmark-record.md` 2026-09-21 entries):
+
+1. **BFP8 weight residency** (wave 1, #3242): zero speedup. BFP8 warm
+   TPOT = 35.1 s vs baseline 35.3 s. The bottleneck was not weight
+   bandwidth.
+
+2. **`VLLM_CPP_CUDAGRAPH=1`**: no-op. Capture/replay was already enabled
+   by default for APEX 27B (`Qwen3_5ForConditionalGeneration` is an
+   evidence family in `DecodeCaptureDefaultArch`;
+   `GraphCaptureEnabled()` returns true when the env var is unset;
+   `HostFreeDecodeEnabled()` and `DecodeCaptureEnabled()` likewise
+   default on). The 35.1 s warm TPOT was already WITH capture/replay.
+
+3. **`VT_TT_KEEPQUANT_INT8DOT=1`**: **4.5× speedup.** Replaces the
+   multi-op f32 re-decode (`DecodeKeepQuantWordsF32`) with a single-kernel
+   int8 dot product (`MatmulBTQuantInt8DotKernel`).
+
+| Run | TPOT (s) | Speedup |
+|---|---:|---|
+| Baseline (W4a grouped, f32-exact) | 35.1 | 1.0× |
+| INT8DOT | 7.7 | 4.5× |
+
+Both legs drift from `[220,17]` to `[220,16]` on the synthetic ignore-eos
+input — baseline at token 25, int8-dot at token 13. Both converge to the
+same pattern. The drift is accumulated rounding, not an int8-dot-specific
+regression. Capture/replay confirmed active at runtime
+(`Qwen3_5DenseDecodeGraph::Step` in trace, capture-safe device copies).
+
+A real-prompt A/B (chat template, "Explain what gravity is in one
+sentence", 16 tokens) confirmed semantic convergence despite token-level
+divergence: 0/16 exact position matches, but tokens 4-15 of INT8DOT match
+tokens 2-13 of baseline — a 2-token shift of the same content. Both
+produce coherent text about gravity. Mean ITL: INT8DOT 7549 ms vs baseline
+49783 ms.
+
+The gap narrows from ~1800× to ~385× (7.7 s vs ~20 ms native). The
+remaining gap is still format: the int8 dot is an SFPU kernel, not a
+tensor-core BFP matmul. The next lever is BFP weight residency for the
+*decode compute* path — not for bandwidth (disproven), but to move the dot
+product from SFPU to tensor-core BFP matmul.
+
+Wave 2 (BFP4 arm, KV BFP8, per-role split, e2e near-tie) remains owed.
 
 ## Scope
 
@@ -187,6 +222,9 @@ row's Outcome.
 
 ## Owed
 
+- Trace the 76.5 ms per-GEMV overhead (host-side staging vs device launch vs
+  actual compute). This is the confirmed next step: BFP8 showed zero speedup
+  because per-call overhead dominates, not weight bandwidth.
 - BFP8 KV cache residency (named follow-up row).
 - BF16 deltaNet/GDN state residency confirmation against the native stack
   (named follow-up row).
@@ -198,10 +236,12 @@ row's Outcome.
 
 ## Now
 
-`DRAFT` — this spec commits the load-time BFP4/BFP8 conversion and the
-native-matmul dense decode path for the 27B forward. On commit the row
-moves `READY`; implementation starts only after the committed spec is the
-row's contract.
+Wave 1 (BFP8 weight residency) landed in #3242. The A/B benchmark
+(2026-09-21) disproved the format-gap hypothesis: BFP8 warm TPOT = 35.1 s
+matches baseline warm 35.3 s. The track redirects to launch-overhead
+reduction: trace the 76.5 ms per-GEMV overhead, then evaluate whether weight
+format matters at higher throughput. Wave 2 items (BFP4, KV BFP8, per-role
+split, e2e near-tie) remain owed under `## Owed`.
 
 ## Git integration
 

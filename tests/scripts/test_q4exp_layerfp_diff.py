@@ -54,15 +54,26 @@ diff = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(diff)
 
 
-def tap_line(step, il, tag, sumabs, v=(0.0, 0.0, 0.0, 0.0)):
-    """The instrument's EXACT format, src/vllm/model_executor/models/qwen4_exp_forward.cpp."""
+def tap_line(step, il, tag, sumabs, v=(0.0, 0.0, 0.0, 0.0), proj=None):
+    """The instrument's EXACT format, src/vllm/model_executor/models/qwen4_exp_forward.cpp.
+
+    `proj` is a list of 8 floats (the random projections added in #2877).
+    If omitted, 8 zeros are emitted, matching the old format where no
+    projections existed.
+    """
+    if proj is None:
+        proj = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     return ("q4fp step=%d L%+03d tag=%-10s dtype=%-4s dev=%d n=%d "
-            "nonfinite=%d maxabs=%.9g sumabs=%.9g v=%.9g,%.9g,%.9g,%.9g\n"
-            % (step, il, tag, "bf16", 0, 12800, 0, 1.0, sumabs, v[0], v[1], v[2], v[3]))
+            "nonfinite=%d maxabs=%.9g sumabs=%.9g v=%.9g,%.9g,%.9g,%.9g "
+            "proj=%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\n"
+            % (step, il, tag, "bf16", 0, 12800, 0, 1.0, sumabs,
+               v[0], v[1], v[2], v[3],
+               proj[0], proj[1], proj[2], proj[3],
+               proj[4], proj[5], proj[6], proj[7]))
 
 
 def fingerprint(path, layers=48, tags=("blk",), sumabs=lambda il, tag: 100.0, v=None,
-                steps=1):
+                proj=None, steps=1):
     """Write `steps` fingerprinted forwards, exactly as the instrument prints them.
 
     `taps=` is CUMULATIVE. `LayerFp` does `++s.taps` on a counter that
@@ -78,7 +89,8 @@ def fingerprint(path, layers=48, tags=("blk",), sumabs=lambda il, tag: 100.0, v=
         for il in range(layers):
             for tag in tags:
                 vv = v(il, tag) if v else (0.0, 0.0, 0.0, 0.0)
-                lines.append(tap_line(step, il, tag, sumabs(il, tag), vv))
+                pp = proj(il, tag) if proj else None
+                lines.append(tap_line(step, il, tag, sumabs(il, tag), vv, pp))
                 taps += 1
         lines.append("q4fp step=%d taps=%d END\n" % (step, taps))
     path.write_text("".join(lines), encoding="utf-8")
@@ -1219,6 +1231,32 @@ class MetricHonesty(unittest.TestCase):
     def test_head_dmax_positive_control_is_zero_on_identical_values(self):
         a = {"v": "1.0,2.0,3.0,4.0"}
         self.assertEqual(diff.head_dmax(a, dict(a)), 0.0)
+
+
+class ProjDifference(unittest.TestCase):
+    """rel_proj is a DIFFERENCE of random projections (#2877). It is sign-sensitive."""
+
+    def test_rel_proj_reads_zero_on_identical_tensors(self):
+        a = {"proj": "1.5,2.5,3.5,4.5,5.5,6.5,7.5,8.5"}
+        self.assertEqual(diff.rel_proj(a, dict(a)), 0.0)
+
+    def test_rel_proj_sees_what_rel_sumabs_cannot(self):
+        # Equal L1 norms, opposite signs: rel_sumabs == 0, but rel_proj sees the
+        # full difference because the projections are sign-sensitive.
+        a = {"proj": "100.0,200.0,300.0,400.0,500.0,600.0,700.0,800.0"}
+        b = {"proj": "-100.0,-200.0,-300.0,-400.0,-500.0,-600.0,-700.0,-800.0"}
+        self.assertEqual(diff.rel_sumabs("1000", "1000"), 0.0,
+                         "the norms are equal, so the committed metric reads agreement")
+        self.assertGreater(diff.rel_proj(a, b), 0.0,
+                           "a sign-sensitive projection difference cannot cancel")
+
+    def test_rel_proj_returns_none_when_proj_missing(self):
+        a = {"v": "1.0,2.0,3.0,4.0"}
+        self.assertIsNone(diff.rel_proj(a, dict(a)))
+
+    def test_rel_proj_positive_control_is_zero_on_identical_values(self):
+        a = {"proj": "1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0"}
+        self.assertEqual(diff.rel_proj(a, dict(a)), 0.0)
 
 
 if __name__ == "__main__":

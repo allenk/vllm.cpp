@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M2YMVYBHPZ7VZW96BWKGBRG7
 Title: TT: keep-quant arms for the GSQ-RCO Qwen3.8-27B census
 Row: BACKEND-TENSTORRENT
-State: OPEN
+State: CLOSED
 Kind: feature
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-09-20
-Updated: 2026-09-20
-Closed: -
+Updated: 2026-09-22
+Closed: 2026-09-22
 
 ## Problem
 
@@ -16,4 +16,4 @@ The two GSQ-RCO Qwen3.8-27B GGUFs do not run on the Tenstorrent keep-quant path:
 
 ## Resolution
 
--
+DONE 2026-09-22. Both GSQ-RCO artifacts run on-device keep-quant end-to-end and pass gate 3/5: tokens argmax-exact vs the pinned b10451 batch decode (gap 0.0 mnats, 16/16, band 500). Waves 1-5 landed #3239 #3241 #3245 #3253 #3256; the e2e anchor evidence and the bf16-vs-f32 open axis are recorded in the spec Outcome and benchmark-record.

@@ -43,6 +43,7 @@
 #include "vllm/model_executor/models/qwen4_exp_gguf_weights.h"  // qwen4exp GGUF arm
 #include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
+#include "vllm/model_executor/models/qwen3_gguf_weights.h"  // qwen3 (dense) GGUF arm
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft load
 #include "vllm/model_executor/models/qwen3_5_common.h"  // SPEC-MTP I5d KV widening
 #include "vllm/model_executor/models/qwen3_dflash.h"  // SPEC-DFLASH D5 draft load
@@ -1270,6 +1271,7 @@ constexpr GgufArchArm kGgufArchArms[] = {
     {"qwen35", &vllm::HfConfigFromGguf},
     {"qwen35moe", &vllm::HfConfigFromGguf},
     {"qwen3next", &vllm::HfConfigFromGguf},
+    {"qwen3", &vllm::Qwen3HfConfigFromGguf},
     {vllm::kQwen4ExpGgufArch, &vllm::Qwen4ExpHfConfigFromGguf},
     {vllm::kGlm5NextGgufArch, &vllm::Glm5NextHfConfigFromGguf},
     {vllm::kGlmMoeDsaGgufArch, &vllm::GlmMoeDsaHfConfigFromGguf},
@@ -3242,7 +3244,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   if (!fs::exists(dir) || !fs::is_directory(dir)) {
     throw std::runtime_error("model path is not a directory: " + model_dir);
   }
-  const std::string config_path = (dir / "config.json").string();
+  std::string config_path = (dir / "config.json").string();
+  // cua-s1-forms models (MODEL-CUA-S1-FORMS) ship cua-s1-forms.json instead
+  // of config.json. Fall back so the standard loading path can resolve it.
+  if (!fs::exists(config_path)) {
+    const std::string cuas1_path = (dir / "cua-s1-forms.json").string();
+    if (fs::exists(cuas1_path)) {
+      config_path = cuas1_path;
+    }
+  }
   const std::string tokenizer_path = (dir / "tokenizer.json").string();
 
   // Refuse-by-task (ARCH-ONE-SURFACE ROW 1), BEFORE the full HfConfig parse: a
@@ -3294,7 +3304,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       registration.architecture,
       registration.factory != nullptr &&
           registration.factory->supports_weight_offload);
-  tok::Tokenizer tokenizer = tok::Tokenizer::FromHfJson(tokenizer_path);
+  // Models without a standard tokenizer (e.g. cua-s1-forms, which uses
+  // ByteCollator) ship no tokenizer.json. Empty() returns a Tokenizer whose
+  // Encode/Decode are never called for those models.
+  tok::Tokenizer tokenizer = fs::exists(tokenizer_path)
+      ? tok::Tokenizer::FromHfJson(tokenizer_path)
+      : tok::Tokenizer::Empty();
 
   // Shared ownership so a loader may retain the mmap'd shards past the load: the
   // Qwen3.6-35B MoE loader defers its routed-expert host copies and streams them

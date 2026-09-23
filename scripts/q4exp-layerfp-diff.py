@@ -223,6 +223,35 @@ def head_dmax(a, b):
     return max(abs(x - y) for x, y in zip(va, vb))
 
 
+def rel_proj(a, b):
+    """DIFFERENCE of random projections (#2877).
+
+    Each `proj_k` is `S w_i x_i` over the whole tensor, with FIXED-seed `w_i`.
+    The difference `proj_k(a) - proj_k(b) = S w_i (a_i - b_i)` is a LINEAR
+    FUNCTIONAL of the difference and CANNOT cancel, unlike `rel_sumabs` which
+    sums |x_i| and is sign-insensitive.
+
+    Returns the max |proj_k(a) - proj_k(b)| / max(|proj_k(a)|, |proj_k(b)|)
+    over the 8 projections. This is a sign-SENSITIVE relative difference that
+    estimates `||a-b||` without reading the whole tensor back.
+    """
+    try:
+        pa = [float(x) for x in a["proj"].split(",")]
+        pb = [float(x) for x in b["proj"].split(",")]
+    except (KeyError, ValueError):
+        return None
+    if len(pa) != len(pb) or len(pa) == 0:
+        return None
+    worst = 0.0
+    for x, y in zip(pa, pb):
+        m = max(abs(x), abs(y))
+        if m > 0.0:
+            r = abs(x - y) / m
+            if r > worst:
+                worst = r
+    return worst
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("base")
@@ -275,7 +304,13 @@ def main(argv=None):
     print("median 2.1x, 11x at p90 and 24x at p95, so a ratio in the low TENS between two")
     print("of these numbers ranks nothing, in either direction. head_dmax is an exact")
     print("elementwise difference over the 4 emitted values: non-zero PROVES the tensors")
-    print("differ, zero proves nothing. A whole-tensor difference norm is OWED (#2877).")
+    print("differ, zero proves nothing.")
+    print()
+    print("rel_proj is a DIFFERENCE of fixed-seed random projections (#2877): each")
+    print("proj_k = S w_i x_i, and proj_k(a)-proj_k(b) = S w_i (a_i-b_i) is a LINEAR")
+    print("FUNCTIONAL of the difference and CANNOT cancel. It is sign-SENSITIVE where")
+    print("rel_sumabs is not. The max over 8 projections estimates ||a-b|| without")
+    print("reading the whole tensor back.")
     print()
 
     sel = [k for k in order
@@ -288,23 +323,27 @@ def main(argv=None):
         scored.append((rel_sumabs(A[k]["sumabs"], B[k]["sumabs"]), k))
     scored.sort(reverse=True)
 
-    print("%-5s %-5s %-10s %-6s %14s %14s %11s %11s"
+    print("%-5s %-5s %-10s %-6s %14s %14s %11s %11s %11s"
           % ("step", "L", "tag", "dtype", "sumabs_base", "sumabs_other",
-             "rel_sumabs", "head_dmax"))
+             "rel_sumabs", "head_dmax", "rel_proj"))
     for r, k in (scored if a.top == 0 else scored[:a.top]):
         hd = head_dmax(A[k], B[k])
-        print("%-5d %-5d %-10s %-6s %14s %14s %11.3e %11s"
+        rp = rel_proj(A[k], B[k])
+        print("%-5d %-5d %-10s %-6s %14s %14s %11.3e %11s %11s"
               % (k[0], k[1], k[2], A[k]["dtype"], A[k]["sumabs"], B[k]["sumabs"],
-                 r, ("%.3e" % hd) if hd is not None else "n/a"))
+                 r, ("%.3e" % hd) if hd is not None else "n/a",
+                 ("%.3e" % rp) if rp is not None else "n/a"))
 
     nz = sum(1 for r, _ in scored if r > 0.0)
     hz = sum(1 for _, k in scored if (head_dmax(A[k], B[k]) or 0.0) > 0.0)
+    pz = sum(1 for _, k in scored if (rel_proj(A[k], B[k]) or 0.0) > 0.0)
     print()
     print("--- %s SUMMARY ---" % a.label)
     print("TAPS COMPARED                 : %d  (of %d parsed in base)" % (len(scored), len(A)))
     print("MISSING IN OTHER              : %d" % missing)
     print("TAPS WITH rel(sumabs) != 0    : %d" % nz)
     print("TAPS WITH head_dmax != 0      : %d   <- a DIFFERENCE norm; these PROVE a difference" % hz)
+    print("TAPS WITH rel_proj != 0      : %d   <- sign-SENSITIVE (#2877); these PROVE a difference" % pz)
     if scored:
         r, k = scored[0]
         print("LARGEST rel(sumabs)           : %.6e at step=%d L%+03d %s" % (r, k[0], k[1], k[2]))

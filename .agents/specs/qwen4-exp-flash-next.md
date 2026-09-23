@@ -12324,3 +12324,110 @@ profiler and no trace was taken.
 
 None of these is a ceiling, and the first two are ordinary implementation
 defects with named fixes.
+
+### Mutation record — W10 (#1978, dead-end)
+
+**The hypothesis.** `ISSUE-LOCAL-01M2TZ9AE416FW4GH23V09783Q` read the
+slowest decode kernel (`QuantDotGemmGrouped32Kernel`, 41.6 GB/s, 15.2%
+of peak) off the source and attributed the cost to the one-warp-per-output
+shape: at `nb = 80` the inner loop is 2.5 iterations per lane, then a
+five-step `__shfl_down_sync` where 31 of 32 lanes idle. The fix had a
+landed precedent 120 lines below: `QuantDotGemmGroupedFusedSwiGLU32Kernel`
+already amortises at width 2. Generalising to N columns per warp would make
+the loop `2.5 × N` useful iterations per reduction and read the broadcast
+activation once per warp.
+
+**What landed.** `QuantDotGemmGrouped32MultiColKernel` — one warp computes
+C consecutive output columns against ONE broadcast activation row, keeping C
+accumulators and paying the 5-step reduction once for C results. Bit-identical
+by construction: each output keeps its own accumulator and its own ascending
+block order; no re-association.
+
+`VT_V4_W32_COLS` (1/2/4/8, default 1) and `VT_V4_W32_WARPS` (1/2/4/8,
+default 4) select the tile per call. `kW32ColsDefault` stays 1.
+
+A byte-identity gate: 48 combinations (3 dtypes × 2 nb × 4 n × 2 bcast),
+all compared by `==` (not tolerance), with a `kPoison` fill so a zero-grid
+arm reads as FAILURE.
+
+A sweep harness (`benchmarks/w32_grouped_cols_ab.cpp`) runs the released
+decode shape (hidden=2560, inter=640, experts=512, rows=10, nb=80, IQ4_NL)
+at all cols/warps arms, printing median μs + GB/s + FNV-1a bit hash.
+
+**The RED, before the change.** The multi-column kernel did not exist; the
+byte-identity gate had no target to compare against.
+
+**The gate, and why each half discriminates.** The gate is `==` (byte-identical),
+not a tolerance. The sweep harness prints an FNV-1a hash per arm; a non-identical
+arm produces a different hash. The `kPoison` fill catches a zero-grid arm that
+would otherwise compare equal to another zero-grid arm by accident.
+
+**The battery.**
+
+| suite | cases | assertions |
+|---|---|---|
+| `test_cuda_quant_dot` (32-block grouped multi-COLUMN GEMV) | 1/1 passed | **35,858** |
+
+Build on `thor:gpu0` (sm_110, nvcc 13.0, `VLLM_CPP_CUDA_ARCHITECTURES=110`):
+858/858 targets linked, `BUILD_EXIT=0`.
+
+**Counts, before and after, on the same tree.** Before: 1 warp per output
+element, `cols=1` only. After: 1/2/4/8 cols × 1/2/4/8 warps, all
+byte-identical (same FNV-1a `0xce92c733fbd08728`), 35,858 assertions
+across 48 combinations, 0 failed.
+
+**The sweep, measured on `thor:gpu0` (sm_110), 500 iters / 50 warmup:**
+
+```
+shape hidden=2560 inter=640 experts=512 rows=10 nb=80 dtype=iq4_nl
+tower=450.0 MiB  per-launch bytes=8.816 MiB (weights 8.789 + act 2720 B + out 25600 B)
+
+cols   warps  blocks   median_us       GB/s   vs_cols1              bithash
+1      4      1600         606.0       15.3      1.000   0xce92c733fbd08728
+2      4      800          602.9       15.3      1.005   0xce92c733fbd08728
+4      4      400          604.7       15.3      1.002   0xce92c733fbd08728
+8      4      200          606.2       15.2      1.000   0xce92c733fbd08728
+1      1      6400         605.4       15.3      1.001   0xce92c733fbd08728
+1      2      3200         605.8       15.3      1.000   0xce92c733fbd08728
+1      8      800          605.4       15.3      1.001   0xce92c733fbd08728
+4      1      1600         605.6       15.3      1.001   0xce92c733fbd08728
+4      2      800          605.9       15.3      1.000   0xce92c733fbd08728
+4      8      200          604.9       15.3      1.002   0xce92c733fbd08728
+
+OK: every arm produced byte-identical output.
+```
+
+All 10 arms within 0.5% of each other at ~605 μs / 15.3 GB/s. No speedup.
+
+**Why it is a dead-end, measured rather than asserted.** The kernel is
+memory-bound, not compute-bound. The numbers:
+
+- 8.816 MiB per launch (8.789 MiB weights + 2720 B act + 25600 B out)
+- 606 μs to move 8.816 MiB = 15.3 GB/s
+- GB10 peak: ~273 GB/s (LPDDR5x unified memory)
+- Utilization: 5.6%
+
+The multi-column tile does not help because:
+
+1. The activation row is 2720 bytes — already in L2, so broadcasting it to
+   C columns saves nothing.
+2. Weight reads dominate (99.7% of bytes) and are the same regardless of
+   cols. Each of 512 expert groups has 10 rows (800 bytes) at a stride of
+   `intermediate_size × nb_blocks` — a scattered-access pattern where the GPU
+   waits on memory latency, not compute.
+3. The warp reduction is 5 steps × ~1 cycle = 5 cycles, negligible against
+   ~2000 cycles of memory latency per weight fetch.
+
+The issue's own bound was honest about this: "NEITHER IS PREDICTED HERE.
+The kernel may be bound by something this reading does not see." This sweep
+is the measurement that sees it. The bottleneck is the memory system, not
+the reduction tree.
+
+**What would move this kernel.** Coalescing weight reads across warps (warps
+in the same block read consecutive expert rows and share via shared memory),
+or a persistent kernel that prefetches the next expert while computing the
+current one. Both are larger changes than tile widening.
+
+**What this retires.** `ISSUE-LOCAL-01M2TZ9AE416FW4GH23V09783Q`'s owed item
+1 (the N sweep). The sweep ran; the answer is flat. `kW32ColsDefault` stays
+1. The kernel and gate land as a correct-and-measured negative result.

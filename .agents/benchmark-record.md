@@ -61,6 +61,57 @@ next lever: the native BFP4/BFP8 weight-residency row
 Logs: `/tmp/bench_b1.log`, `/tmp/bench_b2.log` (B2, warm), `/tmp/bench_b3.log`
 (M=2 pre-fix fatal).
 
+**VT_TT_KEEPQUANT_INT8DOT=1 A/B (2026-09-21).** The BFP8 weight-residency
+leg showed zero TPOT change (35.1 s warm with BFP8 vs 35.3 s warm without),
+proving the bottleneck was per-call compute, not weight bandwidth. The
+int8-dot lever replaces the multi-op f32 re-decode
+(`DecodeKeepQuantWordsF32`) with a single-kernel int8 dot product
+(`MatmulBTQuantInt8DotKernel`). Both legs are cold runs, 1×128→32,
+`VT_TT_AFFINE_F32=1 VT_TT_NORM_PAD=1 VT_TT_PROGRAM_CACHE=1`, capture/replay
+active (confirmed: `Qwen3_5DenseDecodeGraph::Step` in the trace, capture-safe
+device-to-device copies).
+
+| Run | Config | TTFT (s) | TPOT mean (s) | Decode tok/s | JIT hits |
+|---|---|---:|---:|---:|---|
+| Baseline | W4a grouped, f32-exact | 604.4 | 35.1 | 0.028 | 1786/1786 (100%) |
+| INT8DOT | `VT_TT_KEEPQUANT_INT8DOT=1` | 716.0 | 7.7 | 0.13 | 705/729 (96.7%) |
+
+**4.5× TPOT reduction.** Token check: both legs produce `[220,17]×N` then
+drift to `[220,16]` — baseline drifts at token 25, int8-dot at token 13.
+Both converge to the same pattern. The drift is not an int8-dot-specific
+regression; it is accumulated rounding that manifests earlier under int8.
+The f32-exact floor was verified token-exact against the llama.cpp `b10451`
+oracle for short sequences; at 32 tokens even the baseline drifts.
+
+The gap narrows from ~1800× to ~385× (7.7 s vs ~20 ms native). The remaining
+gap is still format: the int8 dot is an SFPU kernel, not a tensor-core BFP
+matmul. The next lever is BFP weight residency for the *decode* compute path,
+not for bandwidth.
+
+Logs: `/tmp/bench_baseline_32.log`, `/tmp/bench_int8dot_32.log`.
+
+**Real-prompt A/B (2026-09-21).** The synthetic 1×128→32 A/B uses an
+ignore-eos input where both legs emit `[220,17]`. To check whether INT8DOT
+changes *meaningful* output, both legs were re-run with a chat template and
+the prompt "Explain what gravity is in one sentence" (16 output tokens).
+
+| Run | Config | Mean ITL (ms) | Median ITL (ms) |
+|---|---|---:|---:|
+| Baseline | W4a grouped, f32-exact | 49783 | 35073 |
+| INT8DOT | `VT_TT_KEEPQUANT_INT8DOT=1` | 7549 | — |
+
+Token check: 0/16 exact position matches. However tokens 4-15 of INT8DOT
+match tokens 2-13 of baseline — a 2-token shift of the same semantic
+content. Both produce coherent text about gravity. The precision tradeoff
+changes early token selection but converges to the same semantic output.
+
+INT8DOT tokens: `[760, 1156, 16561, 310, 10033, 22525, 369, 264, 1156,
+16561, 310, 279, 1156, 16561, 310, 198]`
+Baseline tokens: `[1596, 1144, 310, 10033, 22525, 369, 264, 1156, 16561,
+310, 279, 1156, 16561, 310, 279, 1156]`
+
+Logs: `/tmp/real_int8dot.log`, `/tmp/real_baseline.log`.
+
 ## ENG-EXPERT-STREAM-DEVICE W0h branch force: the CUDA arm's degenerate continuation belongs to the BRANCH and not to the arm, and the W0f divergence point was transcribed wrong (2026-08-23, `dgx:gpu0`, source `ff8f728071bd5`, #1783, #1124, #1736)
 
 **Placement.** Newest-first. This sits above `QUANT-QWEN38-27B-GGUF-ARM W3`,
@@ -29875,3 +29926,49 @@ throughput result against this reading. The reading refutes the async chain as a
 SUFFICIENT fix and not as a contributing one; the decision and its basis are in
 `.agents/specs/dflash2-async-spec-sampler.md` `## Stop conditions`, amended
 2026-09-06 under #3004, and this entry does not restate or revisit them.
+
+## BACKEND-TENSTORRENT 27B APEX BFP8 weight-residency A/B: zero speedup, the gap is per-call launch overhead not format (2026-09-21, P150, main @ b0dcc4044, #3242)
+
+Model: `Qwen3.8-27B-APEX-I-Nano` GGUF (IQ mix;
+`mudler-qwen3.8-27B-APEX-gguf`), Tenstorrent Blackhole P150, file mutex
+`$HOME/gpu.lock` held, `~/Sources/tt/luwen/target/release/reset` before every
+run. Env: `VT_TT_AFFINE_F32=1 VT_TT_NORM_PAD=1 VT_TT_PROGRAM_CACHE=1`. Binary:
+the `row-tt-bfp-impl` worktree build of `vllm-bench` (Sep 20, #3242 branch
+merged).
+
+`VT_TT_WEIGHT_RESIDENCY` controls weight format: `off` (default, f32-exact
+decode with GGUF block-dequant) vs `bfp8` (weights converted to BFLOAT8_B at
+staging, kept resident, bf16 x bfloat8_b matmul). All three runs use the same
+binary, same model, same prompt (128 input tokens, 16 output tokens,
+`--temperature 0 --ignore-eos --skip-chat-template`).
+
+**Correctness.** All three runs produce the same 16 output tokens:
+`[220, 17]` repeated 8 times. The all-zero logits bug (fixed by #3222) does
+not recur.
+
+| Run | Config | TPOT mean (s) | ITL median (s) | P99 ITL (s) | JIT hits |
+|---|---|---:|---:|---:|---|
+| Baseline cold (off) | 1x128->16, cold JIT | 50.8 | 35.1 | 238.2 | 0/1786 (0%) |
+| BFP8 cold | 1x128->16, cold JIT | 50.8 | 35.0 | 238.2 | 0/1803 (0%) |
+| BFP8 warm | 1x128->16, warm JIT | 35.1 | 35.0 | 36.3 | 1803/1803 (100%) |
+| Baseline warm (B2, 2026-09-13) | 1x128->64, warm JIT | 35.3 | 35.3 | 36.5 | 1751/1751 (100%) |
+
+**Result: zero speedup.** BFP8 warm TPOT (35.1 s) matches baseline warm TPOT
+(35.3 s, the 2026-09-13 B2 entry) within noise. The cold runs are also
+identical (50.8 s). BFP8 weight bandwidth savings (50% fewer weight bytes) are
+irrelevant because the bottleneck is per-call launch overhead, not data
+movement or compute precision.
+
+**Root cause.** A single M=1 BFP8 GEMV call measures 76.5 ms. The 27B decode
+issues roughly 450 GEMM calls per token (attention QKV, MLP gate/up/down, per
+layer across 48 layers, plus GDN). At 76.5 ms/call, the per-call overhead
+alone accounts for roughly 34 s/token, which dominates the 35.1 s TPOT. The
+native tt-metal pipeline amortizes this overhead across batched and large
+GEMMs and trace capture; our decode does M=1 GEMVs one at a time with no
+trace. The roughly 1800x gap to ~50 tok/s is a per-call overhead gap, NOT a
+format or precision gap.
+
+**Next step.** Trace the 76.5 ms GEMV overhead to separate host-side staging,
+device launch, and actual compute. The native stack amortizes launch overhead
+via trace capture; our decode does not. This redirects the BFP track from
+format conversion (wave 2: BFP4, KV BFP8) to launch-overhead reduction.

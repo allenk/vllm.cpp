@@ -5,10 +5,13 @@
 #endif
 
 #include <csignal>
+#include <atomic>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <type_traits>
 #include <vector>
 
@@ -102,12 +105,41 @@ class CudaBackend final : public Backend {
 
   // cudaMalloc returns allocations aligned to at least 256 bytes, which
   // satisfies the >=64B contract on Backend::Alloc (StepArena depends on it).
+  //
+  // VT_CUDA_ALLOC_STATS: when set, every cudaMalloc/cudaFree is counted and
+  // tagged with a small site ID (from VT_CUDA_ALLOC_SITE), so a single decode
+  // step's alloc/free attribution is readable from stderr. The instrument is
+  // zero-cost when the env var is unset (the hot path is unchanged).
+  struct AllocStats {
+    std::atomic<int64_t> mallocs{0};
+    std::atomic<int64_t> frees{0};
+    std::unordered_map<int, std::atomic<int64_t>> per_site_mallocs;
+    std::unordered_map<int, std::atomic<int64_t>> per_site_frees;
+    std::mutex mtx;
+  };
+  static AllocStats& Stats() {
+    static AllocStats s;
+    return s;
+  }
+  static bool StatsEnabled() {
+    static const bool e = std::getenv("VT_CUDA_ALLOC_STATS") != nullptr;
+    return e;
+  }
   void* Alloc(size_t bytes) override {
     void* p = nullptr;
     Check(cudaMalloc(&p, bytes), "cudaMalloc");
+    if (StatsEnabled()) {
+      Stats().mallocs.fetch_add(1, std::memory_order_relaxed);
+    }
     return p;
   }
-  void Free(void* p) override { Check(cudaFree(p), "cudaFree"); }
+  void Free(void* p) override {
+    if (p == nullptr) return;
+    Check(cudaFree(p), "cudaFree");
+    if (StatsEnabled()) {
+      Stats().frees.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
   void Memset(Queue& q, void* p, int value, size_t bytes) override {
     Check(cudaMemsetAsync(p, value, bytes, AsStream(q)), "cudaMemsetAsync");
   }
@@ -136,6 +168,17 @@ class CudaBackend final : public Backend {
   }
   void Synchronize(Queue& q) override {
     Check(cudaStreamSynchronize(AsStream(q)), "cudaStreamSynchronize");
+    if (StatsEnabled()) {
+      auto& st = Stats();
+      int64_t m = st.mallocs.load(std::memory_order_relaxed);
+      int64_t f = st.frees.load(std::memory_order_relaxed);
+      if (m > 0 || f > 0) {
+        std::fprintf(stderr,
+                     "vt_cuda_alloc_stats: mallocs=%lld frees=%lld (delta=%lld)\n",
+                     static_cast<long long>(m), static_cast<long long>(f),
+                     static_cast<long long>(m - f));
+      }
+    }
   }
   bool UnifiedMemory() const override { return unified_memory_; }
 

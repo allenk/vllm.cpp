@@ -1,7 +1,7 @@
 ID: ISSUE-LOCAL-01M2TZ9AE416FW4GH23V09783Q
 Title: QuantDotGemmGrouped32Kernel runs one warp per output element with a 2.5-iteration inner loop, and it is the slowest row in the decode bandwidth table at 15.2% of peak
 Row: MODEL-MM-QWEN4-EXP
-State: OPEN
+State: CLOSED
 Kind: bug
 GitHub: -
 Mirror: PENDING
@@ -95,4 +95,9 @@ untouched -- state that in the scope so the distinction is not lost again.
 
 ## Resolution
 
--
+Closed by W10 (dead-end). The multi-column kernel (`QuantDotGemmGrouped32MultiColKernel`)
+landed and is byte-identical across all widths (35,858 assertions, 0 failed). The sweep
+ran on `thor:gpu0` (sm_110): all 10 arms within 0.5% at ~605 μs / 15.3 GB/s. The kernel is
+memory-bound (5.6% of GB10 peak), not compute-bound — the reduction tree is not the bottleneck.
+`kW32ColsDefault` stays 1. The real win would be coalescing weight reads or a persistent
+prefetch kernel, both larger changes than tile widening.

@@ -203,6 +203,8 @@ vllm_cpp_add_test(test_gliner2_e2e vllm/models/test_gliner2_e2e.cpp)
 target_compile_definitions(test_gliner2_e2e PRIVATE
   GLINER2_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/gliner2_e2e")
 vllm_cpp_add_test(test_gliner2_ner vllm/models/test_gliner2_ner.cpp)
+vllm_cpp_add_test(test_cua_s1 vllm/models/test_cua_s1.cpp)
+target_include_directories(test_cua_s1 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 # VT-CONV1D-MODEL-BLOCK (#1684): the time-block case reads `Conv1dTimeBlock` so
 # it asserts the geometry it claims. Same reach as test_vocoder1d.
@@ -865,6 +867,11 @@ target_include_directories(test_laguna_nvfp4_loader PRIVATE ${CMAKE_SOURCE_DIR}/
 vllm_cpp_add_test(test_laguna_gguf_load vllm/models/test_laguna_gguf_load.cpp)
 target_include_directories(test_laguna_gguf_load PRIVATE ${CMAKE_SOURCE_DIR}/src
                            ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
+
+# The qwen3 GGUF loader (`Qwen3HfConfigFromGguf`, `LoadQwen3FromGguf`). Synthetic
+# GGUF via gguf_builder.h; no model file needed. Needs tests/vllm for gguf_builder.h.
+vllm_cpp_add_test(test_qwen3_gguf_weights vllm/models/test_qwen3_gguf_weights.cpp)
+target_include_directories(test_qwen3_gguf_weights PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 
 # DeepSeek-V4-Flash W3: the NEW attention primitives (DSA Lightning-Indexer
 # top-k selection + 512-wide MLA attention sinks + grouped output-LoRA) unit-
