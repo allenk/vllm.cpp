@@ -2,17 +2,37 @@
 # in diffs/review and exclude from language stats. Regen: scripts/regen-triton-aot.sh
 src/vt/cuda/triton_aot_vendored/** linguist-generated=true
 
-# The Triton AOT MANIFESTs pin `generator scripts/triton-aot-compile.py
-# sha256=<hash>`, and cmake/TritonAOT.cmake:591 recomputes that hash from the
-# WORKING TREE. A content hash over a text file is only meaningful if the bytes
-# are the same everywhere, and without this line they are not: a Windows
-# checkout with core.autocrlf gets CRLF and hashes to
-# 8b76c5d7c0575783859bf36ee04d0d520581f865a309b482548a3f483021621a where the
-# committed LF bytes -- and all seven MANIFESTs -- say
-# eba7b92b36dc898d3dabdca462eac23632a380003dcfd61078a8058750d3b79f.
+# ---------------------------------------------------------------------------
+# RULE: if a file's SHA256 is compared against a value recorded in a COMMITTED
+# manifest, its bytes must not depend on the platform that checked it out.
 #
-# MEASURED: the same repository content passes this check on both Linux CUDA
-# lanes and fails on cuda_windows, which is the only lane that both checks out
-# on Windows and consumes the vendored trees (the other Windows lanes build with
-# CUDA off and never reach triton_aot_finalize).
-scripts/triton-aot-compile.py text eol=lf
+# `file(SHA256 ...)` hashes the WORKING TREE. A Windows checkout with
+# core.autocrlf rewrites LF to CRLF, so an identical file hashes differently
+# there -- and every one of these checks then fails on Windows alone while
+# passing on Linux. `-text` tells git never to convert them in either
+# direction, which is the accurate statement for content that IS the hash.
+#
+# MEASURED, cuda_windows, the only lane that both checks out on Windows and
+# consumes these trees (the other Windows lanes build with CUDA off and never
+# reach triton_aot_finalize):
+#
+#   TritonAOT.cmake:594  generator shim differs        <- the .py below
+#   TritonAOT.cmake:636  artifact hash mismatch:       <- the vendored .c below
+#                        gdn_chunko_bf16_h32...c
+#
+# The second was found the hard way: the first fix pinned ONLY the .py, and the
+# very next lines of the same function hash .c and .h files. Fixing one instance
+# of a class that is visible in the same function is not fixing the class.
+#
+# Hashed sources (TritonAOT.cmake:533,540,550,591,634,661;
+# TritonAOTMultiArch.cmake:75,96,136):
+scripts/triton-aot-compile.py -text
+triton_kernels/*.py -text
+src/vt/cuda/triton_aot_vendored/** -text
+
+# NOT listed, and checked rather than assumed: TritonAOTDefaultTest.cmake hashes
+# demo.c/demo.h, but `_synth_fixture` GENERATES those at configure time into a
+# temp directory, so no checkout ever touches them. CMakeLists.txt:2070 hashes
+# the NVFP4 ABI sources into a build-id cache key that is never compared against
+# a committed value, so a different answer per platform costs a rebuild and not
+# a failure.
