@@ -851,6 +851,34 @@ foreach ($name in @("SOURCE_SHA", "VERSION", "EVIDENCE_URL", "SOURCE_DATE_EPOCH"
 
 Initialize-MsvcEnvironment
 
+# Initialize-MsvcEnvironment REPLACES $env:PATH, and that deletes the CUDA bin
+# directory the workflow put there.
+#
+# vcvars64.bat composes its PATH from the SYSTEM path in the registry, not from
+# the PATH it inherits, and the loop above imports every variable it prints. So
+# a GITHUB_PATH entry added by an earlier workflow step survives into this
+# process and does not survive this function -- which is a thing I reasoned my
+# way to the wrong answer about before measuring it.
+#
+# MEASURED, dry run #9. The lane built and linked, and the test binary then
+# exited 0xC0000135 with:
+#
+#   MISSING cublasLt64_13.dll
+#   ok      WS2_32.dll -> C:\Windows\system32\ws2_32.dll
+#   --- PATH entries carrying DLLs ---     (no NVIDIA entry among 40)
+#
+# cuBLASLt is an import of the test binary, not of the shipped archive: the
+# archive is audited separately and deliberately carries no CUDA payload
+# (validate-release-archive.py refuses one). So the DLL belongs on PATH for the
+# tests, and nowhere else.
+if ($Backend -eq "cuda") {
+    if (-not $env:CUDA_PATH) { throw "CUDA backend selected but CUDA_PATH is unset" }
+    $cudaBin = Join-Path $env:CUDA_PATH "bin"
+    if (-not (Test-Path $cudaBin)) { throw "CUDA_PATH has no bin directory: $cudaBin" }
+    $env:PATH = "$cudaBin;$env:PATH"
+    Write-Host "CUDA bin restored to PATH after the MSVC import: $cudaBin"
+}
+
 if (-not (Test-Path (Join-Path $SmokeModel "config.json"))) {
     throw "Windows runtime smoke model is incomplete: $SmokeModel"
 }
