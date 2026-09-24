@@ -924,11 +924,50 @@ if ($Backend -eq "vulkan") {
 # process, and the name is printed by THIS process (#584). The `throw` below is
 # load-bearing: the localiser reports, and the original failure still ends the
 # gate, so the lane stays red.
+# 0xC0000135 is STATUS_DLL_NOT_FOUND: the binary never reached main, so the
+# doctest localiser has nothing to localise and would report a mystery. Name the
+# missing import instead. MEASURED on cuda_windows, dry run #7: the whole build
+# and the whole Triton AOT chain passed and then
+#   test_openai_api_server.exe exited with status -1073741515
+# which says a DLL is absent and not WHICH, and that distinction has cost this
+# lane a run per guess six times already.
+function Show-MissingImports {
+    param([string]$Program)
+    Write-Host "--- STATUS_DLL_NOT_FOUND: resolving imports of $Program ---"
+    $dumpbin = Get-Command dumpbin -ErrorAction SilentlyContinue
+    if (-not $dumpbin) { Write-Host "dumpbin unavailable; cannot name the import"; return }
+    $lines = & dumpbin /dependents $Program 2>&1
+    $dir = Split-Path -Parent $Program
+    foreach ($line in $lines) {
+        if ($line -match '^\s{4}([A-Za-z0-9_.+-]+\.dll)\s*$') {
+            $dll = $Matches[1]
+            $beside = Join-Path $dir $dll
+            $onPath = Get-Command $dll -ErrorAction SilentlyContinue
+            if (Test-Path $beside) { Write-Host ("  ok      {0}  (beside the exe)" -f $dll) }
+            elseif ($onPath)       { Write-Host ("  ok      {0}  -> {1}" -f $dll, $onPath.Source) }
+            else                   { Write-Host ("  MISSING {0}" -f $dll) }
+        }
+    }
+    Write-Host "--- PATH entries carrying DLLs ---"
+    ($env:PATH -split ';') | Where-Object { $_ -and (Test-Path $_) } |
+        Where-Object { Get-ChildItem $_ -Filter *.dll -ErrorAction SilentlyContinue | Select-Object -First 1 } |
+        ForEach-Object { Write-Host "  $_" }
+}
+
 foreach ($test in $focusedTests) {
+    $program = Join-Path $BuildDir "tests/Release/$test"
     try {
-        Invoke-Checked (Join-Path $BuildDir "tests/Release/$test") @()
+        Invoke-Checked $program @()
     } catch {
-        Invoke-DoctestCaseLocaliserSafely -Program (Join-Path $BuildDir "tests/Release/$test")
+        # Read the code out of the exception Invoke-Checked threw rather than
+        # trusting $LASTEXITCODE to survive the throw: that function embeds it
+        # verbatim ("exited with status <n>"), so the message is the fact and
+        # the automatic variable would be an assumption.
+        if ("$($_.Exception.Message)" -match 'exited with status -1073741515') {
+            Show-MissingImports -Program $program
+        } else {
+            Invoke-DoctestCaseLocaliserSafely -Program $program
+        }
         throw
     }
 }
