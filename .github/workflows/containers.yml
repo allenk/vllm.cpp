@@ -361,6 +361,34 @@ jobs:
       packages: read
     runs-on: ubuntu-latest
     steps:
+      # WHY push-to-registry is false below, and why this job keeps
+      # `packages: read`.
+      #
+      # This job had never run on this fork until the 2026-09-24 nightly -- the
+      # first where `publish` went green on all six lane/arch pairs and
+      # `manifest` passed its own debut, both unblocked by the sm_120a AOT flag.
+      # `attest` then failed with
+      #
+      #   Error: No credentials found for registry ghcr.io
+      #
+      # because `push-to-registry: true` WRITES the attestation back to GHCR,
+      # and this job is deliberately not allowed to. That is not an oversight:
+      # `scripts/check-container-workflow.py` enforces that only `manifest`,
+      # `promote` and `publish` may hold `packages: write`, and this file's own
+      # header assigns `attest` the authority `id-token: write` alone. Granting
+      # the permission is REFUSED BY A GATE -- which is how this fix was found
+      # to be the wrong one before it ever reached a runner.
+      #
+      # So the contradiction lived inside the job: its permission contract says
+      # do not write to the registry, and its step options said push. The option
+      # is the side that drifted.
+      #
+      # Nothing in this tree reads the registry-side referrer.
+      # `release_postpublish_audit.py:305` verifies with `gh attestation
+      # verify`, against GitHub's own attestation store, and
+      # `validate-container-image.py` does not mention attestations at all. The
+      # provenance is still created and still verifiable; only the OCI referrer
+      # copy is not written.
       - name: Resolve the manifest digest for each lane
         id: resolve
         run: |
@@ -376,17 +404,17 @@ jobs:
         with:
           subject-name: ${{ env.REGISTRY_PACKAGE }}
           subject-digest: ${{ steps.resolve.outputs.cpu }}
-          push-to-registry: true
+          push-to-registry: false
       - uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.REGISTRY_PACKAGE }}
           subject-digest: ${{ steps.resolve.outputs.vulkan }}
-          push-to-registry: true
+          push-to-registry: false
       - uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.REGISTRY_PACKAGE }}
           subject-digest: ${{ steps.resolve.outputs.cuda }}
-          push-to-registry: true
+          push-to-registry: false
 
   promote:
     needs: [plan, attest]
