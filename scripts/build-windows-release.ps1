@@ -955,10 +955,15 @@ function Show-MissingImports {
 }
 
 foreach ($test in $focusedTests) {
-    $program = Join-Path $BuildDir "tests/Release/$test"
     try {
-        Invoke-Checked $program @()
+        # The path stays INLINE here. check-windows-portability.py:1210 matches
+        # the AST for an Invoke-Checked whose own text contains
+        # tests/Release/$test, so hoisting it into a variable deletes the gate's
+        # anchor -- which is exactly what happened in dry run #8 and took two
+        # green Windows lanes down with it, in 82 seconds, correctly.
+        Invoke-Checked (Join-Path $BuildDir "tests/Release/$test") @()
     } catch {
+        $program = Join-Path $BuildDir "tests/Release/$test"
         # Read the code out of the exception Invoke-Checked threw rather than
         # trusting $LASTEXITCODE to survive the throw: that function embeds it
         # verbatim ("exited with status <n>"), so the message is the fact and
