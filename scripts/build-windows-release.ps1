@@ -1047,6 +1047,38 @@ foreach ($test in $focusedTests) {
     }
 }
 
+# Prove the ten SMs the manifest is about to CLAIM are actually in the binary.
+#
+# This lane declares VLLM_CPP_CUDA_ARCHITECTURES with ten entries and its
+# manifest says `compiled_sms` is those ten. On Linux that claim is audited by
+# scripts/check-cuda-fat-gencode.py; on Windows it was not audited at all,
+# because that script requires compile_commands.json and the Visual Studio
+# generator does not emit one. Declaring ten and checking none is exactly the
+# shape of defect this release has spent a fortnight removing, and it would have
+# been introduced by the commit that widened the architecture list.
+#
+# So audit the half that needs no compile database: cuobjdump lists the device
+# code actually embedded, and the claim is about embedded device code. The
+# per-source flag intersection that check-cuda-fat-gencode.py also verifies
+# stays Linux-only and stays owed.
+if ($Backend -eq "cuda") {
+    $lib = Join-Path $BuildDir "Release/vllm.lib"
+    if (-not (Test-Path $lib)) { $lib = Join-Path $BuildDir "vllm.lib" }
+    if (-not (Test-Path $lib)) { throw "no vllm.lib under $BuildDir to audit for device code" }
+    $listing = & cuobjdump --list-elf $lib 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "cuobjdump failed on ${lib}: $listing" }
+    $text = ($listing | Out-String)
+    $declared = @("80", "86", "87", "89", "90a", "100a", "103a", "110", "120a", "121a")
+    $absent = $declared | Where-Object { $text -notmatch "sm_$_\b" }
+    if ($absent) {
+        Write-Host "--- cuobjdump --list-elf (first 40 lines) ---"
+        $listing | Select-Object -First 40 | ForEach-Object { Write-Host "  $_" }
+        throw ("the manifest will claim compiled_sms for ten SMs but the library " +
+               "carries no device code for: " + ($absent -join ", "))
+    }
+    Write-Host "device code present for all ten declared SMs"
+}
+
 if (Test-Path $StageDir) {
     Remove-Item -Recurse -Force $StageDir
 }
