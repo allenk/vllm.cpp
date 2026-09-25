@@ -871,12 +871,35 @@ Initialize-MsvcEnvironment
 # archive is audited separately and deliberately carries no CUDA payload
 # (validate-release-archive.py refuses one). So the DLL belongs on PATH for the
 # tests, and nowhere else.
+# CUDA 13 splits its DLLs across TWO directories, which the first version of
+# this block got wrong: the driver tools live in bin\, and the MATH LIBRARIES --
+# cuBLAS, cuBLASLt, cuFFT and friends -- live in bin\x64\. Adding only bin\
+# restored PATH, printed a reassuring line, and left the test importing
+# cublasLt64_13.dll with nowhere to find it. Confirmed against a local CUDA 13.2
+# install: .../CUDA/v13.2/bin/x64/cublasLt64_13.dll.
+#
+# The assertion at the end is the point. Prepending directories is a hypothesis;
+# resolving the import is a fact, and this lane has spent eight walls on the
+# difference between the two.
 if ($Backend -eq "cuda") {
     if (-not $env:CUDA_PATH) { throw "CUDA backend selected but CUDA_PATH is unset" }
-    $cudaBin = Join-Path $env:CUDA_PATH "bin"
-    if (-not (Test-Path $cudaBin)) { throw "CUDA_PATH has no bin directory: $cudaBin" }
-    $env:PATH = "$cudaBin;$env:PATH"
-    Write-Host "CUDA bin restored to PATH after the MSVC import: $cudaBin"
+    $added = @()
+    foreach ($leaf in @("bin", "bin\x64")) {
+        $dir = Join-Path $env:CUDA_PATH $leaf
+        if (Test-Path $dir) { $env:PATH = "$dir;$env:PATH"; $added += $dir }
+    }
+    if (-not $added) { throw "CUDA_PATH has neither bin nor bin\x64: $env:CUDA_PATH" }
+    $added | ForEach-Object { Write-Host "CUDA on PATH after the MSVC import: $_" }
+    # Prove the one import that has actually failed here, by name.
+    $probe = "cublasLt64_13.dll"
+    $found = $added | ForEach-Object { Join-Path $_ $probe } | Where-Object { Test-Path $_ }
+    if (-not $found) {
+        Write-Host "--- DLLs under $env:CUDA_PATH ---"
+        Get-ChildItem $env:CUDA_PATH -Recurse -Filter *.dll -ErrorAction SilentlyContinue |
+            Select-Object -First 40 | ForEach-Object { Write-Host "  $($_.FullName)" }
+        throw "$probe is not under CUDA_PATH; the tests import it and will exit 0xC0000135"
+    }
+    Write-Host "resolved $probe -> $($found | Select-Object -First 1)"
 }
 
 if (-not (Test-Path (Join-Path $SmokeModel "config.json"))) {
