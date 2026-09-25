@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -24,8 +25,37 @@ ROOT = Path(__file__).resolve().parent.parent
 MATRIX = ROOT / "release/container-matrix.json"
 
 
+def package_of(matrix: dict) -> str:
+    """The registry package these tags belong to.
+
+    FORK: `REGISTRY_PACKAGE` in the environment wins over the matrix.
+
+    `release/container-matrix.json` is upstream's file and says
+    `ghcr.io/mudler/vllm.cpp`; this fork cannot push there and publishes
+    `ghcr.io/allenk/vllm.cpp-vk` instead. `.github/workflows/containers.yml:58`
+    already declares that override as a job-level `env`, and every job in it
+    uses `${REGISTRY_PACKAGE}` -- except `promote`, which delegates to this
+    script and so read upstream's name instead.
+
+    That mattered because `promote` is the ONE job in the pipeline that cannot
+    be rehearsed: it is gated on `is_release == 'true'`, so it runs for the
+    first time at the tag and never on a push or a dispatch. Running
+    `--moving` by hand before tagging is what caught it, and it would have
+    tried to retag an image that does not exist in a package we cannot write:
+
+        ghcr.io/mudler/vllm.cpp:0.0.3-vk.1-cpu -> ghcr.io/mudler/vllm.cpp:latest-cpu
+
+    Honouring the env keeps the fork's identity in ONE place rather than two.
+    Changing the matrix instead would have meant editing an upstream data file,
+    the constant `check-container-matrix.py:88` compares it against, and
+    whatever `check-quickstart-recipes.py` renders from it -- three edits to
+    express what the workflow already says once.
+    """
+    return os.environ.get("REGISTRY_PACKAGE") or matrix["package"]
+
+
 def immutable_tags(matrix: dict, version: str) -> list[str]:
-    package = matrix["package"]
+    package = package_of(matrix)
     return [
         f"{package}:{lane['version_tag'].format(version=version)}"
         for lane in matrix["lanes"]
@@ -33,7 +63,7 @@ def immutable_tags(matrix: dict, version: str) -> list[str]:
 
 
 def moving_pairs(matrix: dict, version: str) -> list[tuple[str, str]]:
-    package = matrix["package"]
+    package = package_of(matrix)
     pairs: list[tuple[str, str]] = []
     for lane in matrix["lanes"]:
         source = f"{package}:{lane['version_tag'].format(version=version)}"
@@ -48,7 +78,7 @@ def main_pairs(matrix: dict) -> list[tuple[str, str]]:
     Main images are a convenience, not a release: they move, they carry no
     support claim, and they must never touch `latest*` or a version tag.
     """
-    package = matrix["package"]
+    package = package_of(matrix)
     return [
         (f"{package}:{lane['id']}", f"{package}:{lane['main_tag']}")
         for lane in matrix["lanes"]
@@ -56,7 +86,7 @@ def main_pairs(matrix: dict) -> list[tuple[str, str]]:
 
 
 def main_tags(matrix: dict) -> list[str]:
-    package = matrix["package"]
+    package = package_of(matrix)
     return [f"{package}:{lane['main_tag']}" for lane in matrix["lanes"]]
 
 
