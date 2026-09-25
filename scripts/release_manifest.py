@@ -375,6 +375,11 @@ def _artifact_policy(manifest: dict[str, Any]) -> list[str]:
         "linux-x86_64-musl-cpu-static": ("linux", "x86_64", "musl", "cpu", "literal-static", {"experimental-preview"}),
         "windows-x86_64-msvc-cpu": ("windows", "x86_64", "msvc", "cpu", "static-core", {"preview"}),
         "windows-x86_64-msvc-vulkan": ("windows", "x86_64", "msvc", "vulkan", "static-core", {"preview"}),
+        # FORK: upstream has no Windows CUDA lane. release-matrix.json declares
+        # this artifact as preview and release_pipeline.py already carries its
+        # archive format; without this row the manifest refuses the artifact the
+        # rest of the pipeline is built to produce.
+        "windows-x86_64-msvc-cuda": ("windows", "x86_64", "msvc", "cuda", "static-core", {"preview"}),
     }
     policy = policies.get(artifact_id)
     if policy is None and artifact.get("kind") == "diagnostic" and name == "cuda":

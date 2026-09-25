@@ -377,7 +377,25 @@ def windows_dependencies(report_path: Path, backend: str) -> list[dict[str, Any]
         }
         for name in sorted(set(imports), key=str.upper)
     ]
-    if backend == "vulkan":
+    # FORK: the cuda row exists because this fork added a Windows CUDA lane that
+    # upstream does not have. Its runtime is external and never bundled, exactly
+    # like Vulkan's -- validate-release-archive.py REFUSES a CUDA payload in a
+    # Windows archive, so declaring these as host-supplied is not a choice, it is
+    # the only description of the artifact that is true.
+    externals = {
+        "vulkan": (
+            ("vulkan-loader", "library"),
+            ("vulkan-icd", "library"),
+            ("vulkan-driver", "driver"),
+        ),
+        "cuda": (
+            ("cuda-driver", "driver"),
+            ("cudart", "library"),
+            ("cublas", "library"),
+            ("cublasLt", "library"),
+        ),
+    }
+    if backend in externals:
         rows.extend(
             {
                 "bundled": False,
@@ -387,18 +405,14 @@ def windows_dependencies(report_path: Path, backend: str) -> list[dict[str, Any]
                 "role": "external-runtime",
                 "version": "host",
             }
-            for name, kind in (
-                ("vulkan-loader", "library"),
-                ("vulkan-icd", "library"),
-                ("vulkan-driver", "driver"),
-            )
+            for name, kind in externals[backend]
         )
     return rows
 
 
 def prepare_windows_metadata(args: argparse.Namespace) -> dict[str, Any]:
     expected_id = f"windows-x86_64-msvc-{args.backend}"
-    if args.artifact_id != expected_id or args.backend not in {"cpu", "vulkan"}:
+    if args.artifact_id != expected_id or args.backend not in {"cpu", "vulkan", "cuda"}:
         raise ValueError(f"unsupported Windows artifact {args.artifact_id!r}")
     server = args.stage_dir / "bin/vllm-server.exe"
     if not server.is_file():
@@ -406,12 +420,27 @@ def prepare_windows_metadata(args: argparse.Namespace) -> dict[str, Any]:
     flags = backend_flags(parse_cache(args.build_dir / "CMakeCache.txt"))
     if flags["VLLM_CPP_VULKAN"] is not (args.backend == "vulkan"):
         raise ValueError("resolved Vulkan flag disagrees with Windows artifact")
+    # The same check for CUDA, and it is not symmetry for its own sake: without
+    # it a cuda-labelled artifact built with VLLM_CPP_CUDA=OFF would describe
+    # itself as a CUDA build and say so in a signed manifest.
+    if flags["VLLM_CPP_CUDA"] is not (args.backend == "cuda"):
+        raise ValueError("resolved CUDA flag disagrees with Windows artifact")
     compiled_tiers, selected_tier, test_commands = load_tier_report(
         args.tier_report, "x86_64", False
     )
     dependency_rows = windows_dependencies(args.pe_report, args.backend)
-    runtime = (absent("no real extracted-archive Vulkan ICD probe was executed")
-               if args.backend == "vulkan"
+    # A runner with no GPU cannot produce runtime evidence, and the manifest must
+    # say so rather than inherit the CPU lane's passing command line. The Windows
+    # CUDA lane proves BUILD and PACKAGING only -- release.yml says that in its
+    # own comment, and this is where that sentence becomes a machine-readable
+    # fact instead of a promise in YAML.
+    no_runtime = {
+        "vulkan": "no real extracted-archive Vulkan ICD probe was executed",
+        "cuda": "the release runner has no NVIDIA GPU; this lane proves build and "
+                "packaging and never execution",
+    }
+    runtime = (absent(no_runtime[args.backend])
+               if args.backend in no_runtime
                else passed(" && ".join(test_commands), args.evidence_url))
     facts: dict[str, Any] = {
         "artifact": {
@@ -507,7 +536,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--toolchain", required=True)
     parser.add_argument("--evidence-url", required=True)
-    parser.add_argument("--backend", choices=("cpu", "vulkan"), default="cpu")
+    parser.add_argument("--backend", choices=("cpu", "vulkan", "cuda"), default="cpu")
     parser.add_argument("--pe-report", type=Path)
     parser.add_argument("--toolset-version")
     parser.add_argument("--ucrt-version")
