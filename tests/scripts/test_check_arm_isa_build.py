@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import importlib.util
 import sys
 import tempfile
 import unittest
@@ -37,10 +38,40 @@ def valid_commands() -> list[dict[str, str]]:
             "-march=armv8.2-a+i8mm+dotprod",
         ),
         entry(
-            "src/vt/cpu/cpu_quant_repack_arm.cpp",
+            "src/vt/cpu/cpu_quant_repack_simd.cpp",
             "-march=armv8.2-a+i8mm+dotprod",
         ),
     ]
+
+
+class TierTableMatchesTheTree(unittest.TestCase):
+    """Every source TIER_MARCH names must EXIST.
+
+    This suite was green for nine days while the audit it guards failed 35
+    scheduled ci runs in a row, because both sides said
+    `src/vt/cpu/cpu_quant_repack_arm.cpp` and the tree has
+    `cpu_quant_repack_simd.cpp`. The fixture wrote whichever name the checker
+    read, so they agreed with each other and neither agreed with reality -- a
+    control that shares the bug is not a control.
+
+    The directory listing is the thing neither of them can fake.
+    """
+
+    def test_every_tier_source_exists(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        spec = importlib.util.spec_from_file_location(
+            "check_arm_isa_build", root / "scripts" / "check-arm-isa-build.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        missing = [
+            name for name in (*module.TIER_MARCH, *module.BASELINE_SOURCES)
+            if not (root / name).is_file()
+        ]
+        self.assertEqual(
+            missing, [], f"check-arm-isa-build.py names sources that do not exist: {missing}"
+        )
 
 
 class ArmIsaBuildContract(unittest.TestCase):

@@ -19,7 +19,13 @@ BASELINE_SOURCES = (
 TIER_MARCH = {
     "src/vt/cpu/cpu_quant_dot_sdot.cpp": "-march=armv8.2-a+dotprod+fp16",
     "src/vt/cpu/cpu_quant_dot_arm.cpp": "-march=armv8.2-a+i8mm+dotprod",
-    "src/vt/cpu/cpu_quant_repack_arm.cpp": "-march=armv8.2-a+i8mm+dotprod",
+    # The repack tier's file is cpu_quant_repack_SIMD.cpp. This table said
+    # _arm.cpp, a name the tree does not contain, so the audit demanded a
+    # compile command that could never exist and the scheduled ci lane has
+    # failed on it 35 times running since 2026-09-16. CMakeLists.txt:1536-1538
+    # applies these exact flags to cpu_quant_dot_arm.cpp and
+    # cpu_quant_repack_simd.cpp together.
+    "src/vt/cpu/cpu_quant_repack_simd.cpp": "-march=armv8.2-a+i8mm+dotprod",
 }
 
 
