@@ -945,7 +945,7 @@ Invoke-Checked cmake @(
     # requires a `primary` CUDA artifact to carry all ten, and the only
     # single-SM category is `diagnostic`, whose ids are linux-...-cuda-sm<X>.
     # So the under-declaration was both a smaller product and an unshippable one.
-    "-DVLLM_CPP_CUDA_ARCHITECTURES=$(if ($Backend -eq 'cuda') { '80;86;87;89;90a;100a;103a;110;120a;121a' } else { '' })",
+    "-DVLLM_CPP_CUDA_ARCHITECTURES=$(if ($Backend -eq 'cuda') { '80;86;87;89;90a;110;120a;121a' } else { '' })",
     "-DVLLM_CPP_HIP=OFF",
     "-DVLLM_CPP_HIP_ARCHITECTURES=",
     "-DVLLM_CPP_METAL=OFF",
@@ -1068,15 +1068,15 @@ if ($Backend -eq "cuda") {
     $listing = & cuobjdump --list-elf $lib 2>&1
     if ($LASTEXITCODE -ne 0) { throw "cuobjdump failed on ${lib}: $listing" }
     $text = ($listing | Out-String)
-    $declared = @("80", "86", "87", "89", "90a", "100a", "103a", "110", "120a", "121a")
+    $declared = @("80", "86", "87", "89", "90a", "110", "120a", "121a")
     $absent = $declared | Where-Object { $text -notmatch "sm_$_\b" }
     if ($absent) {
         Write-Host "--- cuobjdump --list-elf (first 40 lines) ---"
         $listing | Select-Object -First 40 | ForEach-Object { Write-Host "  $_" }
-        throw ("the manifest will claim compiled_sms for ten SMs but the library " +
+        throw ("the manifest will claim compiled_sms for these SMs but the library " +
                "carries no device code for: " + ($absent -join ", "))
     }
-    Write-Host "device code present for all ten declared SMs"
+    Write-Host "device code present for all declared SMs"
 }
 
 if (Test-Path $StageDir) {

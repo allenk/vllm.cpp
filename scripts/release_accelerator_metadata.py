@@ -64,9 +64,17 @@ def dependency_rows(server: Path, backend: str, abi_version: str) -> list[dict[s
     return rows
 
 
-def cuda_evidence(url: str) -> dict[str, Any]:
+def cuda_evidence(url: str, sms: tuple[str, ...] | None = None) -> dict[str, Any]:
+    """Per-SM evidence for the architectures this artifact was built for.
+
+    `sms` defaults to every supported SM, which is what the Linux lanes ship.
+    The Windows lane passes a smaller set because MSVC cannot compile two of
+    them (release_manifest.REACHABLE_CUDA_SMS). Taking it as an argument keeps
+    BOTH platforms generating their rows from this one function, so they cannot
+    describe the same architecture differently.
+    """
     rows = []
-    for sm in release_manifest.PRIMARY_CUDA_SMS:
+    for sm in (sms if sms is not None else release_manifest.PRIMARY_CUDA_SMS):
         available = release_manifest.AOT_AVAILABILITY[sm]
         rows.append(
             {
@@ -92,7 +100,7 @@ def cuda_evidence(url: str) -> dict[str, Any]:
             }
         )
     return {
-        "compiled_sms": list(release_manifest.PRIMARY_CUDA_SMS),
+        "compiled_sms": list(sms if sms is not None else release_manifest.PRIMARY_CUDA_SMS),
         "sm_evidence": rows,
     }
 

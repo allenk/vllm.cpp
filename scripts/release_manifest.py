@@ -52,6 +52,28 @@ AOT_AVAILABILITY = {
     "80": True, "86": True, "87": False, "89": True, "90a": True,
     "100a": True, "103a": False, "110": False, "120a": True, "121a": True,
 }
+# The SMs a given HOST TOOLCHAIN can actually compile.
+#
+# `PRIMARY_CUDA_SMS` is the ten this project supports, and it was also the
+# requirement for every primary CUDA artifact -- which encoded a Linux
+# assumption. MSVC cannot compile two of them: CCCL's tcgen05 PTX headers expand
+# to an empty asm operand under cl.exe,
+#
+#   tcgen05_ld.h(217): asm("tcgen05.ld..." : "=r"( [0]) : ...
+#                                                  ^ expected an identifier
+#
+# and `/Zc:preprocessor`, which CCCL's own guard header recommends by name, does
+# NOT fix it -- verified locally: the guard's #error disappears and the operand
+# stays empty. Measured per architecture on CUDA 13.2 + MSVC 14.44: sm_80, 86,
+# 87, 89, 90a, 110, 120a and 121a compile; sm_100a and sm_103a do not.
+#
+# Those two are Blackwell DATACENTRE parts. They run Linux in racks, so a
+# Windows artifact claiming them would have no user, and declaring eight is the
+# accurate description rather than a reduced one. An OS absent from this table
+# keeps the full ten.
+REACHABLE_CUDA_SMS = {
+    "windows": ("80", "86", "87", "89", "90a", "110", "120a", "121a"),
+}
 PUBLISHED_EVIDENCE = ("build", "archive_smoke", "dependency_audit")
 STABLE_EVIDENCE = ("runtime", "correctness")
 STABLE_SUPPLY_CHAIN_EVIDENCE = (
@@ -671,8 +693,15 @@ def _cuda_policy(manifest: dict[str, Any]) -> list[str]:
         errors.append(f"$.cuda.compiled_sms: unsupported CUDA SM claim {unsupported!r}")
     artifact = manifest.get("artifact", {})
     kind = artifact.get("kind") if isinstance(artifact, dict) else None
-    if kind == "primary" and compiled != list(PRIMARY_CUDA_SMS):
-        errors.append("$.cuda.compiled_sms: primary CUDA artifact requires all ten supported SMs")
+    if kind == "primary":
+        host = manifest.get("host", {})
+        expected = list(REACHABLE_CUDA_SMS.get(
+            host.get("os") if isinstance(host, dict) else None, PRIMARY_CUDA_SMS))
+        if compiled != expected:
+            errors.append(
+                "$.cuda.compiled_sms: primary CUDA artifact on "
+                f"{host.get('os') if isinstance(host, dict) else 'unknown'} requires "
+                f"exactly {expected!r}")
     if kind == "diagnostic" and len(compiled) != 1:
         errors.append("$.cuda.compiled_sms: diagnostic CUDA artifact requires exactly one SM")
     row_sms = [row.get("sm") for row in rows if isinstance(row, dict)]
