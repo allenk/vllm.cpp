@@ -1196,19 +1196,36 @@ $headerOutput = @(& dumpbin /nologo /headers $server 2>&1)
 if ($LASTEXITCODE -ne 0) { throw "dumpbin /headers failed" }
 $dependentOutput = @(& dumpbin /nologo /dependents $server 2>&1)
 if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed" }
-$rawOutput = @(& dumpbin /nologo /rawdata $server 2>&1)
-if ($LASTEXITCODE -ne 0) { throw "dumpbin /rawdata failed" }
+# NOT collected into a variable. `dumpbin /rawdata` prints the whole binary as
+# hex text, and this server is a fat CUDA build: the dump is several times the
+# binary and every line became a PowerShell string object here, then a single
+# joined string below. Measured: dry run #14 built all eight SMs, passed every
+# test, served its smoke request, and died two minutes later with
+#
+#   build-windows-release.ps1: Insufficient memory to continue the execution
+#                              of the program.
+#
+# It survived for as long as this lane declared one architecture and produced a
+# small binary. The scan is streamed instead, so only the matches are retained;
+# see the $debugPaths assignment below.
 $machine = if (($headerOutput -join "`n") -match '(?im)^\s*(8664)\s+machine') { $Matches[1] } else { "" }
 $imports = @(
     $dependentOutput | ForEach-Object {
         if ($_ -match '^\s*([A-Za-z0-9_.+-]+\.dll)\s*$') { $Matches[1] }
     } | Sort-Object -Unique
 )
+# Same pattern, same result set, bounded memory: dumpbin's output is piped
+# straight into Select-String so nothing holds the dump, and only matched
+# substrings survive. $headerOutput is small and already in hand.
+$pdbPattern = '(?i)[A-Za-z]:[\\/][^\r\n\x00]*?\.pdb'
 $debugPaths = @(
-    (($headerOutput + $rawOutput) -join "`n") |
-        Select-String -AllMatches -Pattern '(?i)[A-Za-z]:[\\/][^\r\n\x00]*?\.pdb' |
-        ForEach-Object { $_.Matches.Value } | Sort-Object -Unique
-)
+    @($headerOutput | Select-String -AllMatches -Pattern $pdbPattern |
+        ForEach-Object { $_.Matches.Value }) +
+    @(& dumpbin /nologo /rawdata $server 2>&1 |
+        Select-String -AllMatches -Pattern $pdbPattern |
+        ForEach-Object { $_.Matches.Value })
+) | Sort-Object -Unique
+if ($LASTEXITCODE -ne 0) { throw "dumpbin /rawdata failed" }
 @{
     schema = "vllm.cpp.pe-audit.v1"; machine = $machine
     imports = $imports; debug_paths = $debugPaths
