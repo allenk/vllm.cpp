@@ -926,7 +926,26 @@ Invoke-Checked cmake @(
     # src/vt/cuda/triton_aot_vendored/<arch>/ has to match what is being built,
     # and a fat build would carry cubins for architectures whose trees are not
     # all present.
-    "-DVLLM_CPP_CUDA_ARCHITECTURES=$(if ($Backend -eq 'cuda') { '120a' } else { '' })",
+    # TEN SMs, the same list build-linux-accelerator-release.sh:24 passes, and
+    # not the single `120a` this lane used to declare.
+    #
+    # That `120a` came from reading TritonAOT.cmake's single-arch FATAL_ERROR as
+    # a rule about BUILDING. It is not; cmake/TritonAOT.cmake:119-124 says so in
+    # as many words -- the arch names function "embeds every available tree and
+    # leaves the choice to exact-SM runtime dispatch. A fat builder configure is
+    # therefore fine (the shipped ten-SM release archive is exactly that), and it
+    # is only REGENERATION -- writing a cubin into one directory -- that needs a
+    # single arch."
+    #
+    # The evidence agreed before the comment was found: this lane's own build
+    # consumed 140 Triton AOT entries across all seven vendored trees while
+    # declaring one architecture. The two lists were never coupled.
+    #
+    # Declaring one SM also made the artifact undescribable: release_manifest.py
+    # requires a `primary` CUDA artifact to carry all ten, and the only
+    # single-SM category is `diagnostic`, whose ids are linux-...-cuda-sm<X>.
+    # So the under-declaration was both a smaller product and an unshippable one.
+    "-DVLLM_CPP_CUDA_ARCHITECTURES=$(if ($Backend -eq 'cuda') { '80;86;87;89;90a;100a;103a;110;120a;121a' } else { '' })",
     "-DVLLM_CPP_HIP=OFF",
     "-DVLLM_CPP_HIP_ARCHITECTURES=",
     "-DVLLM_CPP_METAL=OFF",

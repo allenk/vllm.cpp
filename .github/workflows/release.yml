@@ -482,11 +482,24 @@ jobs:
           if-no-files-found: error
           overwrite: false
           retention-days: 7
-  # CUDA is a PREVIEW lane and says so: it is built for sm_120a ONLY.
-  # A Triton AOT artifact is a cubin and therefore single-arch, so the
-  # architecture the build declares has to match a vendored tree under
-  # src/vt/cuda/triton_aot_vendored/, and only sm_120a was generated on
-  # hardware here. Other architectures are not faked.
+  # CUDA is a PREVIEW lane and says so, and it is built for the SAME TEN SMs as
+  # the Linux CUDA lanes: 80;86;87;89;90a;100a;103a;110;120a;121a.
+  #
+  # It used to declare sm_120a alone, on the reasoning that "a Triton AOT
+  # artifact is a cubin and therefore single-arch, so the architecture the build
+  # declares has to match a vendored tree". That is the REGENERATION rule, not
+  # the build rule, and cmake/TritonAOT.cmake:119-124 says so directly: the arch
+  # names function "embeds every available tree and leaves the choice to
+  # exact-SM runtime dispatch. A fat builder configure is therefore fine (the
+  # shipped ten-SM release archive is exactly that), and it is only
+  # REGENERATION -- writing a cubin into one directory -- that needs a single
+  # arch."
+  #
+  # Seven trees are vendored; the three SMs without one (87, 103a, 110) declare
+  # portable_fallback in the manifest, exactly as the Linux archives already do.
+  # Nothing is faked -- that half of the old comment was right, and it is kept
+  # honest by the AOT_AVAILABILITY table rather than by shipping a smaller
+  # artifact that no manifest category could describe.
   #
   # The runner has no NVIDIA GPU, so this lane proves BUILD and PACKAGING.
   # It does not prove execution, and nothing here should be read as if it

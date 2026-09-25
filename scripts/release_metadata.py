@@ -491,6 +491,14 @@ def prepare_windows_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "compiled_tiers": compiled_tiers,
             "selected_tier": selected_tier,
         }
+    if args.backend == "cuda":
+        # A CUDA artifact must declare the SMs it was compiled for; without them
+        # the generator refuses it outright ("CUDA generation input requires
+        # cuda.compiled_sms"). This is the SAME function the Linux CUDA lanes
+        # publish from, so the two cannot end up describing the same ten
+        # architectures differently.
+        import release_accelerator_metadata
+        facts["cuda"] = release_accelerator_metadata.cuda_evidence(args.evidence_url)
     schema = release_manifest.load_schema(args.repo_root / "release/manifest-v1.schema.json")
     manifest = release_manifest.generate_manifest(facts, args.repo_root, schema)
     output = args.output_dir
