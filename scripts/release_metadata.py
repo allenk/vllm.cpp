@@ -388,8 +388,14 @@ def windows_dependencies(report_path: Path, backend: str) -> list[dict[str, Any]
             ("vulkan-icd", "library"),
             ("vulkan-driver", "driver"),
         ),
+        # The driver row must be named exactly "nvidia-driver": release_manifest.py
+        # :570 requires that name, and :573-579 REFUSES any other dependency of
+        # kind "driver" on a CUDA artifact -- so an invented "cuda-driver" fails
+        # twice. The Linux lanes declare the same row from
+        # release_accelerator_metadata.py:55, so both platforms now name the
+        # driver boundary identically.
         "cuda": (
-            ("cuda-driver", "driver"),
+            ("nvidia-driver", "driver"),
             ("cudart", "library"),
             ("cublas", "library"),
             ("cublasLt", "library"),
