@@ -1218,13 +1218,20 @@ $imports = @(
 # straight into Select-String so nothing holds the dump, and only matched
 # substrings survive. $headerOutput is small and already in hand.
 $pdbPattern = '(?i)[A-Za-z]:[\\/][^\r\n\x00]*?\.pdb'
+# The @() wraps the WHOLE pipeline including Sort-Object, which is what keeps
+# this a string ARRAY. Moving it inside -- as the first version of this streamed
+# rewrite did -- makes Sort-Object emit a scalar for one match and $null for
+# none, and release_metadata.py then refuses the report:
+#   release metadata error: PE audit debug_paths must be a string array
+# That took all THREE Windows lanes down, two of which had been green.
 $debugPaths = @(
     @($headerOutput | Select-String -AllMatches -Pattern $pdbPattern |
         ForEach-Object { $_.Matches.Value }) +
     @(& dumpbin /nologo /rawdata $server 2>&1 |
         Select-String -AllMatches -Pattern $pdbPattern |
-        ForEach-Object { $_.Matches.Value })
-) | Sort-Object -Unique
+        ForEach-Object { $_.Matches.Value }) |
+    Sort-Object -Unique
+)
 if ($LASTEXITCODE -ne 0) { throw "dumpbin /rawdata failed" }
 @{
     schema = "vllm.cpp.pe-audit.v1"; machine = $machine
