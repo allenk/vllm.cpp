@@ -93,8 +93,28 @@ jobs:
           set -euo pipefail
           version=$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
           test -n "$version"
+          # FORK: the version that names a release artifact is the one declared
+          # in release/release-version.json, NOT the bare project() version
+          # above. CMake carries the upstream number (0.0.3) while a fork
+          # release rides in the pre-release field (0.0.3-vk.1), so a fork tag
+          # can never be read as an upstream one -- FORK.md 2. Deriving the
+          # version here from CMakeLists alone made this check demand `v0.0.3`,
+          # which no fork tag can satisfy: the v0.0.3-vk.1 run skipped its
+          # whole graph 16s in, while release.yml -- which reads the
+          # declaration -- accepted the same tag. Two files held the version
+          # and only one of them had been taught what this fork is.
+          project_version="$version"
+          version=$(python3 -c 'import json; print(json.load(open("release/release-version.json"))["version"])')
+          test -n "$version"
+          # The declaration is still checked against the tree it ships from, so
+          # the shipped version cannot drift from the source it was built out of.
+          case "${version}" in
+            "${project_version}"|"${project_version}"-*) ;;
+            *) echo "release-version.json ${version} does not extend CMakeLists ${project_version}" >&2
+               exit 1 ;;
+          esac
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            # The tag is untrusted input until it matches the tree.
+            # The tag is untrusted input until it matches the declaration.
             test "${GITHUB_REF_NAME}" = "v${version}"
             echo "is_release=true" >> "$GITHUB_OUTPUT"
           else
