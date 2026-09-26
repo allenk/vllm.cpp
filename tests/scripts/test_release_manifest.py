@@ -324,6 +324,84 @@ class ReleaseManifestTests(unittest.TestCase):
         if needle:
             self.assertTrue(any(needle in error for error in errors), errors)
 
+    def test_windows_cuda_rows_satisfy_the_manifest_policies(self) -> None:
+        """The rows the Windows CUDA lane builds must pass the policies.
+
+        Every one of these was learned by a 1h44m dry run failing on ONE line:
+
+            CUDA generation input requires cuda.compiled_sms
+            primary CUDA artifact requires all ten supported SMs
+            $.dependencies: cuda requires external nvidia-driver declaration
+
+        The policy functions are PURE over a dict, so the same answers are
+        available in a second. This case exists so the next person spends the
+        second rather than the hour, and so a change to either side -- the rows
+        release_metadata.py builds, or the policy they must satisfy -- cannot
+        drift apart silently again.
+        """
+        tool = _load_tool()
+        spec = importlib.util.spec_from_file_location(
+            "release_accelerator_metadata",
+            ROOT / "scripts" / "release_accelerator_metadata.py",
+        )
+        assert spec is not None and spec.loader is not None
+        accel = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(accel)
+
+        def external(name: str, kind: str) -> dict[str, object]:
+            return {
+                "bundled": False, "kind": kind, "linkage": "external",
+                "name": name, "role": "external-runtime", "version": "host",
+            }
+
+        # Mirrors release_metadata.windows_dependencies()'s cuda branch.
+        rows = [
+            {"bundled": False, "kind": "library", "linkage": "dynamic",
+             "name": name, "role": "system", "version": "windows-2022"}
+            for name in ("KERNEL32.dll", "WS2_32.dll")
+        ] + [
+            external("nvidia-driver", "driver"),
+            external("cudart", "library"),
+            external("cublas", "library"),
+            external("cublasLt", "library"),
+        ]
+
+        manifest = {
+            "artifact": {
+                "id": "windows-x86_64-msvc-cuda", "kind": "primary",
+                "channel": "preview", "static_boundary": "static-core",
+                "version": "0.0.3-vk.1", "c_abi_version": "1",
+            },
+            "backend": {"name": "cuda",
+                        "gpu_driver_boundary": "external-host-never-bundled"},
+            "host": {"os": "windows", "arch": "x86_64", "abi": "msvc"},
+            "dependencies": rows,
+            "cuda": accel.cuda_evidence(
+                "https://example/run", sms=tool.REACHABLE_CUDA_SMS["windows"]
+            ),
+        }
+
+        self.assertEqual(tool._dependency_policy(manifest), [])
+        self.assertEqual(tool._cuda_policy(manifest), [])
+
+    def test_windows_cuda_declares_only_what_msvc_can_build(self) -> None:
+        """REACHABLE_CUDA_SMS['windows'] must exclude the tcgen05 architectures.
+
+        MEASURED, CUDA 13.2 + MSVC 14.44, one #include <cuda/ptx> TU: sm_100a and
+        sm_103a fail to compile because CCCL's tcgen05 PTX headers expand to an
+        empty asm operand under cl.exe, and /Zc:preprocessor -- which CCCL's own
+        guard recommends by name -- does not fix it. Everything else compiles.
+
+        Linux keeps all ten; this is a Windows-only narrowing and the test says
+        so from both directions, so neither the exclusion nor the Linux set can
+        be edited by accident.
+        """
+        tool = _load_tool()
+        windows = set(tool.REACHABLE_CUDA_SMS["windows"])
+        self.assertEqual(windows & {"100a", "103a"}, set())
+        self.assertEqual(windows, set(tool.PRIMARY_CUDA_SMS) - {"100a", "103a"})
+        self.assertNotIn("linux", tool.REACHABLE_CUDA_SMS)
+
     def test_aot_availability_matches_the_vendored_trees(self) -> None:
         """AOT_AVAILABILITY must agree with the trees that exist on disk.
 
