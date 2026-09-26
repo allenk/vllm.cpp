@@ -263,6 +263,59 @@ class DockerfileMutationTests(unittest.TestCase):
         self.assertEqual([e for e in errors if "never bundled" in e], [])
 
 
+class AttributionMutationTests(unittest.TestCase):
+    """image.source must name THIS fork, and must not erase the origin.
+
+    v0.0.3-vk.1 was one tag away from shipping three images whose
+    image.source said mudler/vllm.cpp while the image.revision beside it was
+    a commit that exists only in allenk/vllm.cpp -- a pair no reader can
+    reconcile, and the label GHCR follows when it decides which repository,
+    and which README, a package belongs to. The label was present the whole
+    time; only its VALUE was wrong, which is exactly what a presence check
+    cannot see.
+    """
+
+    def test_an_upstream_source_label_is_rejected(self):
+        matrix = shipped_matrix()
+        text = DOCKERFILE.read_text(encoding="utf-8").replace(
+            checker.FORK_SOURCE, checker.UPSTREAM_SOURCE, 1
+        )
+        errors = dockerfile_errors(matrix, text)
+        self.assertTrue(
+            any("must not appear to ship from" in e for e in errors),
+            "one lane pointing upstream has to be refused",
+        )
+
+    def test_every_lane_carries_its_own_source_label(self):
+        matrix = shipped_matrix()
+        text = DOCKERFILE.read_text(encoding="utf-8").replace(
+            '      org.opencontainers.image.source="%s" %s%s'
+            % (checker.FORK_SOURCE, chr(92), chr(10)),
+            "",
+            1,
+        )
+        errors = dockerfile_errors(matrix, text)
+        self.assertTrue(any("declares 3 lanes" in e for e in errors))
+
+    def test_correcting_the_source_may_not_erase_the_origin(self):
+        matrix = shipped_matrix()
+        text = DOCKERFILE.read_text(encoding="utf-8").replace(
+            '      io.vllm-cpp.upstream="%s" %s%s'
+            % (checker.UPSTREAM_SOURCE, chr(92), chr(10)),
+            "",
+        )
+        errors = dockerfile_errors(matrix, text)
+        self.assertTrue(
+            any("never erases the origin" in e for e in errors),
+            "this fork is derived from upstream and the images must say so",
+        )
+
+    def test_the_two_constants_are_not_the_same_repository(self):
+        self.assertNotEqual(checker.FORK_SOURCE, checker.UPSTREAM_SOURCE)
+        self.assertIn("allenk", checker.FORK_SOURCE)
+        self.assertIn("mudler", checker.UPSTREAM_SOURCE)
+
+
 class InstructionParserTests(unittest.TestCase):
     def test_line_continuations_are_joined_into_one_instruction(self):
         parsed = checker.dockerfile_instructions("RUN apt-get install \\\n      ffmpeg\n")

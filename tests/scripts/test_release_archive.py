@@ -97,7 +97,7 @@ class ReleaseArchiveContract(unittest.TestCase):
             "dataLicense": "CC0-1.0",
             "SPDXID": "SPDXRef-DOCUMENT",
             "name": manifest["artifact"]["id"],
-            "documentNamespace": "https://github.com/mudler/vllm.cpp/spdx/fixture",
+            "documentNamespace": "https://github.com/allenk/vllm.cpp/spdx/fixture",
             "creationInfo": {
                 "created": "1970-01-01T00:00:00Z",
                 "creators": ["Organization: vllm.cpp"],

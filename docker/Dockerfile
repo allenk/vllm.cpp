@@ -240,7 +240,8 @@ COPY --from=build-cpu /out /opt/vllm
 COPY docker/healthcheck.sh /opt/vllm/bin/vllm-healthcheck
 LABEL org.opencontainers.image.title="vllm.cpp" \
       org.opencontainers.image.description="vllm.cpp OpenAI-compatible server, adaptive CPU lane" \
-      org.opencontainers.image.source="https://github.com/mudler/vllm.cpp" \
+      org.opencontainers.image.source="https://github.com/allenk/vllm.cpp" \
+      io.vllm-cpp.upstream="https://github.com/mudler/vllm.cpp" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${SOURCE_SHA}" \
@@ -262,7 +263,8 @@ COPY --from=build-vulkan /out /opt/vllm
 COPY docker/healthcheck.sh /opt/vllm/bin/vllm-healthcheck
 LABEL org.opencontainers.image.title="vllm.cpp" \
       org.opencontainers.image.description="vllm.cpp OpenAI-compatible server, Vulkan lane (preview)" \
-      org.opencontainers.image.source="https://github.com/mudler/vllm.cpp" \
+      org.opencontainers.image.source="https://github.com/allenk/vllm.cpp" \
+      io.vllm-cpp.upstream="https://github.com/mudler/vllm.cpp" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${SOURCE_SHA}" \
@@ -279,7 +281,8 @@ COPY docker/healthcheck.sh /opt/vllm/bin/vllm-healthcheck
 ENV LD_LIBRARY_PATH=/opt/vllm/lib
 LABEL org.opencontainers.image.title="vllm.cpp" \
       org.opencontainers.image.description="vllm.cpp OpenAI-compatible server, fat CUDA lane (preview)" \
-      org.opencontainers.image.source="https://github.com/mudler/vllm.cpp" \
+      org.opencontainers.image.source="https://github.com/allenk/vllm.cpp" \
+      io.vllm-cpp.upstream="https://github.com/mudler/vllm.cpp" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${SOURCE_SHA}" \

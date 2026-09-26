@@ -242,7 +242,7 @@ def spdx_document(
             "creators": ["Organization: vllm.cpp"],
         },
         "dataLicense": "CC0-1.0",
-        "documentNamespace": f"https://github.com/mudler/vllm.cpp/spdx/{source_commit}/{artifact_id}",
+        "documentNamespace": f"https://github.com/allenk/vllm.cpp/spdx/{source_commit}/{artifact_id}",
         "files": files,
         "name": artifact_id,
         "packages": packages,

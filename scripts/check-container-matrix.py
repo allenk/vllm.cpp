@@ -29,12 +29,28 @@ DOCKERFILE = ROOT / "docker/Dockerfile"
 
 SCHEMA = "vllm.cpp.container-matrix.v1"
 PACKAGE = "ghcr.io/mudler/vllm.cpp"
+# FORK: where THIS source lives. The OCI spec reads image.source as "URL to get
+# source code for building the image", so on a fork it must name the fork -- the
+# revision label beside it is a commit that exists only here, and a source label
+# pointing upstream makes that pair internally impossible. It is also what GHCR
+# follows to decide which repository, and which README, a package belongs to.
+#
+# The upstream project is credited by io.vllm-cpp.upstream instead, so the
+# derivation stays visible rather than being erased by the correction.
+#
+# Asserted by VALUE, not by presence: the label was present and wrong for the
+# whole of v0.0.3-vk.1's development, and a checker that only asks whether a
+# name appears anywhere in the file cannot see that.
+FORK_SOURCE = "https://github.com/allenk/vllm.cpp"
+UPSTREAM_SOURCE = "https://github.com/mudler/vllm.cpp"
 CHANNELS = frozenset({"stable", "preview"})
 PLATFORMS = frozenset({"linux/amd64", "linux/arm64"})
 
 DIGEST_PINNED = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 DOCKERFILE_ARG = re.compile(r"^ARG\s+(?P<name>[A-Z0-9_]+)=(?P<value>\S+)\s*$", re.MULTILINE)
 DOCKERFILE_TARGET = re.compile(r"^FROM\s+\S+\s+AS\s+(?P<name>[A-Za-z0-9_.-]+)\s*$", re.MULTILINE)
+LABEL_SOURCE = re.compile("org[.]opencontainers[.]image[.]source=\"([^\"]*)\"")
+LABEL_UPSTREAM = re.compile("io[.]vllm-cpp[.]upstream=\"([^\"]*)\"")
 DOCKERFILE_FROM = re.compile(r"^FROM\s+(?P<image>\S+)", re.MULTILINE)
 
 # Every lane's runtime stage must carry these, because an image with no lane
@@ -286,6 +302,28 @@ def check_dockerfile(matrix: dict, dockerfile: Path) -> list[str]:
     for label in REQUIRED_LABELS:
         if label not in text:
             errors.append(f"{dockerfile} never sets the required label {label}")
+
+    lanes = len(matrix.get("lanes") or ())
+    sources = LABEL_SOURCE.findall(text)
+    if len(sources) != lanes:
+        errors.append(
+            f"{dockerfile} sets org.opencontainers.image.source {len(sources)} times "
+            f"but the matrix declares {lanes} lanes; every lane's runtime stage "
+            "carries its own"
+        )
+    for value in sources:
+        if value != FORK_SOURCE:
+            errors.append(
+                f"{dockerfile} sets org.opencontainers.image.source={value!r}; this "
+                f"fork ships from {FORK_SOURCE!r} and must not appear to ship from "
+                "anywhere else. Credit the origin with io.vllm-cpp.upstream"
+            )
+    upstreams = LABEL_UPSTREAM.findall(text)
+    if len(upstreams) != lanes or any(v != UPSTREAM_SOURCE for v in upstreams):
+        errors.append(
+            f"{dockerfile} must record io.vllm-cpp.upstream={UPSTREAM_SOURCE!r} on "
+            "every lane, so correcting the source label never erases the origin"
+        )
 
     # The driver is the host's. An image that installs one is claiming support it
     # cannot honour, and the boundary is the single most repeated line in the spec.
