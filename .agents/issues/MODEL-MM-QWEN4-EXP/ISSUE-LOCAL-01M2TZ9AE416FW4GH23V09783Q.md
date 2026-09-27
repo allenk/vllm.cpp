@@ -8,7 +8,7 @@ Mirror: PENDING
 Availability: FULL
 Created: 2026-09-18
 Updated: 2026-09-18
-Closed: -
+Closed: 2026-09-14
 
 ## Problem
 

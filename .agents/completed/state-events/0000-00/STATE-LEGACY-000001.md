@@ -20269,7 +20269,7 @@ lever: `kMatmulBTQuant` = 55 % of prefill). The keep-quant loader repacks each
 eligible q8_0 weight once into the `block_q8_0x4` i8mm interleave
 ([cpu_quant_repack.cpp](specs/../../src/vt/cpu/cpu_quant_repack.cpp)) and
 `kMatmulBTQuant` dispatches a pre-shuffled i8mm gemm/gemv
-([cpu_quant_repack_arm.cpp](specs/../../src/vt/cpu/cpu_quant_repack_arm.cpp)).
+([cpu_quant_repack_arm.cpp](specs/../../src/vt/cpu/cpu_quant_repack_simd.cpp)).
 New TU + the `repacked` marker on `vt::Tensor`/`OwnedTensor` + policy field
 `GgufLoadPolicy::quant_repack`. `VT_CPU_QUANT_REPACK=0` A/B opt-out, `VT_CPU_REF=1`
 oracle.

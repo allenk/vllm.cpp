@@ -1662,7 +1662,16 @@ jobs:
         #
         # No pipe: `$?` after `cmd | tee` reports tee, not ctest.
         run: |
-          set -u
+          # `-e` was taking the output by the other door. A `run:` step's
+          # default shell is `bash -e {0}`, so a failing ctest aborted the
+          # script on its own line and EVERYTHING below -- `cat ctest-run.txt`
+          # first among them -- was dead code on the only path that needs it.
+          # What the lane reported was "Process completed with exit code 8" and
+          # not one test name, from a step that redirects precisely so it can
+          # print the log itself. The comment above had already dodged the
+          # `tee` trap for `$?`; this is the same loss through a different
+          # mechanism, and `set -u` alone does not turn `-e` off.
+          set +e -u
           ctest --test-dir build-arm-full --output-on-failure > ctest-run.txt 2>&1
           status=$?
           cat ctest-run.txt

@@ -678,7 +678,7 @@ gemm/gemv, which read contiguous aligned blocks with NO in-register row shuffles
   (`RepackQ8_0Rows4`/`QuantRepackWeight`), arch-independent.
 - prefill gemm `ggml_gemm_q8_0_4x8_q8_0` (NEON+i8mm, `arch/arm/repack.cpp:5091`)
   and gemv `ggml_gemv_q8_0_4x8_q8_0` (NEON+dotprod, `arch/arm/repack.cpp:1779`) →
-  [cpu_quant_repack_arm.cpp](../../src/vt/cpu/cpu_quant_repack_arm.cpp#L1)
+  [cpu_quant_repack_arm.cpp](../../src/vt/cpu/cpu_quant_repack_simd.cpp#L1)
   (`GemmTileQ8_0`/`GemvRowQ8_0`, parallelized over weight COL-groups).
 - activation side: rather than port `ggml_quantize_mat_q8_0_4x8`'s round-to-even,
   the repack path quantizes each activation row with the SAME `from_float`
