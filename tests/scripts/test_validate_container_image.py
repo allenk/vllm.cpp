@@ -136,5 +136,80 @@ class HubReachWiringTests(unittest.TestCase):
         self.assertIn("ca-certificates", runtime)
 
 
+class LabelContract(unittest.TestCase):
+    """The label contract, including WHICH repository the image claims.
+
+    v0.0.3-vk.1's images were one tag away from carrying
+    org.opencontainers.image.source=mudler/vllm.cpp beside an
+    org.opencontainers.image.revision that exists only in allenk/vllm.cpp, and
+    every gate passed: `revision` was checked by VALUE while `source` was
+    checked only for PRESENCE. A revision means nothing without the repository
+    it lives in, so the pair is checked as a pair now, and these cases exist so
+    it stays that way.
+    """
+
+    LANE = "cpu"
+    VERSION = "0.0.3-vk.1"
+    REVISION = "0" * 40
+
+    def labels(self, **overrides) -> dict:
+        base = {
+            "org.opencontainers.image.source": MODULE.FORK_SOURCE,
+            "org.opencontainers.image.revision": self.REVISION,
+            "org.opencontainers.image.version": self.VERSION,
+            "io.vllm-cpp.lane": self.LANE,
+            "io.vllm-cpp.channel": "stable",
+            "io.vllm-cpp.upstream": MODULE.UPSTREAM_SOURCE,
+        }
+        base.update(overrides)
+        return {key: value for key, value in base.items() if value is not None}
+
+    def errors(self, **overrides) -> list[str]:
+        return MODULE.check_labels(
+            self.labels(**overrides), self.LANE, self.VERSION, self.REVISION
+        )
+
+    def test_a_correctly_labelled_image_passes(self):
+        self.assertEqual(self.errors(), [])
+
+    def test_an_upstream_source_label_is_refused(self):
+        errors = self.errors(**{
+            "org.opencontainers.image.source": MODULE.UPSTREAM_SOURCE
+        })
+        self.assertTrue(
+            any("exists only in this fork" in error for error in errors),
+            "an image claiming upstream as its source must be refused",
+        )
+
+    def test_a_missing_upstream_credit_is_refused(self):
+        errors = self.errors(**{"io.vllm-cpp.upstream": None})
+        self.assertTrue(any("credit its origin" in error for error in errors))
+
+    def test_a_wrong_upstream_credit_is_refused(self):
+        errors = self.errors(**{"io.vllm-cpp.upstream": MODULE.FORK_SOURCE})
+        self.assertTrue(any("credit its origin" in error for error in errors))
+
+    def test_the_two_constants_name_different_repositories(self):
+        self.assertNotEqual(MODULE.FORK_SOURCE, MODULE.UPSTREAM_SOURCE)
+        self.assertIn("allenk", MODULE.FORK_SOURCE)
+        self.assertIn("mudler", MODULE.UPSTREAM_SOURCE)
+
+    def test_the_value_checks_that_already_worked_still_work(self):
+        self.assertTrue(any("io.vllm-cpp.lane must be" in e
+                            for e in self.errors(**{"io.vllm-cpp.lane": "cuda"})))
+        self.assertTrue(any("version label must be" in e for e in self.errors(
+            **{"org.opencontainers.image.version": "0.0.3"})))
+        self.assertTrue(any("revision label must be" in e for e in self.errors(
+            **{"org.opencontainers.image.revision": "f" * 40})))
+
+    def test_an_absent_required_label_is_named(self):
+        for label in MODULE.REQUIRED_LABELS:
+            with self.subTest(label=label):
+                errors = self.errors(**{label: None})
+                self.assertTrue(
+                    any(f"missing the required label {label}" in e for e in errors)
+                )
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=2).result.wasSuccessful() else 1)

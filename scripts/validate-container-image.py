@@ -70,6 +70,21 @@ REQUIRED_LABELS = (
     "io.vllm-cpp.channel",
 )
 
+# FORK: where THIS image's source lives, and the origin it derives from.
+#
+# Checked here as well as in check-container-matrix.py because the two answer
+# different questions: that one reads the Dockerfile, this one reads the IMAGE
+# that was actually built, moments before it is pushed.
+#
+# The asymmetry below is how the defect survived. `revision` was already
+# value-checked, and `source` was checked only for PRESENCE -- so an image could
+# say "built from mudler/vllm.cpp at a commit that exists only in
+# allenk/vllm.cpp" and pass, which is what v0.0.3-vk.1's images were one tag
+# away from saying. A revision is only meaningful in a named repository, so the
+# pair has to be checked as a pair.
+FORK_SOURCE = "https://github.com/allenk/vllm.cpp"
+UPSTREAM_SOURCE = "https://github.com/mudler/vllm.cpp"
+
 # A runtime image that can compile is a build tree that escaped its stage.
 FORBIDDEN_TOOLS = ("cc", "gcc", "g++", "cmake", "ninja", "nvcc", "ld")
 
@@ -86,6 +101,50 @@ def in_image(image: str, script: str) -> tuple[int, str]:
     return run(
         ["docker", "run", "--rm", "--entrypoint", "/bin/sh", image, "-c", script]
     )
+
+
+def check_labels(
+    labels: dict[str, str], lane: str, version: str, revision: str | None
+) -> list[str]:
+    """The label contract, as pure dict work.
+
+    Split out of check_config so every branch is reachable with no docker
+    daemon -- the same reason classify_hub_reach is pure. It was inline and
+    therefore untested, which is how the source label came to be checked for
+    PRESENCE while the revision beside it was checked by VALUE: an image could
+    say it was built from mudler/vllm.cpp at a commit that exists only in
+    allenk/vllm.cpp and pass every gate.
+    """
+    errors: list[str] = []
+    for label in REQUIRED_LABELS:
+        if not labels.get(label):
+            errors.append(f"image is missing the required label {label}")
+    if labels.get("io.vllm-cpp.lane") != lane:
+        errors.append(
+            f"io.vllm-cpp.lane must be {lane!r}, found {labels.get('io.vllm-cpp.lane')!r}"
+        )
+    if labels.get("org.opencontainers.image.version") != version:
+        errors.append(
+            f"image version label must be {version!r}, found "
+            f"{labels.get('org.opencontainers.image.version')!r}"
+        )
+    if revision and labels.get("org.opencontainers.image.revision") != revision:
+        errors.append(
+            f"image revision label must be {revision!r}, found "
+            f"{labels.get('org.opencontainers.image.revision')!r}"
+        )
+    if labels.get("org.opencontainers.image.source") != FORK_SOURCE:
+        errors.append(
+            f"image source label must be {FORK_SOURCE!r}, found "
+            f"{labels.get('org.opencontainers.image.source')!r}; the revision "
+            "beside it exists only in this fork"
+        )
+    if labels.get("io.vllm-cpp.upstream") != UPSTREAM_SOURCE:
+        errors.append(
+            "image must credit its origin with io.vllm-cpp.upstream="
+            f"{UPSTREAM_SOURCE!r}, found {labels.get('io.vllm-cpp.upstream')!r}"
+        )
+    return errors
 
 
 def check_config(image: str, lane: str, version: str, revision: str | None) -> list[str]:
@@ -126,24 +185,7 @@ def check_config(image: str, lane: str, version: str, revision: str | None) -> l
     if not healthcheck.get("Test"):
         errors.append("image must declare a HEALTHCHECK against /health")
 
-    labels = config.get("Labels") or {}
-    for label in REQUIRED_LABELS:
-        if not labels.get(label):
-            errors.append(f"image is missing the required label {label}")
-    if labels.get("io.vllm-cpp.lane") != lane:
-        errors.append(
-            f"io.vllm-cpp.lane must be {lane!r}, found {labels.get('io.vllm-cpp.lane')!r}"
-        )
-    if labels.get("org.opencontainers.image.version") != version:
-        errors.append(
-            f"image version label must be {version!r}, found "
-            f"{labels.get('org.opencontainers.image.version')!r}"
-        )
-    if revision and labels.get("org.opencontainers.image.revision") != revision:
-        errors.append(
-            f"image revision label must be {revision!r}, found "
-            f"{labels.get('org.opencontainers.image.revision')!r}"
-        )
+    errors.extend(check_labels(config.get("Labels") or {}, lane, version, revision))
 
     return errors
 
