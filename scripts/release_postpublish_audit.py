@@ -169,9 +169,28 @@ def validate_remote_release(
         raise ValueError("audit release identity must be the authorized pre-alpha")
     names, archives = expected_names(matrix, version)
 
+    # Compared FIELD BY FIELD, not as a whole dict. GitHub's git-ref object
+    # always carries a `url` alongside `sha` and `type`, so an equality against
+    # a two-key literal was false for every tag in every repository -- this
+    # gate could not pass, and being tag-only it had never run to find out.
+    # v0.0.3-vk.1 published correctly and this refused it, naming the tag.
+    #
+    # The suite agreed with the assertion instead of with the API: its fixture
+    # was written as {"sha": ..., "type": "commit"}, the exact shape the
+    # comparison wanted. A control that shares the bug is not a control.
     tag_object = snapshot.get("tag", {}).get("object", {})
-    if tag_object != {"sha": source_sha, "type": "commit"}:
-        raise ValueError("release tag does not resolve exactly to the expected commit")
+    if not isinstance(tag_object, dict):
+        raise ValueError("release tag object is malformed")
+    if tag_object.get("type") != "commit":
+        raise ValueError(
+            "release tag must resolve to a commit, found "
+            f"{tag_object.get('type')!r}"
+        )
+    if tag_object.get("sha") != source_sha:
+        raise ValueError(
+            "release tag resolves to "
+            f"{tag_object.get('sha')!r}, expected {source_sha!r}"
+        )
     release = snapshot.get("release")
     if not isinstance(release, dict) or (
         release.get("tag_name") != tag or release.get("draft") is not False

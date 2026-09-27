@@ -31,10 +31,22 @@ def load():
     return module
 
 
+def load_manifest_tool():
+    """release_manifest.py owns AOT_AVAILABILITY, the table this test reads."""
+    path = ROOT / "scripts/release_manifest.py"
+    spec = importlib.util.spec_from_file_location("release_manifest", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class AcceleratorMetadataContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.tool = load()
+        cls.manifest_tool = load_manifest_tool()
 
     def fixture(self, scratch: Path, artifact_id: str):
         build = scratch / "build"
@@ -86,10 +98,27 @@ class AcceleratorMetadataContract(unittest.TestCase):
             args = self.fixture(Path(temporary), "linux-x86_64-glibc-cuda")
             manifest = self.tool.prepare_accelerator_metadata(args)
             self.assertEqual(manifest["cuda"]["compiled_sms"], SMS)
+            # DERIVED from release_manifest.AOT_AVAILABILITY, not written out
+            # again. A literal list here was the table's THIRD copy, and when
+            # the 120a row went False -> True (the vendored sm_120a Triton AOT
+            # tree does exist) two copies were updated and this one was not.
+            # It stayed invisible because the ci step that runs this suite sits
+            # behind a step that was failing for an unrelated reason, so the
+            # first failure shadowed it for days.
+            #
+            # The ground truth is pinned ONCE, against the trees on disk, by
+            # test_release_manifest.test_aot_availability_matches_the_vendored_trees.
+            # What THIS case owns is the plumbing: that sm_evidence reports the
+            # table faithfully, in compiled_sms order, for every architecture.
+            table = self.manifest_tool.AOT_AVAILABILITY
             self.assertEqual(
                 [row["aot_available"] for row in manifest["cuda"]["sm_evidence"]],
-                [True, True, False, True, True, True, False, False, False, True],
+                [table[sm] for sm in SMS],
             )
+            # Not vacuous: the table must actually discriminate, or a plumbing
+            # bug that returned a constant would pass the comparison above.
+            self.assertEqual(sorted(set(table[sm] for sm in SMS)), [False, True])
+            self.assertEqual(sorted(table), sorted(SMS))
             driver = next(row for row in manifest["dependencies"] if row["name"] == "nvidia-driver")
             self.assertEqual((driver["linkage"], driver["bundled"]), ("external", False))
 

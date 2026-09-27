@@ -24,6 +24,12 @@ INDEX = ROOT / "scripts/release_index.py"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 RUN_ID = "31415926535"
 REPO = "mudler/vllm.cpp"
+# The git-ref object EXACTLY as GitHub returns it, `url` included.
+COMMIT_OBJECT = {
+    "sha": SHA,
+    "type": "commit",
+    "url": f"https://api.github.com/repos/{REPO}/git/commits/{SHA}",
+}
 
 
 def load():
@@ -153,7 +159,13 @@ class PostPublishAuditContract(unittest.TestCase):
             for index, (name, data) in enumerate(sorted(remote_bytes.items()))
         ]
         snapshot = {
-            "tag": {"object": {"sha": SHA, "type": "commit"}},
+            # dict(COMMIT_OBJECT), `url` and all: this fixture is what
+            # "a complete authenticated remote observation" MEANS, and it
+            # used to be two keys because that is what the audit's
+            # whole-dict equality needed. So the suite proved the audit
+            # accepted a response GitHub never sends, and said nothing
+            # about the one it does.
+            "tag": {"object": dict(COMMIT_OBJECT)},
             "release": {
                 "draft": False,
                 "prerelease": True,
@@ -194,6 +206,8 @@ class PostPublishAuditContract(unittest.TestCase):
         snapshot, remote_bytes, attestations = self.fixture()
         mutations["tag SHA"] = (copy.deepcopy(snapshot), dict(remote_bytes), copy.deepcopy(attestations))
         mutations["tag SHA"][0]["tag"]["object"]["sha"] = "f" * 40
+        mutations["tag type"] = (copy.deepcopy(snapshot), dict(remote_bytes), copy.deepcopy(attestations))
+        mutations["tag type"][0]["tag"]["object"]["type"] = "tag"
         mutations["release prerelease"] = (copy.deepcopy(snapshot), dict(remote_bytes), copy.deepcopy(attestations))
         mutations["release prerelease"][0]["release"]["prerelease"] = False
         mutations["release draft"] = (copy.deepcopy(snapshot), dict(remote_bytes), copy.deepcopy(attestations))
@@ -368,21 +382,29 @@ class PostPublishAuditContract(unittest.TestCase):
         self.assertEqual(result["asset_count"], 35)
 
     def test_annotated_and_lightweight_tags_resolve_to_the_commit(self) -> None:
+        """Both tag shapes resolve, and the object keeps the API's own shape.
+
+        The fixture used to omit `url`. GitHub always sends it, and that
+        omission is what made a whole-dict equality in the audit look correct
+        while being false for every real tag -- the check was tag-only, so it
+        never ran until v0.0.3-vk.1 published and it refused a perfectly good
+        tag. The fixture now carries `url`, which is also why the expectations
+        below carry it: resolve_tag returns the API object unchanged, and a
+        test that trims it is asserting about a response nobody sends.
+        """
         with mock.patch.object(
-            self.audit, "gh_json", return_value={"object": {"sha": SHA, "type": "commit"}}
+            self.audit, "gh_json", return_value={"object": dict(COMMIT_OBJECT)}
         ):
             self.assertEqual(
-                self.audit.resolve_tag(REPO, "v0.0.3-vk.1"),
-                {"sha": SHA, "type": "commit"},
+                self.audit.resolve_tag(REPO, "v0.0.3-vk.1"), COMMIT_OBJECT
             )
         responses = iter((
             {"object": {"sha": "a" * 40, "type": "tag"}},
-            {"tag": "v0.0.3-vk.1", "object": {"sha": SHA, "type": "commit"}},
+            {"tag": "v0.0.3-vk.1", "object": dict(COMMIT_OBJECT)},
         ))
         with mock.patch.object(self.audit, "gh_json", side_effect=lambda args: next(responses)):
             self.assertEqual(
-                self.audit.resolve_tag(REPO, "v0.0.3-vk.1"),
-                {"sha": SHA, "type": "commit"},
+                self.audit.resolve_tag(REPO, "v0.0.3-vk.1"), COMMIT_OBJECT
             )
 
 
