@@ -139,6 +139,58 @@ def _canonical_index_bytes(
         return json_output.read_bytes(), markdown_output.read_bytes()
 
 
+def _describe_byte_drift(name: str, downloaded: bytes, expected: bytes) -> str:
+    """Name the first divergence, and the JSON key it falls in when there is one.
+
+    "is not exact canonical output" is the whole answer this audit used to give,
+    and the audit downloads 700 MB of archives to reach it -- so every retry
+    cost an hour and produced the same sentence. The comparison is between two
+    byte strings that are already in hand; there is no reason not to say which
+    byte, which line, and for JSON which key.
+    """
+    detail = [
+        f"{name}: {len(downloaded)} bytes downloaded, {len(expected)} regenerated"
+    ]
+    limit = min(len(downloaded), len(expected))
+    offset = next((i for i in range(limit) if downloaded[i] != expected[i]), limit)
+    if offset < limit:
+        line = downloaded[:offset].count(b"\n") + 1
+        column = offset - (downloaded.rfind(b"\n", 0, offset) + 1) + 1
+        detail.append(
+            f"first differs at byte {offset} (line {line}, column {column}): "
+            f"downloaded {downloaded[offset:offset + 24]!r} vs "
+            f"regenerated {expected[offset:offset + 24]!r}"
+        )
+    else:
+        longer = "downloaded" if len(downloaded) > len(expected) else "regenerated"
+        detail.append(
+            f"identical for the first {limit} bytes; {longer} continues with "
+            f"{(downloaded if longer == 'downloaded' else expected)[limit:limit + 48]!r}"
+        )
+    try:
+        got = json.loads(downloaded.decode("utf-8"))
+        want = json.loads(expected.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "; ".join(detail)
+    if got == want:
+        detail.append(
+            "the PARSED documents are equal, so the drift is formatting only "
+            "(separators, indent, key order or trailing newline)"
+        )
+        return "; ".join(detail)
+    if isinstance(got, dict) and isinstance(want, dict):
+        only_got = sorted(set(got) - set(want))
+        only_want = sorted(set(want) - set(got))
+        changed = sorted(k for k in set(got) & set(want) if got[k] != want[k])
+        if only_got:
+            detail.append(f"keys only downloaded: {only_got}")
+        if only_want:
+            detail.append(f"keys only regenerated: {only_want}")
+        if changed:
+            detail.append(f"keys whose values differ: {changed}")
+    return "; ".join(detail)
+
+
 def _single_subject(provenance: Any, archive: str, expected_digest: str) -> None:
     subjects = provenance.get("subject") if isinstance(provenance, dict) else None
     matches = [
@@ -251,9 +303,19 @@ def validate_remote_release(
         remote_bytes, matrix, declaration, source_sha
     )
     if remote_bytes["release-index.json"] != expected_json:
-        raise ValueError("downloaded JSON release index is not exact canonical output")
+        raise ValueError(
+            "downloaded JSON release index is not exact canonical output -- "
+            + _describe_byte_drift(
+                "release-index.json", remote_bytes["release-index.json"], expected_json
+            )
+        )
     if remote_bytes["RELEASE_INDEX.md"] != expected_markdown:
-        raise ValueError("downloaded Markdown release index is not exact canonical output")
+        raise ValueError(
+            "downloaded Markdown release index is not exact canonical output -- "
+            + _describe_byte_drift(
+                "RELEASE_INDEX.md", remote_bytes["RELEASE_INDEX.md"], expected_markdown
+            )
+        )
     if set(attestations) != archives:
         raise ValueError("indexes or attestations omit a canonical archive")
     return {"archive_count": len(archives), "asset_count": len(names), "run_id": run_id}
