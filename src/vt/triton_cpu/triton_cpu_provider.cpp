@@ -1,15 +1,24 @@
-// Triton-CPU acceleration provider — SHELL (T-29 Step 2).
+// Triton-CPU acceleration provider.
 //
 // WHAT THIS IS. A provider registered on DeviceType::kCPU under the name
-// "triton-cpu", at a priority above the built-in "vt-native" kernels. Every
-// kernel here currently DECLINES: it forwards to the next provider down via
-// GetOpFallback(), which is vt-native. So with this provider selected the engine
-// produces BYTE-IDENTICAL output to a build without it.
+// "triton-cpu", at a priority above the built-in "vt-native" kernels. It serves
+// nine ops when a compiled kernel is available for them and DECLINES otherwise,
+// forwarding to the next provider down via GetOpFallback(), which is vt-native.
+// With no kernel directory to load from, every op declines and the engine
+// produces BYTE-IDENTICAL output to a build without this file.
 //
-// WHY A SHELL FIRST. This separates "the wiring is wrong" from "the kernel is
-// wrong". A first failure with a real kernel in place is ambiguous; a first
-// failure here is not. Same discipline as the ncnn video patch in the sibling
-// project, whose OFF state had to be bit-identical before any ON state counted.
+// Kernel SOURCES live in triton_cpu_kernels/ with a README covering the build,
+// the required manifest.txt, and WHICH kernels are worth loading: measured, the
+// best configuration is a MIX of the hand-written GEMM with four Triton kernels,
+// and loading all eight is slower than loading none.
+//
+// IT STARTED AS A SHELL, and the reason is worth keeping. Every kernel declined
+// at first, on purpose, so that the first failure could not be ambiguous between
+// "the wiring is wrong" and "the kernel is wrong". Same discipline as the ncnn
+// video patch in the sibling project, whose OFF state had to be bit-identical
+// before any ON state counted. That state is now reachable at run time rather
+// than being the only state: unset VLLM_CPP_TRITON_CPU, or point
+// VT_OP_PROVIDER_DISABLE at triton-cpu, and the same binary is that shell again.
 //
 // WHY A PROVIDER AND NOT A NEW DeviceType. op_provider.h already supplies every
 // mechanism a Triton backend needs, and building a parallel DeviceType would
