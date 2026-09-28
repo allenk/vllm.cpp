@@ -35,6 +35,68 @@
 > appending fields whose zero value keeps existing behavior byte-identical, and only bumps on an
 > incompatible change. If you embed us, embed through that header.
 
+## This fork
+
+This repository is **[allenk/vllm.cpp](https://github.com/allenk/vllm.cpp)**, a fork of
+[mudler/vllm.cpp](https://github.com/mudler/vllm.cpp). Everything above and most of what
+follows is upstream's. This section says which parts are not, so the two are not read as
+one, and so nothing here is claimed that upstream already does.
+
+Procedure and version identity: [FORK.md](FORK.md). Artifacts:
+[releases](https://github.com/allenk/vllm.cpp/releases).
+
+**One release lane upstream does not have.** Comparing the release workflow's jobs against
+upstream's `main`, this fork adds exactly one: **`windows-x86_64-msvc-cuda`**, built for
+eight SM targets (80, 86, 87, 89, 90a, 110, 120a, 121a). `sm_100a` and `sm_103a` are
+excluded because CCCL's tcgen05 PTX headers expand to an empty asm operand under `cl.exe`
+and `/Zc:preprocessor` does not fix it (measured, not assumed). Upstream's own tree already
+carries the Windows CPU and Vulkan lanes.
+
+**An `sm_120a` AOT tree.** Upstream vendors six Triton AOT trees; this fork adds a seventh
+for consumer Blackwell, and flips `AOT_AVAILABILITY["120a"]` from `False` to `True` to match
+what is actually on disk.
+
+**A Triton-CPU acceleration provider** ([`src/vt/triton_cpu/`](src/vt/triton_cpu/)):
+upstream has no equivalent. It registers on `kCPU` above the built-in kernels, serves nine
+ops, and declines back to them for anything it cannot take. Kernels arrive by `dlopen` from
+`VLLM_CPP_TRITON_CPU_DIR`, so the binary carries the ability to load a kernel rather than a
+kernel. What that means in practice, measured on the published `v0.0.3-vk.1` archives
+(Qwen3-0.6B, 128-in/32-out, c=1, 16 threads, two interleaved passes):
+
+```
+Linux, hand-written GEMM + Triton paged_attn/rms_norm/rms_norm_resid/silu_and_mul
+                                              28.32 - 29.37 out tok/s   <- best
+Linux, all hand-written                       26.78 - 26.83
+Linux, all eight Triton kernels               24.02 - 24.99   <- worse than hand-written
+```
+
+⚠️ Two things follow, and both are part of the result. **The mix wins; switching everything
+to Triton loses**. `matmul_bt` is a net negative and the hand-written GEMM should stay.
+And **the release archives contain no Triton kernels**, so this configuration is not
+reachable from a downloaded archive today.
+
+⚠️ **On Windows the provider is selected but never executes.** `VLLM_CPP_TRITON_CPU=1`
+makes `VT_OP_PROVIDER_STATS` report `selected=triton-cpu` for seven ops, while the kernel
+loader is compiled out under `_WIN32`, so every call forwards to the built-in kernels and
+throughput is indistinguishable from the hand-written path.
+
+**Vulkan.** This fork carries 23 changed files under `src/vt/vulkan/` (+28,542 / −5,264),
+built around keeping NVIDIA fast paths behind a capability gate so portability is a design
+constraint rather than a repair. ⚠️ Upstream has been active in the same directory (40
+commits since 2026-08-01), and a file-by-file comparison against upstream's current work
+has not been done yet, so this is a statement of size and direction, not a claim of being
+ahead.
+
+**Platforms.** Shipped: Windows x86_64 (CPU / Vulkan / CUDA), Linux x86_64 (glibc CPU /
+Vulkan / CUDA, musl static CPU), Linux aarch64 (glibc CPU / CUDA, which is the Jetson
+artifact, verified by running it on the board), macOS arm64 (Metal, Metal+MLX).
+⚠️ **In development, not shipped: Android**, covering Vulkan,
+cooperative-matrix and ARM CPU. There is no Android artifact to download.
+
+The three sections marked *"Added in this fork"* below are the engineering write-ups for
+the above. A handful of smaller edits are not marked individually: the architecture count,
+and per-cell `SUPERSEDED` annotations in the llama.cpp comparison table.
+
 ## News
 
 - **2026-09** **Quantized Qwen completes smoke runs on Tenstorrent.** Qwen3.8-27B and
@@ -178,6 +240,8 @@ Decode lands inside llama.cpp's own spread, and the memory gap is 30 MiB. Tokens
 
 #### Concurrent serving on CPU, and what it cost to get there
 
+> *Added in this fork ([allenk/vllm.cpp](https://github.com/allenk/vllm.cpp)). Upstream: [mudler/vllm.cpp](https://github.com/mudler/vllm.cpp).*
+
 That axis used to read "unmeasured" here. It is measured now, on three CPUs, and it does not
 flatter us.
 
@@ -193,7 +257,7 @@ behind a discarded warmup:
 | repack **on** | 16.6 | 39.5 | 53.2 | 61.2 | 64.3 | **3.88x** |
 
 On a Snapdragon 8 Gen 3 the same switch reads **1.18x → 1.72x**. With the tier off, x86, the phone
-and a Jetson Orin all converge on ~1.1–1.2x — which is the clearest statement available that the
+and a Jetson Orin all converge on ~1.1–1.2x, which is the clearest statement available that the
 figure describes the kernel and not the silicon.
 
 **llama.cpp is still ahead on this axis**, and by how much is now located rather than guessed:
@@ -206,15 +270,15 @@ figure describes the kernel and not the silicon.
 | concurrency scaling | 1.51x |
 
 Decode is close; **prefill is where the deficit lives**. Four candidate causes have been priced and
-all four are small — a larger tile (1.00x; llama.cpp's `tinyBLAS_Q0_AVX` caps at the same 4x4),
+all four are small. A larger tile (1.00x; llama.cpp's `tinyBLAS_Q0_AVX` caps at the same 4x4),
 AVX-VNNI (1.025x, implemented and instruction-verified), parallelising the serial activation prep
 (≤1.09x, from an Amdahl fit over a thread sweep), and deferring the in-loop reduction (1.22x). Their
 product is ~1.36x against a per-thread gap of 3.27x, and both kernels reach the same 8 MACs per
 instruction, so the remainder is **open and deliberately unattributed**
 ([open gaps](docs/benchmarks/open-gaps.md)).
 
-Two more things the same work established. Our thread scaling is the *better* of the two — 6.99x
-against 5.59x from 1 to 16 threads — so reading only the many-thread cell **understates** the kernel
+Two more things the same work established. Our thread scaling is the *better* of the two (6.99x
+against 5.59x from 1 to 16 threads), so reading only the many-thread cell **understates** the kernel
 gap rather than overstating it. And on an Arm chip with `dotprod` but no `i8mm`, our tier is gated
 off entirely while upstream ggml serves that chip through a second arm we have not ported, so
 everything measured there is repacked-against-not-repacked.
@@ -427,6 +491,8 @@ hardware-blocked and why, is linked from [Project status](#project-status).
 
 ### Vulkan: NVIDIA fast paths behind a capability gate, portable by construction
 
+> *Added in this fork ([allenk/vllm.cpp](https://github.com/allenk/vllm.cpp)). Upstream: [mudler/vllm.cpp](https://github.com/mudler/vllm.cpp).*
+
 The Vulkan backend carries eight compute shaders beyond the portable set. Two of
 them use `VK_NV_cooperative_matrix2` -- a workgroup-scope cooperative-matrix GEMM
 with tensor addressing, and prefill attention expressed as matrix multiplies with
@@ -453,6 +519,8 @@ footprint is unchanged there and the fix costs nothing on the device that was
 never broken -- measured at 0.996x with byte-identical output.
 
 ### Triton on the CPU, and RISC-V
+
+> *Added in this fork ([allenk/vllm.cpp](https://github.com/allenk/vllm.cpp)). Upstream: [mudler/vllm.cpp](https://github.com/mudler/vllm.cpp).*
 
 A Triton-CPU acceleration provider registers above the native CPU provider and
 declines back to it for every op it does not serve, so a build that does not
