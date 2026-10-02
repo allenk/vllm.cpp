@@ -284,7 +284,7 @@ off entirely while upstream ggml serves that chip through a second arm we have n
 everything measured there is repacked-against-not-repacked.
 
 Method, per-platform tables, and the engagement checks that are not throughput:
-[docs/benchmarks/cpu-q8_0-repack.md](docs/benchmarks/cpu-q8_0-repack.md).
+[docs/benchmarks/cpu-q8-0-repack.md](docs/benchmarks/cpu-q8-0-repack.md).
 
 > **Every llama.cpp denominator here is SUPERSEDED**: they came from `237ad9b96`, our own local-only
 > fork, 65 performance commits deep. The pin is now stock `b10451` and each figure is owed a re-take

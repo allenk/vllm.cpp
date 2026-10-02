@@ -26,7 +26,7 @@
 # the script's env vars. Refuse to start if any server exists; require exactly
 # one per leg; read back that the kill engaged; trap so an interrupt leaves none.
 #
-# WHAT IT SHOULD REPRODUCE: docs/benchmarks/cpu-q8_0-repack.md section 3 reports
+# WHAT IT SHOULD REPRODUCE: docs/benchmarks/cpu-q8-0-repack.md section 3 reports
 # scaling 1.18x off against 1.72x on for this chip. That run pinned clocks and
 # this one does not, so ABSOLUTE tok/s will be lower here; the repack RATIO is
 # the quantity to compare.

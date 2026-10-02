@@ -10,7 +10,7 @@ measurement evidence remains in [the benchmark record](../.agents/benchmark-reco
 | `vllm-online-serving` | Online serving compared with vLLM | Mixed | [Details](benchmarks/vllm-online-serving.md) |
 | `memory` | Host and device memory measurements | Mixed | [Details](benchmarks/memory.md) |
 | `llama-cpp-cpu` | CPU comparison with llama.cpp | Superseded | [Details](benchmarks/llama-cpp-cpu.md) |
-| `cpu-q8_0-repack` | The q8_0 repack tier on three CPUs: x86-64, Arm with i8mm, Arm without | Measured | [Details](benchmarks/cpu-q8_0-repack.md) |
+| `cpu-q8-0-repack` | The q8_0 repack tier on three CPUs: x86-64, Arm with i8mm, Arm without | Measured | [Details](benchmarks/cpu-q8-0-repack.md) |
 | `windows-rtx-pro-6000` | Windows x64 single-host matrix on a consumer Blackwell (sm_120) | Measured | [Details](benchmarks/windows-rtx-pro-6000.md) |
 | `mlx-lm-apple-m4` | Apple M4 comparison with MLX-LM | Measured | [Details](benchmarks/mlx-lm-apple-m4.md) |
 | `dwarfstar-gguf` | GGUF comparison with DwarfStar | Measured | [Details](benchmarks/dwarfstar-gguf.md) |
@@ -22,6 +22,6 @@ measurement evidence remains in [the benchmark record](../.agents/benchmark-reco
 | `tt-keepquant-27b-decode` | Tenstorrent keep-quant 27B Q4_K_M decode, first end-to-end completion on the P150 | Measured | [Details](benchmarks/tt-keepquant-27b-decode.md) |
 | `how-we-measure` | Benchmark method and acceptance rules | Method | [Details](benchmarks/how-we-measure.md) |
 | `variadic-load-methodology` | How the mixed-length, swept-concurrency serving benchmark works | Method | [Details](benchmarks/variadic-load-methodology.md) |
-| [`vulkan-jetson-orin`](benchmarks/vulkan-jetson-orin.md) | Vulkan on an 8 GB Jetson Orin Nano against llama.cpp Vulkan: 2.41x on the reference axis, 1.65x on a decode-weighted one, and the backend's missing quantized compute tier |
+| `vulkan-jetson-orin` | Vulkan on an 8 GB Jetson Orin Nano against llama.cpp Vulkan: 2.41x on the reference axis, 1.65x on a decode-weighted one, and the backend's missing quantized compute tier | Measured | [Details](benchmarks/vulkan-jetson-orin.md) |
 | `open-gaps` | Pending, failed, void, and superseded measurements | Open | [Details](benchmarks/open-gaps.md) |
 | `reproduce` | Reproduction commands and artifacts | Method | [Details](benchmarks/reproduce.md) |
