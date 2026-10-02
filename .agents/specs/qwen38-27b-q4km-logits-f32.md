@@ -118,7 +118,7 @@ divergence from vLLM's default**, and it is argued on three grounds.
    exists); the CUDA keep-quant kernel already branches on
    `out.dtype == DType::kF32`; the aarch64 repack tier already says "write f32
    directly when possible"
-   (`src/vt/cpu/cpu_quant_repack_arm.cpp::QuantRepackMatmul`). So upstream's
+   (`src/vt/cpu/cpu_quant_repack_simd.cpp::QuantRepackMatmul`). So upstream's
    `out_dtype=` intent is reachable here on a quantized head with **no weight
    copy and no extra pass** — it deletes the `CastF32` and its buffer.
 
