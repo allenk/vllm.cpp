@@ -261,3 +261,38 @@ VT_DUMP_LOGITS
 VT_DUMP_QKVZ
 VT_DUMP_TRUST
 VLLM_CPP_ROCM_STATIC_GRAPH
+# Kernel-internal tuning axes and read-only instruments (env-doc gate repair,
+# 2026-10). Tile shape, K depth/unroll, workgroup and register-blocking axes of
+# the Vulkan subgroup coopmat (MR/NR), coopmat2 workgroup-scope, and GDN (BV)
+# kernels and the CUDA grouped W32 lane, each defaulting to its measured value;
+# a per-shape bisect switch (COOPMAT2_ONLY_N); and read-only stats, logs and
+# dumps. VT_VULKAN_PIN_TOKEN is the teacher-forcing comparison harness and
+# deliberately produces garbage text -- never set it in production. The on/off
+# feature levers of these families are documented in docs/ENVIRONMENT.md.
+VLLM_CPP_TRITON_CPU_PROBE
+VLLM_CPP_TRITON_CPU_SHADOW
+VT_CUDA_ALLOC_STATS
+VT_ENGINE_STEP_STATS
+VT_GDN_TRITON_STATS
+VT_SYNC_LOG
+VT_V4_W32_COLS
+VT_V4_W32_WARPS
+VT_VULKAN_COOPMAT2_DIRECT_STORE
+VT_VULKAN_COOPMAT2_GROUP_M
+VT_VULKAN_COOPMAT2_KUNROLL
+VT_VULKAN_COOPMAT2_N
+VT_VULKAN_COOPMAT2_ONLY_N
+VT_VULKAN_COOPMAT2_WGK
+VT_VULKAN_COOPMAT2_WGM
+VT_VULKAN_COOPMAT_LIST
+VT_VULKAN_COOPMAT_MR
+VT_VULKAN_COOPMAT_NR
+VT_VULKAN_COOPMAT_NR4_MIN_M
+VT_VULKAN_COPY_LOG
+VT_VULKAN_GDN_BV
+VT_VULKAN_LOGITS_DUMP
+VT_VULKAN_LOGITS_DUMP_STEPS
+VT_VULKAN_PIN_TOKEN
+VT_VULKAN_PIPELINE_IR
+VT_VULKAN_PIPELINE_STATS
+VT_VULKAN_SHAPE_STATS
