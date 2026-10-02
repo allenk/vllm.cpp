@@ -10,6 +10,25 @@ import tarfile
 import tempfile
 import unittest
 
+
+def _native_child_lifecycle_available():
+    """These tests drive the real child-lifecycle ABI of
+    tools/bench/strix_four_engine/child_lifecycle.py (Native), which refuses
+    anything but Linux x86-64 with glibc 2.39. On other hosts, e.g. the arm64
+    CI lane, they fail on that precondition rather than on the behaviour under
+    test, so they are skipped there instead."""
+    try:
+        from tools.bench.strix_four_engine import child_lifecycle
+        child_lifecycle.Native()
+    except (RuntimeError, OSError, ImportError):
+        return False
+    return True
+
+
+NEEDS_NATIVE_LIFECYCLE = unittest.skipUnless(
+    _native_child_lifecycle_available(),
+    "requires the Linux x86-64 glibc 2.39 child-lifecycle ABI")
+
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = '1cfa9a7208912126459214e8b04321603b3df60c'
 PINS = {'vllm.cpp': '6e3cbfb940be89e28d1d71c264fd8c3a4e44afeb',
@@ -134,6 +153,7 @@ class QualificationTests(unittest.TestCase):
                                 env=dict(os.environ, RC_DEVICE='strix:gpu0', RC_JOB_ID='cpu-fixture'))
         return result, json.loads((root / 'output/result.json').read_text())
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_all_corpora_and_true_wall_throughput_are_retained(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -153,6 +173,7 @@ class QualificationTests(unittest.TestCase):
                     self.assertEqual(rates['maximum'], max(rates['values']))
                     self.assertEqual(rates['ratio_to_vllm'], 1)
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_missing_runtime_proof_retains_diagnostics_without_measurement(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -163,6 +184,7 @@ class QualificationTests(unittest.TestCase):
                 self.assertEqual(len(engine['runs']), 4)
                 self.assertNotIn('throughput', engine)
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_runtime_evidence_requires_a_distinct_prior_run_identity(self):
         for identity in ('new-run', '', '   ', None, True, 42, ['prior-run']):
             with self.subTest(identity=identity), tempfile.TemporaryDirectory() as directory:
@@ -235,6 +257,7 @@ class QualificationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, str(report))
                 self.assertNotEqual(report['status'], 'PASS')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_no_lease_never_launches_a_bound_adapter(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -250,6 +273,7 @@ class QualificationTests(unittest.TestCase):
             self.assertIn('qualification requires a Strix lease', result.stderr)
             self.assertEqual([p.name for p in (root / 'output').iterdir()], ['result.json'])
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_rebound_provenance_fields_are_independently_refused(self):
         cases = ('pax', 'result', 'tensor_count', 'files', 'gguf_sha256',
                  'converter_revision', 'inventory_sha256', 'insecure')
@@ -290,6 +314,7 @@ class QualificationTests(unittest.TestCase):
                 self.assertIn(expected, result.stderr)
                 self.assertNotIn('engines', report)  # Refuse before an adapter starts.
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_copied_audit_and_relocated_model_keep_content_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

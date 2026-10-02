@@ -9,6 +9,25 @@ import tarfile
 import tempfile
 import unittest
 
+
+def _native_child_lifecycle_available():
+    """These tests drive the real child-lifecycle ABI of
+    tools/bench/strix_four_engine/child_lifecycle.py (Native), which refuses
+    anything but Linux x86-64 with glibc 2.39. On other hosts, e.g. the arm64
+    CI lane, they fail on that precondition rather than on the behaviour under
+    test, so they are skipped there instead."""
+    try:
+        from tools.bench.strix_four_engine import child_lifecycle
+        child_lifecycle.Native()
+    except (RuntimeError, OSError, ImportError):
+        return False
+    return True
+
+
+NEEDS_NATIVE_LIFECYCLE = unittest.skipUnless(
+    _native_child_lifecycle_available(),
+    "requires the Linux x86-64 glibc 2.39 child-lifecycle ABI")
+
 from tests.tools import test_strix_four_engine_qualify as qualification_fixture
 from tests.tools.test_strix_four_engine_qualify import digest, PROMPTS, SETTINGS
 
@@ -166,6 +185,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
             self.assertFalse(any(event['kind'] == 'construct' for event in events))
             self.assertIsNone(report)
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_same_byte_module_relocation_cannot_pass(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -176,6 +196,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
             self.assertEqual(report['status'], 'FAIL')
             self.assertIn('controller module changed', ' '.join(report['engines']['vLLM']['errors']))
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_single_engine_failure_and_publication_error_cannot_pass_aggregate(self):
         for mode in ('warmup', 'engine-publish'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
@@ -192,6 +213,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
                 else:
                     self.assertEqual(report['engines']['vLLM']['status'], 'FAIL')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_sglang_first_supplies_native_canonical_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -266,6 +288,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
                                  '--canonical-reference-sha256', digest(fixture['reference'])]
         return fixture
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_native_c1_public_entry_runs_only_first_qualification(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -292,6 +315,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
             self.assertEqual([event['kind'] for event in events if event['kind'] in ('construct', 'exchange', 'close', 'publish')],
                              ['construct', 'exchange', 'exchange', 'close', 'publish', 'publish'])
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_native_c1_real_transport_retains_shutdown_and_canonical_configuration(self):
         for mode in ('', 'error', 'timeout', 'exit', 'truncate'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
@@ -442,6 +466,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
                 self.assertFalse([event for event in events if event['kind'] == 'construct'])
                 self.assertIsNone(report)
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_native_c1_caps_each_exchange_without_relaxing_manifest_timeout(self):
         for timeout, expected in ((7200, 180), (180, 180), (17, 17)):
             with self.subTest(timeout=timeout), tempfile.TemporaryDirectory() as directory:
@@ -452,6 +477,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
                 self.assertEqual([event['timeout'] for event in events if event['kind'] == 'construct'], [expected])
                 self.assertEqual(report['selected_engines'], ['vllm.cpp'])
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_native_c1_failures_finalize_once_without_retry(self):
         for mode, reason in (('configure', 'configure injected'), ('warmup', 'warmup injected'),
                              ('teardown', 'teardown injected'), ('parent', 'lifecycle evidence'),
@@ -495,6 +521,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
         report = json.loads((fixture['output']/'result.json').read_text()) if (fixture['output']/'result.json').exists() else None
         return result, report, events
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_single_engine_publishes_only_the_terminal_aggregate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -522,6 +549,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
             self.assertLess(next(i for i,e in enumerate(events) if e['kind']=='close'),
                             next(i for i,e in enumerate(events) if e['kind']=='publish'))
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_multiple_engines_finalize_before_one_equal_aggregate(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); fixture=self.fixture(root)
@@ -542,6 +570,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
             self.assertEqual(len([e for e in events if e['kind']=='bindings']),8)
             self.assertEqual(len([e for e in events if e['kind']=='validate_run']),4)
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_failures_retain_reasons_and_stop_before_next_engine(self):
         cases={'constructor':'constructor injected','configure':'configure injected',
                'warmup':'warmup injected','teardown':'teardown injected','combined':'configure injected',
@@ -567,6 +596,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
                 self.assertEqual(len([e for e in events if e['kind']=='construct']),1)
                 self.assertEqual(len([e for e in events if e['kind']=='publish']),2)
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_missing_or_failed_lifecycle_observations_cannot_pass(self):
         for mode in ('parent','parent-missing','parent-bool','restoration','restored-type',
                      'missing-restored','cleanup','missing-cleanup','cleanup-type','unresolved','unresolved-type',
@@ -584,6 +614,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
                 self.assertIn('group' if mode=='group' else 'lifecycle evidence', ' '.join(item['errors']))
                 self.assertEqual(len([e for e in events if e['kind']=='construct']),1)
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_publication_errors_preserve_available_evidence(self):
         for mode in ('engine-publish','final-publish','engine-collision','final-collision'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
@@ -656,6 +687,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
                 self.assertIn('import escaped' if mode.endswith('origin') else 'canonical',result.stderr)
                 self.assertFalse([e for e in events if e['kind']=='construct'])
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_provenance_and_default_selection_are_retained(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); fixture=self.fixture(root)
@@ -675,6 +707,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
                 import hashlib
                 self.assertEqual(identity['sha256'],hashlib.sha256(fixture['members'][relative].encode()).hexdigest())
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_publication_error_does_not_hide_execution_or_teardown_errors(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); fixture=self.fixture(root,'combined-publish')
@@ -689,6 +722,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
             self.assertEqual(len([e for e in events if e['kind']=='construct']),1)
             self.assertEqual(len([e for e in events if e['kind']=='publish']),2)
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_later_prompt_drift_preserves_the_first_finalized_record(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); fixture=self.fixture(root,'prompt-drift')
@@ -701,6 +735,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
             for name in ('vLLM','patched SGLang'):
                 self.assertEqual(report['engines'][name],json.loads((fixture['output']/name.replace(' ','-')/'result.json').read_text()))
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_bindings_are_rechecked_before_each_engine_launch(self):
         for mode,reason in (('between-manifest','manifest'),('between-source','archive'),('between-model','file binding mismatch')):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:

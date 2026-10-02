@@ -8,6 +8,25 @@ import sys
 import tempfile
 import unittest
 
+
+def _native_child_lifecycle_available():
+    """These tests drive the real child-lifecycle ABI of
+    tools/bench/strix_four_engine/child_lifecycle.py (Native), which refuses
+    anything but Linux x86-64 with glibc 2.39. On other hosts, e.g. the arm64
+    CI lane, they fail on that precondition rather than on the behaviour under
+    test, so they are skipped there instead."""
+    try:
+        from tools.bench.strix_four_engine import child_lifecycle
+        child_lifecycle.Native()
+    except (RuntimeError, OSError, ImportError):
+        return False
+    return True
+
+
+NEEDS_NATIVE_LIFECYCLE = unittest.skipUnless(
+    _native_child_lifecycle_available(),
+    "requires the Linux x86-64 glibc 2.39 child-lifecycle ABI")
+
 ROOT = Path(__file__).resolve().parents[2]
 
 TORCH = '''from types import SimpleNamespace
@@ -180,6 +199,7 @@ class AdoptedChildrenTests(unittest.TestCase):
                                   text=True,capture_output=True,timeout=20)
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_real_python_adapter_tracker_is_reaped_before_group_absence(self):
         """Deleting Adapter adoption/reaping leaves a real tracker zombie."""
         with tempfile.TemporaryDirectory() as directory:
@@ -197,6 +217,7 @@ class AdoptedChildrenTests(unittest.TestCase):
             self.assertTrue(report["ok"], report)
             self.assertTrue(report["tracker_absent"], report)
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_normal_zero_children_and_repeated_close_restore_actual_state(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -212,6 +233,7 @@ with lifecycle.controller_lifecycle():
             a.close()
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_live_abnormal_parent_and_protocol_failures_remain_failures(self):
         self.driver('''
 for mode,reason in (("live","live adopted"),("nonzero","abnormal adopted"),
@@ -226,6 +248,7 @@ for mode,reason in (("live","live adopted"),("nonzero","abnormal adopted"),
         assert lifecycle.Native().state()==0 and a.lifecycle_evidence["restored"]
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_already_exited_parent_cannot_skip_shutdown_protocol(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -236,6 +259,7 @@ with lifecycle.controller_lifecycle():
     assert lifecycle.Native().state()==0
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_foreign_group_status_is_not_consumed_by_owned_drain(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -257,6 +281,7 @@ with lifecycle.controller_lifecycle():
         except ChildProcessError:pass
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_escaped_adopted_child_is_refused_without_foreign_group_operations(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -282,6 +307,7 @@ with lifecycle.controller_lifecycle():
     assert real_wait(child,0)==(child,0)
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_echild_does_not_replace_group_absence(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -303,6 +329,7 @@ with lifecycle.controller_lifecycle():
     assert absent(a.process.pid)
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_remaining_inventory_failures_are_not_absence(self):
         self.driver('''
 import io
@@ -343,6 +370,7 @@ for fault in ("missing","unreadable","bound","count","malformed","drift","pid","
         if child:assert os.waitpid(child,0)==(child,0)
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_sigchld_changes_during_adapter_ownership_refuse_close(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -356,6 +384,7 @@ with lifecycle.controller_lifecycle():
     assert native.state()==0
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_remaining_child_list_change_is_not_an_empty_inventory(self):
         self.driver('''
 import io
@@ -374,6 +403,7 @@ with lifecycle.controller_lifecycle():
     assert lifecycle._controller.poisoned and lifecycle.Native().state()==0
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_sigaction_query_failure_refuses_controller_before_launch(self):
         self.driver('''
 lib=ctypes.CDLL(None,use_errno=True)
@@ -387,6 +417,7 @@ with mock.patch.object(lib,"sigaction",return_value=-1),mock.patch.object(lifecy
 assert lifecycle.Native().state()==0
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_sigchld_change_after_controller_acquisition_refuses_launch(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -400,6 +431,7 @@ with lifecycle.controller_lifecycle():
     assert native.state()==0
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_foreign_child_after_controller_acquisition_refuses_launch(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -416,6 +448,7 @@ with lifecycle.controller_lifecycle():
     finally:os.close(write);assert os.waitpid(child,0)==(child,0)
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_constructor_failure_restores_and_preserves_original_error(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -428,6 +461,7 @@ with lifecycle.controller_lifecycle():
     a=make();a.exchange(dict(command="configure"));a.close()
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_imported_nested_concurrent_and_threaded_owners_refuse(self):
         self.driver('''
 try:make()
@@ -472,6 +506,7 @@ except RuntimeError as error:assert "explicit controller_lifecycle" in str(error
 else:raise AssertionError("released controller ownership remained reusable")
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_platform_signal_autoreap_and_preexisting_children_refuse(self):
         self.driver('''
 for target,value in (("platform","darwin"),("machine","aarch64")):
@@ -527,6 +562,7 @@ else:raise AssertionError("foreign children accepted at acquisition")
 finally:os.close(write);os.waitpid(foreign,0)
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_wait_group_flags_and_parent_status_ownership(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -560,6 +596,7 @@ with lifecycle.controller_lifecycle():
                               Sigaction.mask.offset, Sigaction.flags.offset, Sigaction.restorer.offset],
                              [152, 0, 8, 136, 144])
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_acquisition_syscall_and_verification_fail_before_launch(self):
         self.driver('''
 for fail_option in (36,37):
@@ -582,6 +619,7 @@ with lifecycle.controller_lifecycle():
     assert native.state()==0
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_restoration_failure_is_retained_and_poisoned_owner_cannot_relaunch(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -604,6 +642,7 @@ with lifecycle.controller_lifecycle():
 with lifecycle.controller_lifecycle():pass
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_restoration_verification_and_original_error_are_preserved(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -618,6 +657,7 @@ with lifecycle.controller_lifecycle():
     assert native.state()==0 and not a.lifecycle_evidence["restored"]
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_cleanup_signal_error_does_not_skip_direct_parent_wait(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -638,6 +678,7 @@ with lifecycle.controller_lifecycle():
     assert lifecycle.Native().state()==0
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_transport_cleanup_error_does_not_replace_original_error(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
@@ -656,6 +697,7 @@ with lifecycle.controller_lifecycle():
     assert lifecycle.Native().state()==0
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_context_cleanup_preserves_original_exception(self):
         self.driver('''
 try:
@@ -670,6 +712,7 @@ with mock.patch.object(os,"killpg",side_effect=AssertionError("abandoned close t
     a.close()
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_drain_child_count_and_deadline_are_bounded(self):
         self.driver('''
 for kind in ("count","time"):
@@ -691,6 +734,7 @@ for kind in ("count","time"):
         assert lifecycle.Native().state()==0
 ''')
 
+    @NEEDS_NATIVE_LIFECYCLE
     def test_cleanup_deadline_cannot_turn_a_live_child_into_success(self):
         self.driver('''
 with lifecycle.controller_lifecycle():
