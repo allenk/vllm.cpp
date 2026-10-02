@@ -2725,6 +2725,125 @@ TEST_CASE("the GDN PREFILL recurrence runs NATIVELY on Vulkan and matches the CP
   cpu.DestroyQueue(cq);
 }
 
+// ===========================================================================
+// GDN PREFILL at Dk = Dv = 128 -- the only shape the register-state kernel
+// (vt_gdn_prefill_reg) takes. The test above is ragged ON PURPOSE (Dk = 20 /
+// Dv = 19), so it never reaches that kernel, and until 2026-10-02 nothing did.
+// That is how the kernel shipped without a subgroup-width gate and computed
+// WRONG on llvmpipe (subgroup 8): out NMSE 0.662 here, against 1.6e-13 on a
+// 32-wide NVIDIA subgroup. See the gate in vulkan_ops.cpp GdnPrefillKernel.
+//
+// It asserts the numbers AND which kernel the gate picked: on a 32-wide
+// subgroup with VT_VULKAN_GDN_REG unset or 1, the register pipeline must have
+// run (else a green result says nothing about it); on any other width it must
+// NOT have run. Run it with VT_VULKAN_GDN_REG=0 too for the shared-state arm.
+// ===========================================================================
+TEST_CASE("GDN PREFILL at Dk = Dv = 128 (the register kernel's shape) matches the CPU oracle") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  constexpr int64_t kHk = 2, kHv = 4, kDk = 128, kDv = 128;
+  constexpr int64_t kN = 2, kT = 7;
+  const std::vector<int32_t> qsl = {0, 4, 7};
+  constexpr int64_t kQk = kT * kHk * kDk;
+  constexpr int64_t kVo = kT * kHv * kDv;
+  constexpr int64_t kGb = kT * kHv;
+  constexpr int64_t kSt = kN * kHv * kDv * kDk;
+
+  const std::vector<float> qv = Spread(kQk, 1.0f, 201u);
+  const std::vector<float> kv = Spread(kQk, 1.0f, 203u);
+  const std::vector<float> vv = Spread(kVo, 2.0f, 207u);
+  const std::vector<float> gv = GdnDecays(kGb, 209u);
+  const std::vector<float> bv = GdnBetas(kGb, 213u);
+  const std::vector<float> s0 = Spread(kSt, 0.5f, 227u);
+
+  vt::GdnArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(kDk));
+
+  Buf vqb(vk, kQk, 4), vkb(vk, kQk, 4), vvb(vk, kVo, 4), vob(vk, kVo, 4);
+  Buf vgb(vk, kGb, 4), vbb(vk, kGb, 4), vsb(vk, kSt, 4), vlb(vk, kN + 1, 4);
+  Buf cqb(cpu, kQk, 4), ckb(cpu, kQk, 4), cvb(cpu, kVo, 4), cob(cpu, kVo, 4);
+  Buf cgb(cpu, kGb, 4), cbb(cpu, kGb, 4), csb(cpu, kSt, 4), clb(cpu, kN + 1, 4);
+
+  vk.Copy(vq, vqb.p(), qv.data(), kQk * 4);
+  vk.Copy(vq, vkb.p(), kv.data(), kQk * 4);
+  vk.Copy(vq, vvb.p(), vv.data(), kVo * 4);
+  vk.Copy(vq, vgb.p(), gv.data(), kGb * 4);
+  vk.Copy(vq, vbb.p(), bv.data(), kGb * 4);
+  vk.Copy(vq, vsb.p(), s0.data(), kSt * 4);
+  vk.Copy(vq, vlb.p(), qsl.data(), (kN + 1) * 4);
+  std::memcpy(cqb.p(), qv.data(), kQk * 4);
+  std::memcpy(ckb.p(), kv.data(), kQk * 4);
+  std::memcpy(cvb.p(), vv.data(), kVo * 4);
+  std::memcpy(cgb.p(), gv.data(), kGb * 4);
+  std::memcpy(cbb.p(), bv.data(), kGb * 4);
+  std::memcpy(csb.p(), s0.data(), kSt * 4);
+  std::memcpy(clb.p(), qsl.data(), (kN + 1) * 4);
+  vk.Synchronize(vq);
+
+  auto qk_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kT, kHk, kDk});
+  };
+  auto vo_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kT, kHv, kDv});
+  };
+  auto gb_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kT, kHv});
+  };
+  auto st_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kN, kHv, kDv, kDk});
+  };
+
+  Tensor vqt = qk_t(vqb.p(), vd), vkt = qk_t(vkb.p(), vd);
+  Tensor vvt = vo_t(vvb.p(), vd), vot = vo_t(vob.p(), vd);
+  Tensor vgt = gb_t(vgb.p(), vd), vbt = gb_t(vbb.p(), vd), vst = st_t(vsb.p(), vd);
+  Tensor vlt = Tensor::Contiguous(vlb.p(), vt::DType::kI32, vd, {kN + 1});
+  Tensor cqt = qk_t(cqb.p(), cd), ckt = qk_t(ckb.p(), cd);
+  Tensor cvt = vo_t(cvb.p(), cd), cot = vo_t(cob.p(), cd);
+  Tensor cgt = gb_t(cgb.p(), cd), cbt = gb_t(cbb.p(), cd), cst = st_t(csb.p(), cd);
+  Tensor clt = Tensor::Contiguous(clb.p(), vt::DType::kI32, cd, {kN + 1});
+
+  vt::GdnPrefill(cq, cot, cqt, ckt, cvt, cgt, cbt, cst, clt, args);
+  vt::GdnPrefill(vq, vot, vqt, vkt, vvt, vgt, vbt, vst, vlt, args);
+  vk.Synchronize(vq);
+
+  CHECK(RanNative(vt::OpId::kGdnPrefill));
+  // Which kernel the gate picked. doctest's MESSAGE stream prints a const char*
+  // as a truthy "1", so everything goes out as ints (env: -1 = unset).
+  const char* env = std::getenv("VT_VULKAN_GDN_REG");
+  const bool reg_wanted = env == nullptr || env[0] != '0';
+  const bool reg_ran = ctx.PipelineExistsFor("vt_gdn_prefill_reg");
+  MESSAGE("subgroup width = " << ctx.subgroup_size()
+          << ", VT_VULKAN_GDN_REG = " << (env ? std::atoi(env) : -1)
+          << ", register pipeline ran (1 = yes) = " << (reg_ran ? 1 : 0));
+  if (ctx.subgroup_size() == 32 && reg_wanted) {
+    CHECK(reg_ran);
+  } else if (ctx.subgroup_size() != 32) {
+    CHECK_FALSE(reg_ran);
+  }
+
+  std::vector<float> got_out(kVo), got_state(kSt);
+  vk.Copy(vq, got_out.data(), vob.p(), kVo * 4);
+  vk.Copy(vq, got_state.data(), vsb.p(), kSt * 4);
+  vk.Synchronize(vq);
+  const std::vector<float> ref_out(cob.as<float>(), cob.as<float>() + kVo);
+  const std::vector<float> ref_state(csb.as<float>(), csb.as<float>() + kSt);
+  const double nmse_out = NmseOf(ref_out, got_out);
+  const double nmse_state = NmseOf(ref_state, got_state);
+  MESSAGE("Dk = Dv = 128 out NMSE = " << nmse_out << ", state NMSE = " << nmse_state);
+  CHECK(nmse_out <= kGdnNmseTol);
+  CHECK(nmse_state <= kGdnNmseTol);
+
+  vk.DestroyQueue(vq);
+  cpu.DestroyQueue(cq);
+}
+
 TEST_CASE("the GDN DECODE recurrence runs NATIVELY on Vulkan, indexed and compact") {
   if (!VulkanPresent()) return;
   auto& ctx = vt::vulkan::VulkanContext::Get();

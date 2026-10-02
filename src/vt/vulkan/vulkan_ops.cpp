@@ -3291,11 +3291,24 @@ void GdnPrefillKernel(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k
   // narrower, and our VT_LOAD is a dtype-erased macro where theirs is a direct
   // typed access. Recorded rather than guessed at.
   // VT_VULKAN_GDN_REG=0 forces the shared-state kernel back.
+  //
+  // ⚠️ AND GATED ON A 32-WIDE SUBGROUP. The shader's workgroup is 32 lanes and
+  // each row is reduced with ONE subgroupAdd, i.e. it assumes the workgroup IS a
+  // subgroup. On a narrower subgroup (llvmpipe reports 8) the workgroup splits
+  // and each add covers only part of the row. Before this gate the kernel was
+  // silently WRONG there -- measured at Dk = Dv = 128 against the CPU reference:
+  // llvmpipe (8) out NMSE 0.662, RTX PRO 6000 (32) 1.6e-13. No unit test caught
+  // it because the GDN prefill test uses Dk = 20 / Dv = 19 and never reached
+  // this kernel; the "GDN PREFILL at Dk = Dv = 128" case in
+  // test_vulkan_backend.cpp now does, and also asserts which kernel this gate
+  // picked. Wider subgroups (64) would be correct (only 32 lanes active) but
+  // are kept off the path until measured.
   static const bool kGdnReg = [] {
     const char* v = std::getenv("VT_VULKAN_GDN_REG");
     return v == nullptr || v[0] != '0';
   }();
-  if (kGdnReg && state.shape[3] == 128 && dv == 128) {
+  if (kGdnReg && state.shape[3] == 128 && dv == 128 &&
+      VulkanContext::Get().subgroup_size() == 32) {
     const uint32_t rspec[3] = {spec[0], spec[1], 4u};
     const uint32_t rgroups = static_cast<uint32_t>(n * hv * dv);
     Go("vt_gdn_prefill_reg", bind, p, rgroups, rspec, 3);
