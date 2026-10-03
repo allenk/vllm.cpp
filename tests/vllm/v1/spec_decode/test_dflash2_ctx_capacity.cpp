@@ -57,7 +57,28 @@ constexpr int kLongPromptTokens = 4300;
 // The per-request drain budget. Generous on purpose: the 4300-token prefill
 // takes single-digit seconds on a CPU box, and a slow runner must not turn a
 // pass into a timeout.
+//
+// ThreadSanitizer is the exception that 60 s does not cover: it slows this
+// prefill by roughly an order of magnitude, and on the scheduled
+// sanitize-cpu (thread) lane the 4300-token request sometimes had not finished
+// at 60 s while the short request beside it had (allenk/vllm.cpp run
+// 37126187511: "first request: NO TERMINAL OUTPUT within 60s", second
+// "finished with 4 tokens"). That is the budget expiring, not the engine dying,
+// which is what this test exists to catch. Under TSan the budget is 300 s; a
+// genuinely dead engine still never produces the terminal frame, so the
+// assertion keeps its meaning. Detection matches src/vt/cpu/cpu_threadpool.cpp.
+#if defined(__SANITIZE_THREAD__)
+#define VT_TEST_THREAD_SANITIZER 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define VT_TEST_THREAD_SANITIZER 1
+#endif
+#endif
+#ifdef VT_TEST_THREAD_SANITIZER
+constexpr int kDrainBudgetSeconds = 300;
+#else
 constexpr int kDrainBudgetSeconds = 60;
+#endif
 
 // One token id of the tiny BPE fixture ("hello"). The prompts here go in
 // PRE-TOKENIZED, through `AsyncLLM::generate(std::vector<int32_t>, ...)`, so the
