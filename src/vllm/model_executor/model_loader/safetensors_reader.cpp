@@ -280,12 +280,10 @@ std::map<std::string, std::string> LoadSafetensorsIndex(
 
 namespace {
 
-#if !defined(_WIN32)
 long HostPageSize() {
   static const long page = support::HostPageSize();
   return page;
 }
-#endif
 
 // nullopt => env-driven; set => forced (test seam).
 std::optional<bool>& WindowedReleaseOverride() {
@@ -312,10 +310,6 @@ bool LoadWindowedReleaseEnabled() {
 }
 
 void ReleaseSourcePages(const void* data, size_t nbytes) {
-#if defined(_WIN32)
-  (void)data;
-  (void)nbytes;
-#else
   if (data == nullptr || nbytes == 0) return;
   const auto ps = static_cast<uintptr_t>(HostPageSize());
   const auto begin = reinterpret_cast<uintptr_t>(data);
@@ -327,6 +321,17 @@ void ReleaseSourcePages(const void* data, size_t nbytes) {
   const uintptr_t page_begin = (begin + ps - 1) & ~(ps - 1);
   const uintptr_t page_end = end & ~(ps - 1);
   if (page_end <= page_begin) return;  // span smaller than one whole page
+#if defined(_WIN32)
+  // The view is MapViewOfFile(FILE_MAP_READ): clean, file-backed pages, so the
+  // same release applies. Without it every byte read during the load stays in
+  // the process working set (measured: 18.6 GiB file-backed on the 35B NVFP4
+  // checkpoint, 0.3 GB RssFile on Linux). VirtualUnlock on a range that was
+  // never locked removes its pages from the working set; they move to the
+  // standby list and a later read soft-faults them back. It then reports
+  // FALSE / ERROR_NOT_LOCKED by design, so the return is ignored, as below.
+  ::VirtualUnlock(reinterpret_cast<void*>(page_begin),
+                  static_cast<SIZE_T>(page_end - page_begin));
+#else
   // MAP_PRIVATE PROT_READ pages are clean and file-backed; MADV_DONTNEED drops
   // the resident page and a later read re-faults it from disk. A failure merely
   // leaves the page resident (a memory, not correctness, regression), so the
