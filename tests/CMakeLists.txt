@@ -4161,6 +4161,9 @@ set_tests_properties(test_qwen4_exp_moe_sel_fp PROPERTIES
 # (qwen3_5_moe_block.h) plus the one probe symbol `vllm::MoeKqDeviceCalls()`, so
 # it needs no src/ grant.
 vllm_cpp_add_test(test_qwen35_moe_kq_device vllm/models/test_qwen35_moe_kq_device.cpp)
+# Block-wise FP8 routed + shared experts (Qwen/Qwen3.6-35B-A3B-FP8) against an
+# exact bf16 twin of the same block; CPU always, CUDA when a backend exists.
+vllm_cpp_add_test(test_qwen35_moe_fp8_block vllm/models/test_qwen35_moe_fp8_block.cpp)
 # The same binary on the REFERENCE arm, so the fallback the row promises is a
 # gated route and not a claim. The suite forces the variable per case, so this
 # registration proves the process-level default does not change the verdict.

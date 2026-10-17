@@ -6374,6 +6374,33 @@ std::vector<uint16_t> ExpertMlpNvfp4(Dev d, const Nvfp4Weight& gate,
   return MatmulNvfp4Bf16(d, act, n, I, down);  // [n,H]
 }
 
+// One BLOCK-WISE FP8 routed expert on the reference loop: the `n` gathered
+// rows go up once, through the same block GEMM the dense MLP uses (per-token
+// 128-group activation quant, per-block weight scale applied in the mainloop),
+// and come back once. Each projection returns bf16 -- upstream's fused MoE
+// keeps its intermediates in the model dtype too -- and the SwiGLU runs on the
+// device in f32, rounded to bf16 on store. This is the CORRECTNESS arm: it
+// round-trips the host per expert and is not capturable; a grouped kernel is
+// gated against it.
+std::vector<uint16_t> ExpertMlpFp8Block(Dev d, const Fp8BlockWeight& gate,
+                                        const Fp8BlockWeight& up,
+                                        const Fp8BlockWeight& down,
+                                        const std::vector<uint16_t>& x,
+                                        int64_t n, int64_t H, int64_t I) {
+  DBuf dx(d, DType::kBF16, {n, H}, x.data());
+  DBuf g = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, dx.t(), gate,
+                                                        DType::kBF16);  // [n,I]
+  DBuf u = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, dx.t(), up,
+                                                        DType::kBF16);  // [n,I]
+  DBuf act(d, DType::kBF16, {n, I});
+  vt::MoeSiluMul(d.q, act.t(), g.t(), u.t());
+  DBuf y = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, act.t(), down,
+                                                        DType::kBF16);  // [n,H]
+  std::vector<uint16_t> out(static_cast<size_t>(n) * H);
+  y.Download(d, out.data());
+  return out;
+}
+
 // Shared-expert MLP (moe-semantics.md §5): silu-mul MLP then sigmoid(x@Wseg) *
 // out. Device-resident (M2.5 Phase 1): h [T,H] bf16 (device) -> DBuf [T,H] bf16
 // (device); the silu-mul + sigmoid-gate are device ops (not host loops), so the
@@ -6470,6 +6497,23 @@ struct SharedExpertParts {
 SharedExpertParts SharedExpertUngated(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
                                       const Tensor& h, int64_t T, bool fp4) {
   const int64_t Is = cfg.shared_expert_intermediate_size;
+  // BLOCK-WISE FP8 shared expert (`Qwen/Qwen3.6-35B-A3B-FP8`): exclusive and
+  // first, as on the dense MLP. The loader fills the block fields and leaves
+  // the bf16 and fp4 ones EMPTY, so a non-empty block weight IS the scheme.
+  // Every GEMM returns the model dtype (bf16), the `out_dtype` upstream's block
+  // linear uses; MoeSiluMul and the gate/combine kernels accept bf16 inputs.
+  if (!w.shared_gate_proj_fp8_block.Empty()) {
+    DBuf sg = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, h, w.shared_gate_proj_fp8_block, DType::kBF16);  // [T,Is]
+    DBuf su = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, h, w.shared_up_proj_fp8_block, DType::kBF16);    // [T,Is]
+    DBuf sact(d, DType::kBF16, {T, Is});
+    vt::MoeSiluMul(d.q, sact.t(), sg.t(), su.t());  // silu(sg) * su -> bf16
+    DBuf sd = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, sact.t(), w.shared_down_proj_fp8_block, DType::kBF16);  // [T,H]
+    DBuf gl = MatmulF32D(d, h, w.shared_gate);                     // [T,1] f32
+    return {std::move(sd), std::move(gl)};
+  }
 #ifdef VT_MARLIN_NVFP4
   // Fused gate_up (VT_MOE_FUSED_W13, dense sibling of the MoE fused w13): ONE
   // Marlin GEMM [T,2Is] + SiluAndMul — vLLM's merged gate_up_proj layout. The
@@ -7674,6 +7718,13 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
         fp4 ? ExpertMlpNvfp4(d, w.expert_gate_fp4[static_cast<size_t>(e)],
                              w.expert_up_fp4[static_cast<size_t>(e)],
                              w.expert_down_fp4[static_cast<size_t>(e)], xg, n, H, I)
+        : !w.expert_gate_fp8_block.empty()
+            // Block-wise FP8 experts (`Qwen/Qwen3.6-35B-A3B-FP8`): the
+            // correctness arm, one block GEMM per projection per expert.
+            ? ExpertMlpFp8Block(d, w.expert_gate_fp8_block[static_cast<size_t>(e)],
+                                w.expert_up_fp8_block[static_cast<size_t>(e)],
+                                w.expert_down_fp8_block[static_cast<size_t>(e)], xg,
+                                n, H, I)
         : !w.expert_gate_kq.Empty()
             // A3 keep-quant: gate/up/down are slices of the stacked tower (byte-exact
             // with the pre-A3 per-expert ExpertMlp; W3b grouped path above).
