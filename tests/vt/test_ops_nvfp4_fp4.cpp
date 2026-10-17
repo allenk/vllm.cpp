@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "support/test_env.h"  // SetEnv/UnsetEnv — MSVC has no setenv (#603)
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"  // F8E4M3ToF32, kE2M1Lut
 #include "vllm/model_executor/models/qwen3_5_weights.h"
@@ -1276,15 +1277,15 @@ struct ScopedEnv {
     had = cur != nullptr;
     if (had) saved = cur;
     if (value)
-      setenv(n, value, 1);
+      vllm_test::SetEnv(n, value);
     else
-      unsetenv(n);
+      vllm_test::UnsetEnv(n);
   }
   ~ScopedEnv() {
     if (had)
-      setenv(name, saved.c_str(), 1);
+      vllm_test::SetEnv(name, saved.c_str());
     else
-      unsetenv(name);
+      vllm_test::UnsetEnv(name);
   }
 };
 

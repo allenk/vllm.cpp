@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "support/test_env.h"  // SetEnv/UnsetEnv — MSVC has no setenv (#603)
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
@@ -63,13 +64,13 @@ class ScopedEnv {
       had_old_ = true;
       old_ = old;
     }
-    setenv(name, value, 1);
+    vllm_test::SetEnv(name, value);
   }
   ~ScopedEnv() {
     if (had_old_) {
-      setenv(name_.c_str(), old_.c_str(), 1);
+      vllm_test::SetEnv(name_.c_str(), old_.c_str());
     } else {
-      unsetenv(name_.c_str());
+      vllm_test::UnsetEnv(name_.c_str());
     }
   }
   ScopedEnv(const ScopedEnv&) = delete;
@@ -1384,9 +1385,9 @@ TEST_CASE(
   auto run = [&](const char* env_value, uint64_t& reg_tile, uint64_t& legacy,
                  std::vector<uint8_t>& out_host) {
     if (env_value == nullptr)
-      unsetenv("VT_GDN_PACKED_REG_TILE");
+      vllm_test::UnsetEnv("VT_GDN_PACKED_REG_TILE");
     else
-      setenv("VT_GDN_PACKED_REG_TILE", env_value, 1);
+      vllm_test::SetEnv("VT_GDN_PACKED_REG_TILE", env_value);
     DeviceTensor d_state(gpu, guard.q, dtype, {c.slots, c.hv, c.dv, c.dk},
                          c.state.data());
     DeviceTensor d_out(gpu, guard.q, dtype, {c.batch, c.hv, c.dv});
@@ -1420,7 +1421,7 @@ TEST_CASE(
   CHECK(legacy1 == 0);
   CheckClose(Unpack(out_reg, dtype), Unpack(out_cpu, dtype), 2e-2f, 1e-2f);
 
-  unsetenv("VT_GDN_PACKED_REG_TILE");
+  vllm_test::UnsetEnv("VT_GDN_PACKED_REG_TILE");
 }
 #endif  // VLLM_CPP_CUDA
 
@@ -1507,9 +1508,9 @@ TEST_CASE(
                    std::vector<uint8_t>& out_host,
                    std::vector<uint8_t>& state_host) {
       if (env_value == nullptr)
-        unsetenv("VT_GDN_PACKED_DECODE_TRITON");
+        vllm_test::UnsetEnv("VT_GDN_PACKED_DECODE_TRITON");
       else
-        setenv("VT_GDN_PACKED_DECODE_TRITON", env_value, 1);
+        vllm_test::SetEnv("VT_GDN_PACKED_DECODE_TRITON", env_value);
       DeviceTensor d_state(gpu, guard.q, DType::kF32,
                            {c.slots, hv, dv, dk}, state_f32.data());
       DeviceTensor d_out(gpu, guard.q, dtype, {batch, hv, dv});
@@ -1546,7 +1547,7 @@ TEST_CASE(
     CheckClose(Unpack(out_aot, dtype), Unpack(out_legacy, dtype), 2e-2f,
                1e-2f);
   }
-  unsetenv("VT_GDN_PACKED_DECODE_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_PACKED_DECODE_TRITON");
 }
 #endif  // VLLM_CPP_CUDA && VLLM_CPP_TRITON
 
@@ -1690,7 +1691,7 @@ void RunConvUpdateFastCase(int64_t batch, int64_t c, int64_t k, bool with_bias, 
                     indexed ? idx.data() : nullptr);
 
   auto run = [&](bool fast, std::vector<uint8_t>& out_bytes, std::vector<uint8_t>& st_bytes) {
-    ::setenv("VT_CONV_UPDATE_FAST", fast ? "1" : "0", 1);
+    vllm_test::SetEnv("VT_CONV_UPDATE_FAST", fast ? "1" : "0");
     DeviceTensor dst(gpu, gq.q, state_dtype, {slots, c, width}, stb.data());
     DeviceTensor dout(gpu, gq.q, cb.out, {batch, c});
     // Preset out so the NULL-block token's untouched bytes are identical across arms.
@@ -1707,7 +1708,7 @@ void RunConvUpdateFastCase(int64_t batch, int64_t c, int64_t k, bool with_bias, 
   std::vector<uint8_t> out_ref, st_ref, out_fast, st_fast;
   run(/*fast=*/false, out_ref, st_ref);
   run(/*fast=*/true, out_fast, st_fast);
-  ::unsetenv("VT_CONV_UPDATE_FAST");
+  vllm_test::UnsetEnv("VT_CONV_UPDATE_FAST");
   // BIT-EXACT (0-ulp): fast==shipped by construction — raw bytes must match.
   CHECK(out_fast == out_ref);  // out activation byte-identical
   CHECK(st_fast == st_ref);    // rolled conv_state byte-identical
@@ -1806,7 +1807,7 @@ void RunRmsNormGatedFastContiguous(int64_t rows, bool sigmoid_gate, uint32_t see
   DeviceTensor dw(gpu, gq.q, in_dt, {d}, wb.data());
 
   auto run = [&](bool fast, std::vector<uint8_t>& out_bytes) {
-    ::setenv("VT_RMSNORM_GATED_FAST", fast ? "1" : "0", 1);
+    vllm_test::SetEnv("VT_RMSNORM_GATED_FAST", fast ? "1" : "0");
     DeviceTensor dout(gpu, gq.q, out_dt, {rows, d});
     vt::RmsNormGated(gq.q, dout.tensor(), dx.tensor(), dz.tensor(), dw.tensor(), args);
     out_bytes.resize(static_cast<size_t>(rows * d) * vt::SizeOf(out_dt));
@@ -1815,7 +1816,7 @@ void RunRmsNormGatedFastContiguous(int64_t rows, bool sigmoid_gate, uint32_t see
   std::vector<uint8_t> out_ref, out_fast;
   run(/*fast=*/false, out_ref);
   run(/*fast=*/true, out_fast);
-  ::unsetenv("VT_RMSNORM_GATED_FAST");
+  vllm_test::UnsetEnv("VT_RMSNORM_GATED_FAST");
   // BIT-EXACT (0-ulp): fast==shipped by construction.
   CheckClose(Unpack(out_fast, out_dt), Unpack(out_ref, out_dt), 0.0f, 0.0f);
 }
@@ -1908,9 +1909,9 @@ struct GdnDecodeTestEnv {
 
 void SetOrUnsetEnv(const char* name, const char* value) {
   if (value == nullptr)
-    unsetenv(name);
+    vllm_test::UnsetEnv(name);
   else
-    setenv(name, value, 1);
+    vllm_test::SetEnv(name, value);
 }
 
 // Same-process schedule discriminator for the regular fused GDN decode path.
@@ -1978,10 +1979,10 @@ void RunGdnDecodeExactCase(int64_t dv, DType io_dtype, DType state_dtype,
   std::vector<uint8_t> out_candidate, state_candidate;
   run(incumbent, out_incumbent, state_incumbent);
   run(candidate, out_candidate, state_candidate);
-  unsetenv("VT_GDN_DECODE_REGSTATE");
-  unsetenv("VT_GDN_DECODE_SWIZZLE");
-  unsetenv("VT_GDN_DECODE_BV");
-  unsetenv("VT_GDN_DECODE_NW");
+  vllm_test::UnsetEnv("VT_GDN_DECODE_REGSTATE");
+  vllm_test::UnsetEnv("VT_GDN_DECODE_SWIZZLE");
+  vllm_test::UnsetEnv("VT_GDN_DECODE_BV");
+  vllm_test::UnsetEnv("VT_GDN_DECODE_NW");
   CheckBytesEqual(out_candidate, out_incumbent);
   CheckBytesEqual(state_candidate, state_incumbent);
 
@@ -2093,7 +2094,7 @@ void RunRmsNormGatedFastPaddedRank3(int64_t t, int64_t hv, bool sigmoid_gate, ui
   Tensor tz3 = Rank3RowView(dz.tensor().data, in_dt, Gpu(), t, hv, d, stride);
 
   auto run = [&](bool fast, std::vector<uint8_t>& out_bytes) {
-    ::setenv("VT_RMSNORM_GATED_FAST", fast ? "1" : "0", 1);
+    vllm_test::SetEnv("VT_RMSNORM_GATED_FAST", fast ? "1" : "0");
     DeviceTensor dout(gpu, gq.q, out_dt, {t, hv, d});
     vt::RmsNormGated(gq.q, dout.tensor(), dx.tensor(), tz3, dw.tensor(), args);
     out_bytes.resize(static_cast<size_t>(rows * d) * vt::SizeOf(out_dt));
@@ -2102,7 +2103,7 @@ void RunRmsNormGatedFastPaddedRank3(int64_t t, int64_t hv, bool sigmoid_gate, ui
   std::vector<uint8_t> out_ref, out_fast;
   run(/*fast=*/false, out_ref);
   run(/*fast=*/true, out_fast);
-  ::unsetenv("VT_RMSNORM_GATED_FAST");
+  vllm_test::UnsetEnv("VT_RMSNORM_GATED_FAST");
   CheckClose(Unpack(out_fast, out_dt), Unpack(out_ref, out_dt), 0.0f, 0.0f);
 }
 
@@ -2642,9 +2643,9 @@ void RunConvFwdRegByteExactCase(const std::vector<int32_t>& qsl, const std::vect
   auto run = [&](bool reg, bool exact, const char* channel_arm,
                  std::vector<uint8_t>& out_bytes,
                  std::vector<uint8_t>& st_bytes) {
-    ::setenv("VT_CONV_REG", reg ? "1" : "0", 1);
-    ::setenv("VT_CONV_EXACT_CHUNKS", exact ? "1" : "0", 1);
-    ::setenv("VT_CONV_CHANNEL_TILE", channel_arm, 1);
+    vllm_test::SetEnv("VT_CONV_REG", reg ? "1" : "0");
+    vllm_test::SetEnv("VT_CONV_EXACT_CHUNKS", exact ? "1" : "0");
+    vllm_test::SetEnv("VT_CONV_CHANNEL_TILE", channel_arm);
     DeviceTensor dst(gpu, gq.q, DType::kF32, {n, c, k - 1}, stb.data());  // fresh state per arm
     DeviceTensor dout(gpu, gq.q, cb.out, {t, c});
     gpu.Memset(gq.q, dout.tensor().data, 0x5a, static_cast<size_t>(t * c) * vt::SizeOf(cb.out));
@@ -2671,9 +2672,9 @@ void RunConvFwdRegByteExactCase(const std::vector<int32_t>& qsl, const std::vect
   run(/*reg=*/true, /*exact=*/true, "0", out_exact, st_exact);
   run(/*reg=*/true, /*exact=*/true, "1", out_width_four, st_width_four);
   run(/*reg=*/true, /*exact=*/true, "2", out_two_channels, st_two_channels);
-  ::unsetenv("VT_CONV_REG");
-  ::unsetenv("VT_CONV_EXACT_CHUNKS");
-  ::unsetenv("VT_CONV_CHANNEL_TILE");
+  vllm_test::UnsetEnv("VT_CONV_REG");
+  vllm_test::UnsetEnv("VT_CONV_EXACT_CHUNKS");
+  vllm_test::UnsetEnv("VT_CONV_CHANNEL_TILE");
   CHECK(out_reg == out_tiled);  // out activation byte-identical
   CHECK(st_reg == st_tiled);    // rolled conv_state byte-identical
   CHECK(out_exact == out_tiled);  // exact descriptor changes only work assignment
@@ -2746,8 +2747,8 @@ void RunGdnPostConvSplitByteExactCase(int64_t t, int64_t hk, int64_t hv, int64_t
 
   auto run = [&](bool split, std::vector<uint8_t>& q, std::vector<uint8_t>& k,
                  std::vector<uint8_t>& v, std::vector<uint8_t>& g, std::vector<uint8_t>& b) {
-    ::setenv("VT_GDN_POSTCONV_SPLIT", split ? "1" : "0", 1);
-    ::setenv("VT_GDN_POSTCONV_TOKEN_TILE", "0", 1);
+    vllm_test::SetEnv("VT_GDN_POSTCONV_SPLIT", split ? "1" : "0");
+    vllm_test::SetEnv("VT_GDN_POSTCONV_TOKEN_TILE", "0");
     DeviceTensor dq_(gpu, gq.q, qkv_dt, {t, hk, dk});
     DeviceTensor dk_(gpu, gq.q, qkv_dt, {t, hk, dk});
     DeviceTensor dv_(gpu, gq.q, qkv_dt, {t, hv, dv});
@@ -2770,8 +2771,8 @@ void RunGdnPostConvSplitByteExactCase(int64_t t, int64_t hk, int64_t hv, int64_t
   std::vector<uint8_t> q0, k0, v0, g0, b0, q1, k1, v1, g1, b1;
   run(/*split=*/false, q0, k0, v0, g0, b0);
   run(/*split=*/true, q1, k1, v1, g1, b1);
-  ::unsetenv("VT_GDN_POSTCONV_SPLIT");
-  ::unsetenv("VT_GDN_POSTCONV_TOKEN_TILE");
+  vllm_test::UnsetEnv("VT_GDN_POSTCONV_SPLIT");
+  vllm_test::UnsetEnv("VT_GDN_POSTCONV_TOKEN_TILE");
   CHECK(q1 == q0);
   CHECK(k1 == k0);
   CHECK(v1 == v0);
@@ -2855,9 +2856,9 @@ void RunGdnPostConvTokenTileCase(int64_t t, int64_t hk, int64_t hv, DType qkv,
   auto run = [&](bool token_tile, std::vector<uint8_t>& q, std::vector<uint8_t>& k,
                  std::vector<uint8_t>& v, std::vector<uint8_t>& g,
                  std::vector<uint8_t>& b) {
-    ::setenv("VT_GDN_POSTCONV_SPLIT", "0", 1);
-    ::setenv("VT_GDN_POSTCONV_FAST", "1", 1);
-    ::setenv("VT_GDN_POSTCONV_TOKEN_TILE", token_tile ? "1" : "0", 1);
+    vllm_test::SetEnv("VT_GDN_POSTCONV_SPLIT", "0");
+    vllm_test::SetEnv("VT_GDN_POSTCONV_FAST", "1");
+    vllm_test::SetEnv("VT_GDN_POSTCONV_TOKEN_TILE", token_tile ? "1" : "0");
     DeviceTensor dq_(gpu, gq.q, qkv, {t, hk, dk});
     DeviceTensor dk_(gpu, gq.q, qkv, {t, hk, dk});
     DeviceTensor dv_(gpu, gq.q, qkv, {t, hv, dv});
@@ -2880,9 +2881,9 @@ void RunGdnPostConvTokenTileCase(int64_t t, int64_t hk, int64_t hv, DType qkv,
   std::vector<uint8_t> q0, k0, v0, g0, b0, q1, k1, v1, g1, b1;
   run(/*token_tile=*/false, q0, k0, v0, g0, b0);
   run(/*token_tile=*/true, q1, k1, v1, g1, b1);
-  ::unsetenv("VT_GDN_POSTCONV_SPLIT");
-  ::unsetenv("VT_GDN_POSTCONV_FAST");
-  ::unsetenv("VT_GDN_POSTCONV_TOKEN_TILE");
+  vllm_test::UnsetEnv("VT_GDN_POSTCONV_SPLIT");
+  vllm_test::UnsetEnv("VT_GDN_POSTCONV_FAST");
+  vllm_test::UnsetEnv("VT_GDN_POSTCONV_TOKEN_TILE");
 
   const std::vector<float> q1f = Unpack(q1, qkv);
   const std::vector<float> k1f = Unpack(k1, qkv);
@@ -3662,18 +3663,18 @@ TEST_CASE("CUDA public GdnDecode binds decode layout to exact production geometr
       {"32", "1", "1", false, 4, 256, 17536},
   };
   const cudaStream_t stream = static_cast<cudaStream_t>(gq.q.handle);
-  setenv("VT_GDN_DECODE_NW", "8", 1);
+  vllm_test::SetEnv("VT_GDN_DECODE_NW", "8");
   void* shared_production_function = nullptr;
   for (const auto& expected : cases) {
     CAPTURE(expected.bv_env == nullptr ? "<unset>" : expected.bv_env);
     CAPTURE(expected.swizzle_env);
     CAPTURE(expected.regstate_env);
     if (expected.bv_env == nullptr)
-      unsetenv("VT_GDN_DECODE_BV");
+      vllm_test::UnsetEnv("VT_GDN_DECODE_BV");
     else
-      setenv("VT_GDN_DECODE_BV", expected.bv_env, 1);
-    setenv("VT_GDN_DECODE_SWIZZLE", expected.swizzle_env, 1);
-    setenv("VT_GDN_DECODE_REGSTATE", expected.regstate_env, 1);
+      vllm_test::SetEnv("VT_GDN_DECODE_BV", expected.bv_env);
+    vllm_test::SetEnv("VT_GDN_DECODE_SWIZZLE", expected.swizzle_env);
+    vllm_test::SetEnv("VT_GDN_DECODE_REGSTATE", expected.regstate_env);
     CudaGraphGuard captured;
     REQUIRE(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) ==
             cudaSuccess);
@@ -3711,10 +3712,10 @@ TEST_CASE("CUDA public GdnDecode binds decode layout to exact production geometr
     CHECK(params.blockDim.z == 1);
     CHECK(params.sharedMemBytes == expected.shared_bytes);
   }
-  unsetenv("VT_GDN_DECODE_REGSTATE");
-  unsetenv("VT_GDN_DECODE_SWIZZLE");
-  unsetenv("VT_GDN_DECODE_BV");
-  unsetenv("VT_GDN_DECODE_NW");
+  vllm_test::UnsetEnv("VT_GDN_DECODE_REGSTATE");
+  vllm_test::UnsetEnv("VT_GDN_DECODE_SWIZZLE");
+  vllm_test::UnsetEnv("VT_GDN_DECODE_BV");
+  vllm_test::UnsetEnv("VT_GDN_DECODE_NW");
 #endif
 }
 
@@ -3906,11 +3907,11 @@ TEST_CASE("CUDA gdn Triton AOT concurrent first load is safe across two queues")
 
   // T9/R10: scoped; the matching end-of-case restore is gone with it.
   ScopedEnv gdn_chunked_on("VT_GDN_CHUNKED", "1");
-  setenv("VT_GDN_DELTAH_TRITON", "1", 1);
-  setenv("VT_GDN_CHUNKO_TRITON", "1", 1);
-  setenv("VT_GDN_WU_TRITON", "1", 1);
-  setenv("VT_GDN_TRITON_CHUNK_POOL", "1", 1);
-  setenv("VT_GDN_TRITON_WU_POOL", "1", 1);
+  vllm_test::SetEnv("VT_GDN_DELTAH_TRITON", "1");
+  vllm_test::SetEnv("VT_GDN_CHUNKO_TRITON", "1");
+  vllm_test::SetEnv("VT_GDN_WU_TRITON", "1");
+  vllm_test::SetEnv("VT_GDN_TRITON_CHUNK_POOL", "1");
+  vllm_test::SetEnv("VT_GDN_TRITON_WU_POOL", "1");
   const Combo bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
   vt::cuda::testing::ResetGdnTritonDebugStats();
   const auto h48 = RunGdnChunkedVsSequentialOnQueue(
@@ -3923,11 +3924,11 @@ TEST_CASE("CUDA gdn Triton AOT concurrent first load is safe across two queues")
   CHECK(stats.chunk_o_bf16_launches == 2);
   CHECK(stats.chunk_o_hand_launches == 0);
   vt::cuda::testing::DisableGdnTritonDebugStats();
-  unsetenv("VT_GDN_DELTAH_TRITON");
-  unsetenv("VT_GDN_CHUNKO_TRITON");
-  unsetenv("VT_GDN_WU_TRITON");
-  unsetenv("VT_GDN_TRITON_CHUNK_POOL");
-  unsetenv("VT_GDN_TRITON_WU_POOL");
+  vllm_test::UnsetEnv("VT_GDN_DELTAH_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_CHUNKO_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_WU_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_TRITON_CHUNK_POOL");
+  vllm_test::UnsetEnv("VT_GDN_TRITON_WU_POOL");
 }
 #endif
 
@@ -3944,18 +3945,18 @@ TEST_CASE("CUDA gdn prefill chunked (Triton delta_h) matches sequential at gate 
     return;
   }
   const Combo bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
-  setenv("VT_GDN_DELTAH_TRITON", "1", 1);  // opt into the Triton path (inert if not built)
-  setenv("VT_GDN_CHUNKO_TRITON", "0", 1);
-  setenv("VT_GDN_WU_TRITON", "0", 1);
+  vllm_test::SetEnv("VT_GDN_DELTAH_TRITON", "1");  // opt into the Triton path (inert if not built)
+  vllm_test::SetEnv("VT_GDN_CHUNKO_TRITON", "0");
+  vllm_test::SetEnv("VT_GDN_WU_TRITON", "0");
   // Two chunks + partial tail (150 tok) exercises the cross-chunk state recurrence,
   // which is the delta_h kernel. 27B shape (Hk16/Hv48) then 35B shape (Hk16/Hv32).
   RunGdnChunkedVsSequential({0, 150}, 16, 48, 128, 128, bf16, 7100, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16, 7110, 3e-2f, 3e-2f);
   // Multi-sequence varlen at the 27B shape (differing chunk counts + chunk offsets).
   RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16, 7120, 3e-2f, 3e-2f);
-  unsetenv("VT_GDN_DELTAH_TRITON");
-  unsetenv("VT_GDN_CHUNKO_TRITON");
-  unsetenv("VT_GDN_WU_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_DELTAH_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_CHUNKO_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_WU_TRITON");
   (void)bf16;
 }
 
@@ -3978,17 +3979,17 @@ TEST_CASE("CUDA gdn prefill chunked (Triton chunk_o only) matches sequential at 
   }
   const Combo bf16_f32 = {DType::kBF16, DType::kF32, 3e-2f, 3e-2f};   // default GDN out dtype
   const Combo bf16_bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
-  setenv("VT_GDN_DELTAH_TRITON", "0", 1);
-  setenv("VT_GDN_CHUNKO_TRITON", "1", 1);
-  setenv("VT_GDN_WU_TRITON", "0", 1);
+  vllm_test::SetEnv("VT_GDN_DELTAH_TRITON", "0");
+  vllm_test::SetEnv("VT_GDN_CHUNKO_TRITON", "1");
+  vllm_test::SetEnv("VT_GDN_WU_TRITON", "0");
   RunGdnChunkedVsSequential({0, 150}, 16, 48, 128, 128, bf16_f32, 7200, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_f32, 7210, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16_f32, 7215, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150}, 16, 48, 128, 128, bf16_bf16, 7216, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_bf16, 7217, 3e-2f, 3e-2f);
-  unsetenv("VT_GDN_DELTAH_TRITON");
-  unsetenv("VT_GDN_CHUNKO_TRITON");
-  unsetenv("VT_GDN_WU_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_DELTAH_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_CHUNKO_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_WU_TRITON");
 }
 
 TEST_CASE("CUDA gdn prefill chunked (Triton WU only) matches sequential at gate shape") {
@@ -3997,9 +3998,9 @@ TEST_CASE("CUDA gdn prefill chunked (Triton WU only) matches sequential at gate 
     return;
   }
   const Combo bf16_bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
-  setenv("VT_GDN_DELTAH_TRITON", "0", 1);
-  setenv("VT_GDN_CHUNKO_TRITON", "0", 1);
-  setenv("VT_GDN_WU_TRITON", "1", 1);
+  vllm_test::SetEnv("VT_GDN_DELTAH_TRITON", "0");
+  vllm_test::SetEnv("VT_GDN_CHUNKO_TRITON", "0");
+  vllm_test::SetEnv("VT_GDN_WU_TRITON", "1");
   RunGdnChunkedVsSequential({0, 150}, 16, 48, 128, 128, bf16_bf16, 7220, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_bf16, 7230, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16_bf16, 7235, 3e-2f, 3e-2f);
@@ -4015,9 +4016,9 @@ TEST_CASE("CUDA gdn prefill chunked (Triton WU only) matches sequential at gate 
   RunGdnChunkedVsSequential({0, 10, 22, 31, 40, 52, 61}, 16, 32, 128, 128, bf16_bf16, 7239,
                             3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 10}, 16, 32, 128, 128, bf16_bf16, 7241, 3e-2f, 3e-2f);
-  unsetenv("VT_GDN_DELTAH_TRITON");
-  unsetenv("VT_GDN_CHUNKO_TRITON");
-  unsetenv("VT_GDN_WU_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_DELTAH_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_CHUNKO_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_WU_TRITON");
 }
 
 TEST_CASE("CUDA gdn prefill chunked (Triton WU + delta_h + chunk_o) matches sequential") {
@@ -4027,16 +4028,16 @@ TEST_CASE("CUDA gdn prefill chunked (Triton WU + delta_h + chunk_o) matches sequ
   }
   const Combo bf16_f32 = {DType::kBF16, DType::kF32, 3e-2f, 3e-2f};
   const Combo bf16_bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
-  setenv("VT_GDN_WU_TRITON", "1", 1);
-  setenv("VT_GDN_CHUNKO_TRITON", "1", 1);
-  setenv("VT_GDN_DELTAH_TRITON", "1", 1);
+  vllm_test::SetEnv("VT_GDN_WU_TRITON", "1");
+  vllm_test::SetEnv("VT_GDN_CHUNKO_TRITON", "1");
+  vllm_test::SetEnv("VT_GDN_DELTAH_TRITON", "1");
   RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16_f32, 7240, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_f32, 7250, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16_bf16, 7251, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_bf16, 7252, 3e-2f, 3e-2f);
-  unsetenv("VT_GDN_DELTAH_TRITON");
-  unsetenv("VT_GDN_WU_TRITON");
-  unsetenv("VT_GDN_CHUNKO_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_DELTAH_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_WU_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_CHUNKO_TRITON");
 }
 
 #ifdef VLLM_CPP_TRITON_CHUNKO_BF16
@@ -4054,11 +4055,11 @@ TEST_CASE("CUDA gdn Triton bf16 chunk_o dispatch and same-stream pools reuse dir
   // T9/R10: scoped, so the value does not leak into a later case and become
   // the CPU algorithm selector (KERNEL-GDN-CHUNKED-MIRROR D3).
   ScopedEnv gdn_chunked_on("VT_GDN_CHUNKED", "1");
-  setenv("VT_GDN_DELTAH_TRITON", "1", 1);
-  setenv("VT_GDN_CHUNKO_TRITON", "1", 1);
-  setenv("VT_GDN_WU_TRITON", "1", 1);
-  setenv("VT_GDN_TRITON_CHUNK_POOL", "1", 1);
-  setenv("VT_GDN_TRITON_WU_POOL", "1", 1);
+  vllm_test::SetEnv("VT_GDN_DELTAH_TRITON", "1");
+  vllm_test::SetEnv("VT_GDN_CHUNKO_TRITON", "1");
+  vllm_test::SetEnv("VT_GDN_WU_TRITON", "1");
+  vllm_test::SetEnv("VT_GDN_TRITON_CHUNK_POOL", "1");
+  vllm_test::SetEnv("VT_GDN_TRITON_WU_POOL", "1");
 
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard gq(gpu);
@@ -4122,8 +4123,8 @@ TEST_CASE("CUDA gdn Triton bf16 chunk_o dispatch and same-stream pools reuse dir
 
   // Same binary, pools disabled: numerical parity and Triton dispatch remain,
   // while the persistent-pool counters stay unchanged.
-  setenv("VT_GDN_TRITON_CHUNK_POOL", "0", 1);
-  setenv("VT_GDN_TRITON_WU_POOL", "0", 1);
+  vllm_test::SetEnv("VT_GDN_TRITON_CHUNK_POOL", "0");
+  vllm_test::SetEnv("VT_GDN_TRITON_WU_POOL", "0");
   const auto disabled_diff = RunGdnChunkedVsSequentialOnQueue(
       gpu, gq.q, {0, 150}, 16, 48, 128, 128, bf16, 7340, 3e-2f, 3e-2f);
   CheckUpstreamCutedslTolerances(disabled_diff);
@@ -4138,11 +4139,11 @@ TEST_CASE("CUDA gdn Triton bf16 chunk_o dispatch and same-stream pools reuse dir
   CHECK(disabled.wu_pool_reuses == smaller.wu_pool_reuses);
 
   vt::cuda::testing::DisableGdnTritonDebugStats();
-  unsetenv("VT_GDN_DELTAH_TRITON");
-  unsetenv("VT_GDN_CHUNKO_TRITON");
-  unsetenv("VT_GDN_WU_TRITON");
-  unsetenv("VT_GDN_TRITON_CHUNK_POOL");
-  unsetenv("VT_GDN_TRITON_WU_POOL");
+  vllm_test::UnsetEnv("VT_GDN_DELTAH_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_CHUNKO_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_WU_TRITON");
+  vllm_test::UnsetEnv("VT_GDN_TRITON_CHUNK_POOL");
+  vllm_test::UnsetEnv("VT_GDN_TRITON_WU_POOL");
 }
 #endif
 
@@ -4837,7 +4838,7 @@ TEST_CASE("CUDA gdn spec decode matches the CPU reference across the NW lever") 
 
   for (const char* nw : {"1", "2", "4", "8"}) {
     CAPTURE(nw);
-    setenv("VT_GDN_DECODE_NW", nw, 1);
+    vllm_test::SetEnv("VT_GDN_DECODE_NW", nw);
     std::vector<float> cache(static_cast<size_t>(t * d.hv * d.dv * d.dk), 0.0f);
     std::copy(h0.begin(), h0.end(),
               cache.begin() + static_cast<std::ptrdiff_t>(1 * d.hv * d.dv * d.dk));
@@ -4846,7 +4847,7 @@ TEST_CASE("CUDA gdn spec decode matches the CPU reference across the NW lever") 
     CheckClose(out, cpu_out, 1e-5f, 1e-5f);
     CheckClose(cache, cpu_cache, 1e-5f, 1e-5f);
   }
-  unsetenv("VT_GDN_DECODE_NW");
+  vllm_test::UnsetEnv("VT_GDN_DECODE_NW");
 }
 
 // The CUDA conv spec update against the CPU reference and against a chain of the

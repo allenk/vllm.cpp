@@ -27,6 +27,7 @@
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "support/test_env.h"  // SetEnv/UnsetEnv — MSVC has no setenv (#603)
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vt/backend.h"
 #include "vt/ops.h"
@@ -52,13 +53,13 @@ class ScopedEnv {
       had_old_ = true;
       old_ = old;
     }
-    setenv(name, value, 1);
+    vllm_test::SetEnv(name, value);
   }
   ~ScopedEnv() {
     if (had_old_) {
-      setenv(name_.c_str(), old_.c_str(), 1);
+      vllm_test::SetEnv(name_.c_str(), old_.c_str());
     } else {
-      unsetenv(name_.c_str());
+      vllm_test::UnsetEnv(name_.c_str());
     }
   }
   ScopedEnv(const ScopedEnv&) = delete;
