@@ -156,8 +156,10 @@ void* EnsureScratch(void** buf, size_t* have, size_t need, cudaStream_t s, const
 // alternative under `## Owed`, because changing the op's output contract would
 // change two landed rows' allocations.
 //
-// UNCONDITIONAL. There is no `k_tiles == 1` fast path, where the two layouts
-// coincide and a skipped transpose would be invisible.
+// Run for every m > 1, including `k_tiles == 1`, where the two layouts also
+// coincide: a test at that shape then still exercises this kernel. The one
+// skip is m == 1 (see the op below), the shape of every GEMM in a
+// single-sequence decode step, where it would be pure launch overhead.
 __global__ void TransposeActScaleKernel(float* dst, const float* src, int m, int k_tiles) {
   const int64_t total = static_cast<int64_t>(m) * k_tiles;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -496,16 +498,26 @@ void MatmulFp8BlockScaledKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8,
   // `layout_SF*` expects. `cdiv`, because the op's contract allows a ragged
   // final K-block even though the activation quant upstream demands divisibility
   // (`utils/fp8_utils.py`: `cdiv` on the weight, an assert on the activation).
+  //
+  // ONE row is the exception. At m == 1 the two layouts are the same bytes
+  // (Fp8BlockScaledActScaleIndex(0, k_tile, 1) == k_tile, the row-major
+  // offset), so the quant's own buffer goes to cutlass as it is and the
+  // transpose launch -- one per FP8 GEMM of a single-sequence decode step --
+  // is not issued. The pointer must keep the 16-byte alignment the scratch
+  // buffer has; any m > 1 still transposes, so G7's M sweep keeps running the
+  // kernel.
   const int k_tiles = (k + block_k - 1) / block_k;
-  const size_t scale_bytes = static_cast<size_t>(m) * k_tiles * sizeof(float);
-  float* a_scale_t = static_cast<float*>(EnsureScratch(&sc.act_scale_t, &sc.act_scale_t_bytes,
-                                                       scale_bytes, s,
-                                                       "cudaMallocAsync act scale transpose"));
-  {
+  const float* a_scale_cm = static_cast<const float*>(a_scale.data);
+  if (m > 1 || reinterpret_cast<uintptr_t>(a_scale.data) % 16 != 0) {
+    const size_t scale_bytes = static_cast<size_t>(m) * k_tiles * sizeof(float);
+    float* a_scale_t = static_cast<float*>(
+        EnsureScratch(&sc.act_scale_t, &sc.act_scale_t_bytes, scale_bytes, s,
+                      "cudaMallocAsync act scale transpose"));
     const int64_t total = static_cast<int64_t>(m) * k_tiles;
     const int blocks = static_cast<int>((total + 255) / 256);
     TransposeActScaleKernel<<<blocks, 256, 0, s>>>(
         a_scale_t, static_cast<const float*>(a_scale.data), m, k_tiles);
+    a_scale_cm = a_scale_t;
   }
 
   const bool out_f32 = (out.dtype == DType::kF32);
@@ -521,16 +533,16 @@ void MatmulFp8BlockScaledKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8,
   switch (config) {
     case Fp8BlockScaledConfig::kSwapAb:
       RunBlockwiseGemm<typename Sm120BlockwiseConfigSwapAb<OutType>::Gemm>(
-          d_out, a_fp8.data, b_fp8.data, a_scale_t, b_scale_ptr, m, n, k, s);
+          d_out, a_fp8.data, b_fp8.data, a_scale_cm, b_scale_ptr, m, n, k, s);
       break;
     case Fp8BlockScaledConfig::kPingpong:
       RunBlockwiseGemm<typename Sm120BlockwiseConfigPingpong<OutType>::Gemm>(
-          d_out, a_fp8.data, b_fp8.data, a_scale_t, b_scale_ptr, m, n, k, s);
+          d_out, a_fp8.data, b_fp8.data, a_scale_cm, b_scale_ptr, m, n, k, s);
       break;
     case Fp8BlockScaledConfig::kDefault:
     case Fp8BlockScaledConfig::kCount:
       RunBlockwiseGemm<typename Sm120BlockwiseConfigDefault<OutType>::Gemm>(
-          d_out, a_fp8.data, b_fp8.data, a_scale_t, b_scale_ptr, m, n, k, s);
+          d_out, a_fp8.data, b_fp8.data, a_scale_cm, b_scale_ptr, m, n, k, s);
       break;
   }
   // AFTER cutlass reported success, so a call that threw does not overstate
