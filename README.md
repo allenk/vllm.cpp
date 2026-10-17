@@ -94,6 +94,13 @@ The dense 27B model runs at the power cap, where single runs vary by about 4%. A
 book translation (3,375 requests at concurrency 8) with Qwen3.8-27B FP8 on the Windows build
 finished with no failed request.
 
+**Block-FP8 activation quant, on every platform.** The quant in front of each 128x128 block-FP8
+GEMM gave a whole 128-wide group to one thread; it now splits the group across 16 lanes, as
+upstream's kernel does, and its output is bit-identical. A Qwen3.8-27B FP8 decode step runs 304
+of these quants. Captured in one CUDA graph on the same GPU they took 4.57 ms before and 0.33 ms
+after at one token (K=5120), and 16.11 ms and 0.35 ms at eight. The 27B FP8 decode numbers
+above were measured before this change.
+
 **An `sm_120a` AOT tree.** Upstream vendors six Triton AOT trees; this fork adds a seventh
 for consumer Blackwell, and flips `AOT_AVAILABILITY["120a"]` from `False` to `True` to match
 what is actually on disk.

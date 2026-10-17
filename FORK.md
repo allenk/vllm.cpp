@@ -107,6 +107,12 @@ tests/scripts/test_release_windows_metadata.py     version fixture
 the real version moves onto a mutant's value, move the mutant
 (`project_version` mutant 0.0.4 -> 0.0.5 at the 0.0.4 bump).
 
+`tests/scripts/test_server_package.py` builds the real CPU archive and reads the
+expected version from the declaration, so it needs no edit. It used to pin the
+literal and was the file the 0.0.4 bump missed: `build-test-cpu` went red on the
+push. Before pushing a bump, run every `tests/scripts/test_*.py`, not only the
+ones in the list above.
+
 **Always dry-run before tagging.** All artifacts are `required: true`, so one red
 lane means no release at all — and a tag, once pushed, is public and cannot be
 taken back. The first dry run on this pipeline had eight of eleven lanes red.
