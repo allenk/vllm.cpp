@@ -2060,6 +2060,8 @@ if(VLLM_CPP_CUDA)
     set(_NVFP4_CACHE_ABI_SOURCES
       ${_NVFP4_CUTLASS_SOURCES}
       src/vt/cuda/nvfp4_cutlass_tactics.h
+      src/vt/cuda/cutlass_params_launch.cuh
+      src/vt/cuda/tma_kernel_param.cuh
       src/vt/cuda/nvfp4_plan_cache.h
       src/vt/cuda/nvfp4_tactic_ids.h)
     set(_NVFP4_CACHE_BUILD_INPUT
@@ -2625,6 +2627,19 @@ if(VLLM_CPP_CUDA)
     vt_cuda_set_source_gencode("${VT_CUTLASS_FP8_ARCHS}"
       ${_FP8_CUTLASS_SOURCES})
     list(APPEND _VT_CUDA_FEATURE_SOURCES ${_FP8_CUTLASS_SOURCES})
+  endif()
+  # CUTLASS's own CMakeLists adds /Zc:__cplusplus for MSVC; consuming it as
+  # headers only skips that. Without it cl.exe reports __cplusplus as 199711L,
+  # cuda.h drops alignas(128) from CUtensorMap, and every TMA descriptor in a
+  # CUTLASS Params lands at a misaligned offset: the build succeeds and the
+  # kernel faults on its first descriptor prefetch. These TUs launch through
+  # cutlass_params_launch.cuh, which is what lets them take the flag at all:
+  # CUTLASS's own by-value entry point then fails with C2719, and the header's
+  # static_assert fails any TU that includes it without the flag.
+  set(_VT_CUTLASS_TMA_SOURCES ${_NVFP4_CUTLASS_SOURCES} ${_FP8_CUTLASS_SOURCES})
+  if(MSVC AND _VT_CUTLASS_TMA_SOURCES)
+    set_property(SOURCE ${_VT_CUTLASS_TMA_SOURCES}
+      APPEND PROPERTY COMPILE_OPTIONS -Xcompiler=/Zc:__cplusplus)
   endif()
   if(VLLM_CPP_CUTLASS_NVFP4_SM100)
     vt_cuda_set_source_gencode("${VT_CUTLASS_NVFP4_SM100_ARCHS}"

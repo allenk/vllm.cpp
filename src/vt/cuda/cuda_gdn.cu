@@ -47,6 +47,7 @@
 // cpu_ops.cpp, mamba2-ssd.md §8.1).
 #include "vt/cuda/cuda_mamba2_ssd.cuh"
 #include "vt/cuda/gdn_decode_fused.h"
+#include "vt/cuda/tma_kernel_param.cuh"
 #include "vt/cuda/gdn_packed_decode_triton.h"
 #include "vt/cuda/gdn_prefill_conv.h"
 #include "vt/cuda/gdn_packed_reg_tile.h"
@@ -4211,8 +4212,12 @@ __global__ void GdnChunkDeltaHTmaKernel(float* state, TD* hstate, TD* v_new, con
                                         const TD* u, const TD* w, const float* gcum,
                                         const int32_t* qsl, const int32_t* boh, int64_t hk_n,
                                         int64_t dk, int64_t hv_n, int64_t dv,
-                                        const __grid_constant__ CUtensorMap descW,
-                                        const __grid_constant__ CUtensorMap descK) {
+                                        // TmaDescriptorParam, not CUtensorMap: a by-value
+                                        // CUtensorMap is 8-aligned in parameter space on
+                                        // MSVC (descriptors at 0x68 / 0xe8, misaligned-
+                                        // address fault); see tma_kernel_param.cuh.
+                                        const __grid_constant__ TmaDescriptorParam descW,
+                                        const __grid_constant__ TmaDescriptorParam descK) {
 // bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
 // wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
 // Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
@@ -6110,7 +6115,7 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
                   "gdn chunked delta_h(tma) shared opt-in");
             GdnChunkDeltaHTmaKernel<TSc, BV, STAGES><<<grid_reg, reg_block, ring_bytes, s>>>(
                 state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(),
-                d_boh, hk_n, dk, hv_n, dv, descW, descK);
+                d_boh, hk_n, dk, hv_n, dv, AsTmaParam(descW), AsTmaParam(descK));
             Check(cudaGetLastError(), "gdn chunked delta_h(tma) launch");
             launched = true;
           }

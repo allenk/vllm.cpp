@@ -12,6 +12,7 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
+#include "vt/cuda/cutlass_params_launch.cuh"
 #include "vt/cuda/nvfp4_cutlass_tactics.h"
 
 namespace vt::cuda::nvfp4 {
@@ -130,15 +131,17 @@ void Run(const LaunchParams& params) {
     throw std::runtime_error(std::string("W1 NVFP4 tactic cannot implement shape: ") +
                              cutlassGetStatusString(status));
   }
-  status = gemm.initialize(args, params.workspace, params.stream);
+  // `cutlass_launch::Run`, not `gemm.initialize` + `gemm.run`: see
+  // `cutlass_params_launch.cuh`.
+  const cudaError_t launched = cutlass_launch::Run<typename Gemm::GemmKernel>(
+      args, params.workspace, params.stream, &status);
   if (status != cutlass::Status::kSuccess) {
     throw std::runtime_error(std::string("W1 NVFP4 tactic initialization failed: ") +
                              cutlassGetStatusString(status));
   }
-  status = gemm.run(args, params.workspace, params.stream);
-  if (status != cutlass::Status::kSuccess) {
+  if (launched != cudaSuccess) {
     throw std::runtime_error(std::string("W1 NVFP4 tactic launch failed: ") +
-                             cutlassGetStatusString(status));
+                             cudaGetErrorString(launched));
   }
 }
 

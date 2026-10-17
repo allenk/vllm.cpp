@@ -24,6 +24,7 @@
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
+#include "vt/cuda/cutlass_params_launch.cuh"
 #include "vt/cuda/nvfp4_cutlass_tactics.h"
 
 namespace vt::cuda::nvfp4 {
@@ -141,20 +142,24 @@ void RunImpl(void* d, const void* a, const void* b, const void* a_sf, const void
     throw std::runtime_error(std::string("NVFP4 tactic cannot implement shape: ") +
                              cutlassGetStatusString(can_implement));
   }
-  const cutlass::Status initialized = gemm.initialize(args, workspace, stream);
-  if (initialized != cutlass::Status::kSuccess) {
-    throw std::runtime_error(std::string("NVFP4 tactic initialization failed: ") +
-                             cutlassGetStatusString(initialized));
-  }
   // The eager C++ adapter produces activation FP4, swizzled scales and a device
   // alpha immediately before this call. Unlike FlashInfer's runner boundary,
   // those producers do not participate in a complete PDL dependency chain.
   // Ordinary stream serialization is asynchronous to the host and is required
-  // for correctness (the exact real-shape raw A/B gate catches stale reads).
-  const cutlass::Status ran = gemm.run(args, workspace, stream, nullptr, false);
-  if (ran != cutlass::Status::kSuccess) {
+  // for correctness (the exact real-shape raw A/B gate catches stale reads), so
+  // the launch is without PDL. It goes through `cutlass_launch::Run`, not
+  // `gemm.initialize` + `gemm.run`, whose by-value `Params` entry point MSVC
+  // cannot compile with aligned TMA descriptors (`cutlass_params_launch.cuh`).
+  cutlass::Status initialized = cutlass::Status::kSuccess;
+  const cudaError_t launched =
+      cutlass_launch::Run<typename Gemm::GemmKernel>(args, workspace, stream, &initialized);
+  if (initialized != cutlass::Status::kSuccess) {
+    throw std::runtime_error(std::string("NVFP4 tactic initialization failed: ") +
+                             cutlassGetStatusString(initialized));
+  }
+  if (launched != cudaSuccess) {
     throw std::runtime_error(std::string("NVFP4 tactic launch failed: ") +
-                             cutlassGetStatusString(ran));
+                             cudaGetErrorString(launched));
   }
 }
 

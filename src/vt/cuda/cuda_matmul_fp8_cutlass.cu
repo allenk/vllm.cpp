@@ -45,6 +45,7 @@
 
 #include "cutlass/util/packed_stride.hpp"
 
+#include "vt/cuda/cutlass_params_launch.cuh"
 #include "vt/cuda/fp8_per_tensor_dispatch.h"
 #include "vt/cuda/graph_safe_scratch.h"
 #include "vt/ops.h"
@@ -287,8 +288,13 @@ void RunGemm(void* D, const void* A, const void* B, const float* alpha, int M, i
     }
   }
   VT_CUTLASS_CHECK(gemm.can_implement(arguments));
-  VT_CUTLASS_CHECK(gemm.initialize(arguments, workspace, stream));
-  VT_CUTLASS_CHECK(gemm.run(arguments, workspace, stream));
+  // Not `gemm.initialize` + `gemm.run`: their entry point takes `Params` by
+  // value, which MSVC cannot compile with aligned TMA descriptors. See
+  // `cutlass_params_launch.cuh`.
+  cutlass::Status status = cutlass::Status::kSuccess;
+  Check(cutlass_launch::Run<typename Gemm::GemmKernel>(arguments, workspace, stream, &status),
+        "cutlass launch");
+  VT_CUTLASS_CHECK(status);
   if (workspace && !pool) Check(cudaFreeAsync(workspace, stream), "cudaFreeAsync workspace");
 }
 

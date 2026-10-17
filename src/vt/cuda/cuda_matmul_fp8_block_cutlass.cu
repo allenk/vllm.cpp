@@ -82,6 +82,7 @@
 #include "cutlass/layout/matrix.h"
 #include "cutlass/util/packed_stride.hpp"
 
+#include "vt/cuda/cutlass_params_launch.cuh"
 #include "vt/cuda/fp8_block_scaled_dispatch.h"
 #include "vt/cuda/graph_safe_scratch.h"
 #include "vt/ops.h"
@@ -447,18 +448,24 @@ void RunBlockwiseGemm(void* d_ptr, const void* a_ptr, const void* b_ptr, const f
                                       hw_info,
                                       scheduler};
 
-  using GemmOp = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-  GemmOp gemm_op;
-  VT_CUTLASS_CHECK(gemm_op.can_implement(args));
+  // Launched through `cutlass_launch::Run`, not `GemmUniversalAdapter::run`:
+  // the adapter's entry point takes `Params` by value, which cannot be compiled
+  // with the alignment the TMA descriptors need on MSVC. See
+  // `cutlass_params_launch.cuh` for the whole chain.
+  // The kernel answers bool; the adapter maps false to kInvalid, and so do we.
+  VT_CUTLASS_CHECK(GemmKernel::can_implement(args) ? cutlass::Status::kSuccess
+                                                   : cutlass::Status::kInvalid);
 
-  const size_t workspace_size = gemm_op.get_workspace_size(args);
+  const size_t workspace_size = GemmKernel::get_workspace_size(args);
   void* workspace = nullptr;
   if (workspace_size > 0) {
     StreamScratch& sc = ScratchFor(stream);
     workspace = EnsureScratch(&sc.workspace, &sc.workspace_bytes, workspace_size, stream,
                               "cudaMallocAsync workspace");
   }
-  VT_CUTLASS_CHECK(gemm_op.run(args, workspace, stream));
+  cutlass::Status status = cutlass::Status::kSuccess;
+  Check(cutlass_launch::Run<GemmKernel>(args, workspace, stream, &status), "cutlass launch");
+  VT_CUTLASS_CHECK(status);
 }
 
 // ---- The op ---------------------------------------------------------------
