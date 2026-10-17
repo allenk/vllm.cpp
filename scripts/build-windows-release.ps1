@@ -906,6 +906,20 @@ if (-not (Test-Path (Join-Path $SmokeModel "config.json"))) {
     throw "Windows runtime smoke model is incomplete: $SmokeModel"
 }
 
+# The VS generator's CUDA integration compiles one .cu file at a time (the
+# v0.0.3-vk.1 lane logged its 42 "Compiling CUDA source file" lines one after
+# another over 31 minutes), and nvcc compiles a file's architectures one after
+# another unless told otherwise, so the CUTLASS and FlashAttention-2 sources
+# this lane now builds are the long pole. MEASURED on the heaviest FA2 source
+# (flash_fwd_split_hdim128_bf16_sm80.cu, two architectures): 307 s and
+# 3.7 GiB peak serially, 174 s and 7.4 GiB with --threads=2. Two leaves room
+# on a 16 GB runner; CUDAFLAGS seeds CMAKE_CUDA_FLAGS on the first configure
+# and keeps CMake's own MSVC defaults after it, which a -DCMAKE_CUDA_FLAGS
+# override would drop.
+if ($Backend -eq "cuda") {
+    $env:CUDAFLAGS = "--threads=2"
+}
+
 $queryDir = Join-Path $BuildDir ".cmake/api/v1/query"
 New-Item -ItemType Directory -Force -Path $queryDir | Out-Null
 New-Item -ItemType File -Force -Path (Join-Path $queryDir "codemodel-v2") | Out-Null
