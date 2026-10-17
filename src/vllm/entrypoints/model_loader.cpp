@@ -1271,7 +1271,7 @@ constexpr GgufArchArm kGgufArchArms[] = {
     {"qwen35", &vllm::HfConfigFromGguf},
     {"qwen35moe", &vllm::HfConfigFromGguf},
     {"qwen3next", &vllm::HfConfigFromGguf},
-    // WITHHELD for v0.0.3-vk.1, and withheld rather than deleted: the arm,
+    // WITHHELD since v0.0.3-vk.1, and withheld rather than deleted: the arm,
     // its four fixes and its tests all stay, and `Qwen3GgufRefusal()` in the
     // OWED block below says so by name. Restoring this ONE line re-enables it.
     // Rationale and evidence: `Qwen3GgufRefusal()`.

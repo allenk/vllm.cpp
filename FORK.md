@@ -3,7 +3,8 @@
 This file exists only in this fork. `upstream/main` has no `FORK.md`, so nothing
 here can ever conflict on a merge from upstream — which is the same reason the
 fork's identity lives in `release/release-version.json` rather than in a file
-upstream also edits.
+upstream also edits. (One exception since `0.0.4-vk.1`: the project version line
+in `CMakeLists.txt`, section 2.)
 
 It is the standing rule for `allenk/vllm.cpp`. Follow it rather than re-deriving
 it.
@@ -69,15 +70,42 @@ numeric core equals `project_version` (which must equal `CMakeLists.txt`). The
 fork identity therefore rides in the version's **pre-release field**:
 
 ```
-project_version   0.0.3          tracks CMakeLists.txt, unchanged
-version           0.0.3-vk.1     ours
-tag               v0.0.3-vk.1    == "v" + version, so the validator is untouched
-assets            vllm.cpp-0.0.3-vk.1-<platform>.<ext>
-images            ghcr.io/allenk/vllm.cpp-vk:0.0.3-vk.1-<lane>
+project_version   0.0.4          CMakeLists.txt; upstream is still at 0.0.3
+version           0.0.4-vk.1     ours
+tag               v0.0.4-vk.1    == "v" + version, so the validator is untouched
+assets            vllm.cpp-0.0.4-vk.1-<platform>.<ext>
+images            ghcr.io/allenk/vllm.cpp-vk:0.0.4-vk.1-<lane>
 ```
 
 One field makes the tag, every asset filename and every image tag impossible for
-upstream to emit, with no change to any file upstream also maintains.
+upstream to emit. The numeric core is ours to choose only by editing a line
+upstream also owns: `0.0.4-vk.1` needs `project(vllm_cpp VERSION 0.0.4)`, so
+this fork is one patch ahead of upstream's `0.0.3`. That line is the price of
+numbering a fork release past upstream's, and the first upstream merge that moves
+it conflicts there once.
+
+**What a version bump touches.** The declaration, `CMakeLists.txt`, and every
+file that compares against the declaration or the tag. Read each occurrence of
+the old version before changing it; a replace across the tree is wrong, because
+the same string also appears in sentences that record what an earlier release
+measured or withheld, and in checks that quote upstream's roadmap:
+
+```
+release/release-version.json                       the declaration
+CMakeLists.txt                                     project(vllm_cpp VERSION ...)
+scripts/release_postpublish_audit.py               the authorized identity
+.github/workflows/release-postpublish-audit.yml    --tag
+scripts/check-windows-release-state.py             the --tag it requires
+tests/scripts/test_release_pipeline.py             plan, fixtures, the mutants
+tests/scripts/test_release_postpublish_audit.py    fixtures
+tests/scripts/test_check_windows_release_state.py  the --tag argument
+tests/scripts/test_release_archive.py              VERSION fixture
+tests/scripts/test_release_windows_metadata.py     version fixture
+```
+
+`test_release_pipeline.py`'s identity mutants must each stay a MISMATCH: when
+the real version moves onto a mutant's value, move the mutant
+(`project_version` mutant 0.0.4 -> 0.0.5 at the 0.0.4 bump).
 
 **Always dry-run before tagging.** All artifacts are `required: true`, so one red
 lane means no release at all — and a tag, once pushed, is public and cannot be
@@ -157,7 +185,8 @@ scripts/check-triton-aot-multiarch.py   the sm_120a row
 cmake/TritonAOT*Test.cmake       the seven-tree counts
 tests/scripts/test_check_triton_aot_multiarch.py   the sm_120a fixture
 .github/workflows/ci.yml         the upstream-only guard on audit-live-rows
-release/release-version.json + the eight files that spell 0.0.3-vk.1
+release/release-version.json + the files that spell the -vk version (section 2)
+CMakeLists.txt                   project VERSION 0.0.4 (upstream: 0.0.3)
 scripts/env-doc-allowlist.txt    our 42 Vulkan/Triton-CPU tuning knobs
 this file
 ```

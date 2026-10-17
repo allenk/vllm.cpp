@@ -9,7 +9,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 include(InSourceGuard)
 vllm_cpp_forbid_in_source_build("${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
 
-project(vllm_cpp VERSION 0.0.3 LANGUAGES CXX)
+project(vllm_cpp VERSION 0.0.4 LANGUAGES CXX)
 
 set(VLLM_CPP_BUILD_VERSION "${PROJECT_VERSION}" CACHE STRING
   "Exact version identity reported by this build")

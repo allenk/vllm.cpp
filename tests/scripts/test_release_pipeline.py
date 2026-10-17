@@ -117,8 +117,8 @@ class ReleasePipelineContract(unittest.TestCase):
         self.assertFalse(plan["publish"])
         self.assertEqual(plan["release_tag"], f"dry-run-{SHA[:12]}")
         self.assertEqual(plan["source_sha"], SHA)
-        self.assertEqual(plan["version"], "0.0.3-vk.1")
-        self.assertEqual(plan["project_version"], "0.0.3")
+        self.assertEqual(plan["version"], "0.0.4-vk.1")
+        self.assertEqual(plan["project_version"], "0.0.4")
         self.assertTrue(plan["prerelease"])
 
     def test_release_version_declaration_is_the_single_prerelease_identity(self) -> None:
@@ -127,14 +127,14 @@ class ReleasePipelineContract(unittest.TestCase):
             declaration,
             {
                 "prerelease": True,
-                "project_version": "0.0.3",
+                "project_version": "0.0.4",
                 "schema": "vllm.cpp.release-version.v1",
-                "tag": "v0.0.3-vk.1",
-                "version": "0.0.3-vk.1",
+                "tag": "v0.0.4-vk.1",
+                "version": "0.0.4-vk.1",
             },
         )
         cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
-        self.assertIn("project(vllm_cpp VERSION 0.0.3 LANGUAGES CXX)", cmake)
+        self.assertIn("project(vllm_cpp VERSION 0.0.4 LANGUAGES CXX)", cmake)
 
     def test_default_build_version_is_project_version(self) -> None:
         cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
@@ -149,9 +149,9 @@ class ReleasePipelineContract(unittest.TestCase):
     def test_release_version_declaration_rejects_every_identity_mismatch(self) -> None:
         original = json.loads(RELEASE_VERSION.read_text(encoding="utf-8"))
         mutations = {
-            "version": "0.0.3",
-            "project_version": "0.0.4",
-            "tag": "v0.0.3-pre.2",
+            "version": "0.0.4",
+            "project_version": "0.0.5",
+            "tag": "v0.0.4-pre.2",
             "prerelease": False,
             "schema": "vllm.cpp.release-version.v0",
         }
@@ -170,7 +170,7 @@ class ReleasePipelineContract(unittest.TestCase):
                 self.assertEqual(text.count(shell_argument), 1)
                 for replacement in (
                     "",
-                    '-DVLLM_CPP_BUILD_VERSION="0.0.3-vk.1"',
+                    '-DVLLM_CPP_BUILD_VERSION="0.0.4-vk.1"',
                     '-DVLLM_CPP_BUILD_VERSION="$PROJECT_VERSION"',
                 ):
                     self.assertNotEqual(
@@ -185,7 +185,7 @@ class ReleasePipelineContract(unittest.TestCase):
         self.assertEqual(text.count(powershell_argument), 1)
         for replacement in (
             "",
-            '"-DVLLM_CPP_BUILD_VERSION=0.0.3-vk.1"',
+            '"-DVLLM_CPP_BUILD_VERSION=0.0.4-vk.1"',
             '"-DVLLM_CPP_BUILD_VERSION=$env:PROJECT_VERSION"',
         ):
             self.assertNotEqual(
@@ -421,7 +421,7 @@ class ReleasePipelineContract(unittest.TestCase):
             "version not loaded from declaration": mutate(
                 cpu,
                 "          $env:VERSION = (Get-Content release/release-version.json -Raw | ConvertFrom-Json).version\n",
-                "          $env:VERSION = '0.0.3-vk.1'\n",
+                "          $env:VERSION = '0.0.4-vk.1'\n",
             ),
             "source epoch not exported from HEAD": mutate(
                 cpu,
@@ -483,7 +483,7 @@ class ReleasePipelineContract(unittest.TestCase):
             "release command added": mutate(
                 cpu,
                 contract,
-                contract + "      - run: gh release create v0.0.3-vk.1\n",
+                contract + "      - run: gh release create v0.0.4-vk.1\n",
             ),
             "publish command added": mutate(
                 cpu,
@@ -493,7 +493,7 @@ class ReleasePipelineContract(unittest.TestCase):
             "tag command added": mutate(
                 cpu,
                 contract,
-                contract + "      - run: git tag v0.0.3-vk.1\n",
+                contract + "      - run: git tag v0.0.4-vk.1\n",
             ),
             "attestation command added": mutate(
                 cpu,
@@ -683,10 +683,10 @@ class ReleasePipelineContract(unittest.TestCase):
         self.assertEqual(self.checker.validate_pr_ci(commented), [])
 
     def test_tag_publish_requires_exact_version_and_ready_matrix(self) -> None:
-        tag = "refs/tags/v0.0.3-vk.1"
+        tag = "refs/tags/v0.0.4-vk.1"
         self.assertFalse(self.plan("push", tag)["publish"])
         self.assertTrue(self.plan("push", tag, release_ready=True)["publish"])
-        for ref in ("refs/tags/v0.0.3", "refs/tags/v0.0.3-pre.2", "refs/heads/v0.0.3-vk.1"):
+        for ref in ("refs/tags/v0.0.4", "refs/tags/v0.0.4-pre.2", "refs/heads/v0.0.4-vk.1"):
             with self.subTest(ref=ref):
                 with self.assertRaises(ValueError):
                     self.plan("push", ref, release_ready=True)
@@ -814,7 +814,7 @@ class ReleasePipelineContract(unittest.TestCase):
             verified_path = root / "verified-handoff.json"
             assets = root / "assets"
             assets.mkdir()
-            archive = assets / "vllm.cpp-0.0.3-vk.1-linux-x86_64-glibc-cpu.tar.gz"
+            archive = assets / "vllm.cpp-0.0.4-vk.1-linux-x86_64-glibc-cpu.tar.gz"
             archive.write_bytes(b"release bytes")
             digest = self.pipeline.file_sha256(archive)
             (assets / f"{archive.name}.sha256").write_text(
@@ -843,7 +843,7 @@ class ReleasePipelineContract(unittest.TestCase):
     def test_publish_ready_plan_requires_every_required_asset_triplet(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            plan = self.plan("push", "refs/tags/v0.0.3-vk.1", release_ready=True)
+            plan = self.plan("push", "refs/tags/v0.0.4-vk.1", release_ready=True)
             plan_path = root / "plan.json"
             self.pipeline.write_json(plan_path, plan)
             assets = root / "assets"
@@ -967,7 +967,7 @@ class ReleasePipelineContract(unittest.TestCase):
             assets = root / "assets"
             assets.mkdir()
             artifact_id = "windows-x86_64-msvc-cpu"
-            archive = assets / f"vllm.cpp-0.0.3-vk.1-{artifact_id}.zip"
+            archive = assets / f"vllm.cpp-0.0.4-vk.1-{artifact_id}.zip"
             archive.write_bytes(b"release bytes")
             digest = self.pipeline.file_sha256(archive)
             for suffix in (".sha256", ".provenance.json"):
@@ -979,9 +979,9 @@ class ReleasePipelineContract(unittest.TestCase):
                            "sha256": self.pipeline.file_sha256(path),
                            "size": path.stat().st_size}
                           for path in sorted(assets.iterdir())],
-                "prerelease": True, "project_version": "0.0.3",
-                "publish": True, "release_tag": "v0.0.3-vk.1",
-                "source_sha": SHA, "verified": True, "version": "0.0.3-vk.1",
+                "prerelease": True, "project_version": "0.0.4",
+                "publish": True, "release_tag": "v0.0.4-vk.1",
+                "source_sha": SHA, "verified": True, "version": "0.0.4-vk.1",
             }
             handoff_path = root / "handoff.json"
             index_json = root / "index.json"
@@ -990,28 +990,28 @@ class ReleasePipelineContract(unittest.TestCase):
             self.pipeline.write_json(index_json, {
                 "artifacts": [{"archive": archive.name, "id": artifact_id,
                                "sha256": digest}],
-                "prerelease": True, "project_version": "0.0.3",
-                "release_tag": "v0.0.3-vk.1",
+                "prerelease": True, "project_version": "0.0.4",
+                "release_tag": "v0.0.4-vk.1",
                 "schema": "vllm.cpp.release-index.v1", "source_sha": SHA,
-                "version": "0.0.3-vk.1",
+                "version": "0.0.4-vk.1",
             })
-            index_md.write_text(f"v0.0.3-vk.1\n{SHA}\n{archive.name}\n")
+            index_md.write_text(f"v0.0.4-vk.1\n{SHA}\n{archive.name}\n")
             good = subprocess.CompletedProcess(
                 [], 0,
-                stdout='{"isDraft":false,"isPrerelease":true,"tagName":"v0.0.3-vk.1"}\n',
+                stdout='{"isDraft":false,"isPrerelease":true,"tagName":"v0.0.4-vk.1"}\n',
             )
             with mock.patch.object(
                 self.pipeline.subprocess, "run", side_effect=[None, good]
             ) as run:
                 self.pipeline.publish_release(
-                    handoff_path, assets, index_json, index_md, "v0.0.3-vk.1"
+                    handoff_path, assets, index_json, index_md, "v0.0.4-vk.1"
                 )
             self.assertIn("--prerelease", run.call_args_list[0].args[0])
 
             bad_states = (
-                {"isDraft": True, "isPrerelease": True, "tagName": "v0.0.3-vk.1"},
-                {"isDraft": False, "isPrerelease": False, "tagName": "v0.0.3-vk.1"},
-                {"isDraft": False, "isPrerelease": True, "tagName": "v0.0.3-pre.2"},
+                {"isDraft": True, "isPrerelease": True, "tagName": "v0.0.4-vk.1"},
+                {"isDraft": False, "isPrerelease": False, "tagName": "v0.0.4-vk.1"},
+                {"isDraft": False, "isPrerelease": True, "tagName": "v0.0.4-pre.2"},
             )
             for state in bad_states:
                 with self.subTest(state=state), mock.patch.object(
@@ -1019,7 +1019,7 @@ class ReleasePipelineContract(unittest.TestCase):
                     side_effect=[None, subprocess.CompletedProcess([], 0, stdout=json.dumps(state))],
                 ), self.assertRaises(ValueError):
                     self.pipeline.publish_release(
-                        handoff_path, assets, index_json, index_md, "v0.0.3-vk.1"
+                        handoff_path, assets, index_json, index_md, "v0.0.4-vk.1"
                     )
 
     def test_publish_rejects_missing_or_mismatched_explicit_archive_format(self) -> None:

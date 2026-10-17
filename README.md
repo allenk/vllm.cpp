@@ -52,6 +52,48 @@ excluded because CCCL's tcgen05 PTX headers expand to an empty asm operand under
 and `/Zc:preprocessor` does not fix it (measured, not assumed). Upstream's own tree already
 carries the Windows CPU and Vulkan lanes.
 
+**Windows CUDA in `0.0.4-vk.1`.** Three Windows-only defects are fixed in this release. Each was
+found by running a Windows build and the Linux build of the same commit on one GPU (RTX PRO 6000
+Blackwell, sm_120a) and comparing what ran:
+
+- **The archive now contains FlashAttention-2 and the CUTLASS GEMMs.** The `v0.0.3-vk.1` Windows
+  CUDA archive was configured without CUTLASS headers, so it compiled neither, while its configure
+  log still listed both as enabled (`CUDA FA2 compiled-arch manifest: []`). Decode attention ran on
+  the fallback paged-attention kernel, NVFP4 linears took a slow path, and 128x128 block-FP8
+  checkpoints were refused at load. The lane now fetches CUTLASS 4.5.0, as the Linux lanes do, and
+  fails when the FA2 manifest lacks sm_80, sm_86, sm_89 or sm_120a.
+- **TMA descriptors were misaligned under MSVC.** `cl.exe` reports `__cplusplus` as `199711L`
+  unless `/Zc:__cplusplus` is given, and `cuda.h` then leaves `alignas(128)` off `CUtensorMap`, so
+  every CUTLASS kernel that reads a TMA descriptor from its parameters faulted on Windows;
+  Qwen3.8-27B FP8 failed on its first request. Those translation units now take the flag and launch
+  through an entry point that receives the parameters as bytes, because CUTLASS's by-value kernel
+  parameter does not compile under MSVC once the alignment is kept (C2719). In the sm_120a build all
+  44 kernels that read a TMA descriptor have the descriptor offsets of the Linux build. The sm_90 and
+  sm_100 build-verify units take the same path: they compile under MSVC and GCC with identical
+  descriptor offsets, and no sm_90 or sm_100 board has run them.
+- **Checkpoint pages are released after loading.** The safetensors loader returned consumed mmap
+  pages to the OS with `madvise` on Linux and did nothing on Windows; it now calls `VirtualUnlock`.
+  Working set after loading Qwen3.6-35B-A3B NVFP4: 21.75 GiB before, 3.55 GiB after.
+
+Measured with local builds of the same source and configuration as the archive (the archive itself
+is built on GitHub's Windows runner, which has no GPU). CUDA 13.2, 350 W power cap, decode tok/s,
+887-token prompt, greedy:
+
+```
+                                       Windows (MSVC)   Linux (GCC, WSL2)
+Qwen3.6-35B-A3B NVFP4      c=1         171.7            171.3          same session
+Qwen3.8-27B FP8            c=1 / c=4   35.7 / 103.6     37.6 / 108.2
+
+Windows, built without CUTLASS (the v0.0.3-vk.1 configuration):
+Qwen3.6-35B-A3B NVFP4      c=1         124
+Qwen3.8-27B NVFP4          c=1         5.4              (59.3 with CUTLASS)
+Qwen3.8-27B FP8                        refused at load
+```
+
+The dense 27B model runs at the power cap, where single runs vary by about 4%. A 2,295-paragraph
+book translation (3,375 requests at concurrency 8) with Qwen3.8-27B FP8 on the Windows build
+finished with no failed request.
+
 **An `sm_120a` AOT tree.** Upstream vendors six Triton AOT trees; this fork adds a seventh
 for consumer Blackwell, and flips `AOT_AVAILABILITY["120a"]` from `False` to `True` to match
 what is actually on disk.
