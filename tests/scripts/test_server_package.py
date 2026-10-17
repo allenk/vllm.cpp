@@ -10,6 +10,7 @@ archive target, extracts it into a second empty tree, and invokes that binary.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 import shutil
@@ -22,6 +23,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILD_JOBS = os.environ.get("VLLM_CPP_PACKAGE_TEST_JOBS", "2")
+# The archive carries VLLM_CPP_BUILD_VERSION, which defaults to the CMake
+# project version; release_pipeline.py holds that equal to `project_version`,
+# so the expected name follows a version bump instead of pinning one release.
+PROJECT_VERSION = json.loads(
+    (ROOT / "release" / "release-version.json").read_text(encoding="utf-8")
+)["project_version"]
 
 
 def run(*command: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -83,7 +90,7 @@ class ServerPackageTest(unittest.TestCase):
             archive = archives[0]
             self.assertEqual(
                 archive.name,
-                f"vllm.cpp-0.0.3-linux-{platform.machine()}-glibc-cpu.tar.gz",
+                f"vllm.cpp-{PROJECT_VERSION}-linux-{platform.machine()}-glibc-cpu.tar.gz",
             )
             first_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
 
