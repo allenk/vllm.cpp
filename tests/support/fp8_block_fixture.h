@@ -387,14 +387,14 @@ struct CachePool {
     }
     const vt::Device cpu{vt::DeviceType::kCPU, 0};
     for (auto& b : full_attn_buf) {
-      PagedKvCache kv;
-      kv.data = b.data();
-      kv.dtype = kv_dtype;
-      kv.num_blocks = num_blocks;
-      kv.block_size = block_size;
-      kv.num_kv_heads = Hkv;
-      kv.head_size = Dh;
-      attn_kv.push_back(kv);
+      PagedKvCache cache;
+      cache.data = b.data();
+      cache.dtype = kv_dtype;
+      cache.num_blocks = num_blocks;
+      cache.block_size = block_size;
+      cache.num_kv_heads = Hkv;
+      cache.head_size = Dh;
+      attn_kv.push_back(cache);
     }
     for (size_t g = 0; g < gdn_ssm_buf.size(); ++g) {
       GdnStateCache gs;
