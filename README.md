@@ -61,7 +61,9 @@ Blackwell, sm_120a) and comparing what ran:
   log still listed both as enabled (`CUDA FA2 compiled-arch manifest: []`). Decode attention ran on
   the fallback paged-attention kernel, NVFP4 linears took a slow path, and 128x128 block-FP8
   checkpoints were refused at load. The lane now fetches CUTLASS 4.5.0, as the Linux lanes do, and
-  fails when the FA2 manifest lacks sm_80, sm_86, sm_89 or sm_120a.
+  fails when the FA2 manifest lacks sm_80, sm_86, sm_89 or sm_120a. It builds with CUDA 13.2:
+  CUTLASS 4.5.0's CuTe does not compile as C++20 under `cl.exe` with nvcc 13.3 or newer, and
+  configure now refuses that combination instead of failing an hour into the build.
 - **TMA descriptors were misaligned under MSVC.** `cl.exe` reports `__cplusplus` as `199711L`
   unless `/Zc:__cplusplus` is given, and `cuda.h` then leaves `alignas(128)` off `CUtensorMap`, so
   every CUTLASS kernel that reads a TMA descriptor from its parameters faulted on Windows;

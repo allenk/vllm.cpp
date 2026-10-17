@@ -539,10 +539,23 @@ jobs:
       #
       # So: no sub-package restriction. A complete toolkit costs minutes; an
       # incomplete one costs runs, and this lane has now spent four.
+      #
+      # 13.2, NOT the 13.3 the Linux lanes use. CUTLASS 4.5.0's CuTe does not
+      # compile as C++20 with cl.exe once nvcc is 13.3 or newer. Release run
+      # 39044890461 (nvcc 13.3.33, cl 19.44.35229) stopped every CuTe TU at
+      #   cute/stride.hpp(299): error C3545: 'Ints': parameter pack expects a
+      #   non-type template argument
+      # after five hours of compiling: this was the first run of this lane with
+      # CUTLASS on, so nothing before it had included CuTe. One CuTe-only TU with
+      # this lane's flags fails the same way under nvcc 13.4.92 and compiles under
+      # 13.2.51 on the same cl.exe, and 13.2 is the toolkit the Windows CUDA
+      # archive was validated with locally (FA2 manifest, CUDA tests, sm_120
+      # answer). CMakeLists.txt refuses the combination at configure time, so a
+      # bump here fails in seconds rather than hours.
       - name: Install the CUDA toolkit this lane compiles against
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: '13.3.0'
+          cuda: '13.2.0'
           method: 'network'
       # And prove the install can actually be compiled against, at the door,
       # rather than 40 minutes later through a message that names none of this.

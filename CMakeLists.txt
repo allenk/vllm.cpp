@@ -619,6 +619,29 @@ if(VLLM_CPP_CUDA)
         "${_CUTLASS_MAJOR}.${_CUTLASS_MINOR}.${_CUTLASS_PATCH} at "
         "${VLLM_CPP_CUTLASS_DIR}")
     endif()
+    # CUTLASS 4.5.0's CuTe does not compile as C++20 with cl.exe as the host
+    # compiler once nvcc is 13.3 or newer:
+    #   cute/stride.hpp(299): error C3545: 'Ints': parameter pack expects a
+    #   non-type template argument
+    # and every TU that includes CuTe stops there -- the CUTLASS GEMMs and all of
+    # the FlashAttention-2 kernels. MEASURED: release run 39044890461 (nvcc
+    # 13.3.33, cl 19.44.35229) failed twenty TUs this way after five hours of
+    # compiling. One CuTe-only TU with that lane's flags fails the same way under
+    # nvcc 13.4.92 and compiles under nvcc 13.2.51 on the same cl.exe; under 13.4
+    # it also compiles as C++17. GCC builds on 13.3 are unaffected. Refusing here
+    # turns an hour-long build failure into a configure error. Measured on 4.5.0
+    # only, so a newer CUTLASS is not refused unmeasured.
+    if(MSVC AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.3
+       AND CMAKE_CUDA_STANDARD GREATER_EQUAL 20
+       AND _CUTLASS_VERSION_NUMBER LESS_EQUAL 40500)
+      message(FATAL_ERROR
+        "CUTLASS ${_CUTLASS_MAJOR}.${_CUTLASS_MINOR}.${_CUTLASS_PATCH} does not compile "
+        "as C++20 with cl.exe under nvcc ${CMAKE_CUDA_COMPILER_VERSION} (CuTe error "
+        "C3545 in cute/stride.hpp). Configure a Windows build that uses CUTLASS, "
+        "which includes every FlashAttention-2 build, with CUDA 13.2: "
+        "-DCMAKE_CUDA_COMPILER=<CUDA 13.2>/bin/nvcc.exe, or the Visual Studio "
+        "toolset field cuda=<CUDA 13.2>.")
+    endif()
     # Headers are present + new enough: usable by FA2 on ANY arch it resolves for.
     set(VLLM_CPP_CUTLASS_HEADERS ON)
     # Datacenter sm_100a NVFP4 tcgen05 build-verify TU (BACKEND-CUDA-SM100). Its

@@ -309,4 +309,15 @@ two working trees              The Windows checkout is origin; the tree that BUI
                                editing before touching src/.
 comments outlive code          `RefuseDflash2PathWalk` was described in a comment
                                long after the function was deleted. Check the code.
+nvcc 13.3 + cl.exe + CuTe      The Windows CUDA lane had installed CUDA 13.3 since
+                               September and compiled fine, because nothing in it
+                               included CuTe. The first run with CUTLASS on failed
+                               every CuTe TU after five hours: CUTLASS 4.5.0 does
+                               not compile as C++20 under cl.exe with nvcc 13.3 or
+                               newer (C3545 in cute/stride.hpp), while the Linux
+                               lanes on 13.3 with GCC pass. The lane is pinned to
+                               13.2, the toolkit the archive was validated with,
+                               and configure refuses the combination. Reproduce a
+                               new toolchain on one CuTe-only TU before a lane
+                               spends hours on it.
 ```
