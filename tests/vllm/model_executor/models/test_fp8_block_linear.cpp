@@ -19,8 +19,9 @@
 //
 // No checkpoint download, no GPU, no snapshot. `vt::MatmulFp8BlockScaled` is a
 // CPU correctness reference (M2) and that is what makes this gateable here; the
-// CUDA kernel is #1189 M5 and until it lands a CUDA device refuses this
-// checkpoint by name at `Prepare`, which G6 asserts.
+// CUDA kernel is #1189 M5, and a CUDA build without it refuses this checkpoint
+// by name at `Prepare`, which G6 asserts (with it, G6 asserts the refusal is
+// inert on CUDA).
 #include <doctest/doctest.h>
 #include <doctest/doctest.h>
 
@@ -264,15 +265,24 @@ TEST_CASE("fp8 block linear: ONE perturbed block scale moves the model's logits"
 TEST_CASE("fp8 block linear: a device with no block-scaled GEMM refuses at Prepare, by name") {
   // M3 refused every LOADED block weight because nothing could read one. That
   // is narrowed, not deleted: the refusal now asks the PREPARE queue's device
-  // whether it has a kernel. CUDA does not until #1189 M5, and a user finding
-  // that out at the first GEMM — after a graph capture — is the failure this
-  // prevents.
+  // whether it has a kernel. A CUDA build without #1189 M5's kernel has none,
+  // and a user finding that out at the first GEMM — after a graph capture — is
+  // the failure this prevents.
   const HfConfig c = BlockConfig();
   const Qwen3_5DenseWeights w = BlockWeights(c, /*block_arm=*/true);
 
   REQUIRE(vt::OpRegistered(vt::OpId::kMatmulFp8BlockScaled, vt::DeviceType::kCPU));
-  REQUIRE_FALSE(
-      vt::OpRegistered(vt::OpId::kMatmulFp8BlockScaled, vt::DeviceType::kCUDA));
+  // M5 landed: a build whose CUDA architectures include VT_CUTLASS_FP8_ARCHS
+  // registers the kernel, and CUDA is then a device that HAS one. The refusal
+  // must be inert there, and the refusing half of this case needs a build
+  // without the kernel, which every CPU-only lane is.
+  if (vt::OpRegistered(vt::OpId::kMatmulFp8BlockScaled, vt::DeviceType::kCUDA)) {
+    CHECK_NOTHROW(
+        vllm::RefuseUnrunnableQwen3_5DenseFp8Block(w, vt::DeviceType::kCUDA));
+    MESSAGE("this build registers the CUDA block-scaled GEMM, so the refusal "
+            "half of G6 runs only on builds without it");
+    return;
+  }
 
   std::string message;
   try {
