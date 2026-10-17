@@ -2,9 +2,9 @@
 // parameter is plain bytes, so the same source builds and runs under GCC and
 // MSVC.
 //
-// WHY THIS EXISTS. Every sm90/sm120 CUTLASS GEMM keeps its TMA descriptors
-// (`CUtensorMap`) inside `GemmKernel::Params` and reads them straight out of
-// kernel-parameter space; the first thing the mainloop does is
+// WHY THIS EXISTS. Every sm90/sm100/sm120 CUTLASS GEMM keeps its TMA
+// descriptors (`CUtensorMap`) inside `GemmKernel::Params` and reads them straight
+// out of kernel-parameter space; the first thing the mainloop does is
 // `prefetch.tensormap [&params.tma_load_a]`, which needs a 64-byte aligned
 // address. On MSVC that fails twice over, for the reasons spelled out in
 // `tma_kernel_param.cuh`:
@@ -24,6 +24,15 @@
 // are the only adapter members that name `cutlass::device_kernel`; the adapter's
 // static `can_implement` and `get_workspace_size` remain usable. GCC builds take
 // the same path, so there is one launch path on both platforms.
+//
+// LAUNCH SELECTION mirrors `GemmUniversalAdapter::run` (CUTLASS 4.5.0) with the
+// kernel pointer swapped for `ParamsBytesKernel`: a static 1x1x1 cluster is a
+// plain launch (every sm_12x tactic today); an sm90 kernel with a larger cluster
+// goes through `ClusterLauncher::launch`, and an sm100-family or sm120 kernel
+// with one through `ClusterLauncher::launch_with_fallback_cluster`, which for a
+// static cluster shape passes a zero fallback exactly as the adapter does.
+// Programmatic dependent launch is never requested. The cluster paths are
+// compile-verified only: no sm90 or sm100 board has run them here.
 #pragma once
 
 #include <cuda.h>
@@ -32,6 +41,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "cute/layout.hpp"
+#include "cutlass/cluster_launch.hpp"
 #include "cutlass/cutlass.h"
 #include "vt/cuda/tma_kernel_param.cuh"
 
@@ -64,22 +75,27 @@ ParamsBytesKernel(const __grid_constant__ ParamsBytes<Kernel> raw) {
   op(*reinterpret_cast<const Params*>(&raw), smem);
 }
 
-// `GemmUniversalAdapter::initialize` + `run` for a kernel launched without a
-// cluster and without PDL. Returns the CUDA error instead of folding it into
-// `Status::kErrorInternal`, so a failure names its cause; `*status` carries the
-// CUTLASS status of workspace initialisation.
+// After a `ClusterLauncher` refusal: the CUDA error behind it when the runtime
+// recorded one, otherwise a configuration error (the launcher also refuses grid
+// and cluster shapes that do not divide, before calling the runtime).
+inline cudaError_t ClusterLaunchError() {
+  const cudaError_t err = cudaGetLastError();
+  return err != cudaSuccess ? err : cudaErrorInvalidConfiguration;
+}
+
+// `GemmUniversalAdapter::initialize` + `run` without PDL. Returns the CUDA error
+// instead of folding it into `Status::kErrorInternal`, so a failure names its
+// cause; `*status` carries the CUTLASS status of workspace initialisation.
 template <class Kernel>
 cudaError_t Run(const typename Kernel::Arguments& args, void* workspace, cudaStream_t stream,
                 cutlass::Status* status) {
   using Params = typename Kernel::Params;
   static_assert(sizeof(ParamsBytes<Kernel>) == sizeof(Params), "blob must mirror Params exactly");
-  static_assert(Kernel::ArchTag::kMinComputeCapability != 90,
-                "sm90 kernels launch with a cluster; this path does not handle cluster launch");
 
   *status = Kernel::initialize_workspace(args, workspace, stream);
   if (*status != cutlass::Status::kSuccess) return cudaSuccess;
 
-  const Params params = Kernel::to_underlying_arguments(args, workspace);
+  Params params = Kernel::to_underlying_arguments(args, workspace);
   const dim3 grid = Kernel::get_grid_shape(params);
   const dim3 block = Kernel::get_block_shape();
   const int smem_size = Kernel::SharedStorageSize;
@@ -90,7 +106,37 @@ cudaError_t Run(const typename Kernel::Arguments& args, void* workspace, cudaStr
         cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     if (err != cudaSuccess) return err;
   }
-  void* kernel_args[] = {const_cast<Params*>(&params)};
+  void* kernel_args[] = {&params};
+
+  if constexpr (Kernel::ArchTag::kMinComputeCapability >= 90) {
+    using ClusterShape = typename Kernel::DispatchPolicy::ClusterShape;
+    constexpr bool kStatic1x1x1 =
+        cute::is_static_v<ClusterShape> && cute::size(ClusterShape{}) == 1;
+    if constexpr (!kStatic1x1x1) {
+      constexpr int kArch = Kernel::ArchTag::kMinComputeCapability;
+      dim3 cluster(cute::size<0>(ClusterShape{}), cute::size<1>(ClusterShape{}),
+                   cute::size<2>(ClusterShape{}));
+      dim3 fallback_cluster(0, 0, 0);
+      if constexpr ((kArch == 100 || kArch == 101 || kArch == 103) &&
+                    !cute::is_static_v<ClusterShape>) {
+        // A dynamic cluster shape is chosen at run time and carried in the
+        // params, together with the shape to fall back to.
+        cluster = params.hw_info.cluster_shape;
+        fallback_cluster = params.hw_info.cluster_shape_fallback;
+      }
+      cutlass::Status launched;
+      if constexpr (kArch == 90) {
+        launched = cutlass::ClusterLauncher::launch(grid, cluster, block,
+                                                    static_cast<size_t>(smem_size), stream, fn,
+                                                    kernel_args, /*launch_with_pdl=*/false);
+      } else {
+        launched = cutlass::ClusterLauncher::launch_with_fallback_cluster(
+            grid, cluster, fallback_cluster, block, static_cast<size_t>(smem_size), stream, fn,
+            kernel_args, /*launch_with_pdl=*/false);
+      }
+      return launched == cutlass::Status::kSuccess ? cudaSuccess : ClusterLaunchError();
+    }
+  }
   return cudaLaunchKernel(fn, grid, block, kernel_args, static_cast<size_t>(smem_size), stream);
 }
 

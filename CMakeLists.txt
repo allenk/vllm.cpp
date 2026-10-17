@@ -2628,6 +2628,28 @@ if(VLLM_CPP_CUDA)
       ${_FP8_CUTLASS_SOURCES})
     list(APPEND _VT_CUDA_FEATURE_SOURCES ${_FP8_CUTLASS_SOURCES})
   endif()
+  set(_VT_CUTLASS_TMA_SOURCES ${_NVFP4_CUTLASS_SOURCES} ${_FP8_CUTLASS_SOURCES})
+  if(VLLM_CPP_CUTLASS_NVFP4_SM100)
+    vt_cuda_set_source_gencode("${VT_CUTLASS_NVFP4_SM100_ARCHS}"
+      src/vt/cuda/cuda_matmul_nvfp4_sm100.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES
+      src/vt/cuda/cuda_matmul_nvfp4_sm100.cu)
+    list(APPEND _VT_CUTLASS_TMA_SOURCES src/vt/cuda/cuda_matmul_nvfp4_sm100.cu)
+  endif()
+  if(VLLM_CPP_SCALEDMM_C3X_SM90)
+    vt_cuda_set_source_gencode("${VT_SCALEDMM_C3X_SM90_ARCHS}"
+      src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES
+      src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu)
+    list(APPEND _VT_CUTLASS_TMA_SOURCES src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu)
+  endif()
+  if(VLLM_CPP_SCALEDMM_C3X_SM100)
+    vt_cuda_set_source_gencode("${VT_SCALEDMM_C3X_SM100_ARCHS}"
+      src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES
+      src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu)
+    list(APPEND _VT_CUTLASS_TMA_SOURCES src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu)
+  endif()
   # CUTLASS's own CMakeLists adds /Zc:__cplusplus for MSVC; consuming it as
   # headers only skips that. Without it cl.exe reports __cplusplus as 199711L,
   # cuda.h drops alignas(128) from CUtensorMap, and every TMA descriptor in a
@@ -2635,29 +2657,12 @@ if(VLLM_CPP_CUDA)
   # kernel faults on its first descriptor prefetch. These TUs launch through
   # cutlass_params_launch.cuh, which is what lets them take the flag at all:
   # CUTLASS's own by-value entry point then fails with C2719, and the header's
-  # static_assert fails any TU that includes it without the flag.
-  set(_VT_CUTLASS_TMA_SOURCES ${_NVFP4_CUTLASS_SOURCES} ${_FP8_CUTLASS_SOURCES})
+  # static_assert fails any TU that includes it without the flag. The sm90 and
+  # sm100 build-verify TUs are on the list too, so a Windows build that targets
+  # 90a or 100a compiles them the same way.
   if(MSVC AND _VT_CUTLASS_TMA_SOURCES)
     set_property(SOURCE ${_VT_CUTLASS_TMA_SOURCES}
       APPEND PROPERTY COMPILE_OPTIONS -Xcompiler=/Zc:__cplusplus)
-  endif()
-  if(VLLM_CPP_CUTLASS_NVFP4_SM100)
-    vt_cuda_set_source_gencode("${VT_CUTLASS_NVFP4_SM100_ARCHS}"
-      src/vt/cuda/cuda_matmul_nvfp4_sm100.cu)
-    list(APPEND _VT_CUDA_FEATURE_SOURCES
-      src/vt/cuda/cuda_matmul_nvfp4_sm100.cu)
-  endif()
-  if(VLLM_CPP_SCALEDMM_C3X_SM90)
-    vt_cuda_set_source_gencode("${VT_SCALEDMM_C3X_SM90_ARCHS}"
-      src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu)
-    list(APPEND _VT_CUDA_FEATURE_SOURCES
-      src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu)
-  endif()
-  if(VLLM_CPP_SCALEDMM_C3X_SM100)
-    vt_cuda_set_source_gencode("${VT_SCALEDMM_C3X_SM100_ARCHS}"
-      src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu)
-    list(APPEND _VT_CUDA_FEATURE_SOURCES
-      src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu)
   endif()
   if(_MARLIN_SRCS)
     vt_cuda_set_source_gencode("${VT_MARLIN_NVFP4_ARCHS}" ${_MARLIN_SRCS})

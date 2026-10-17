@@ -59,6 +59,8 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
+#include "vt/cuda/cutlass_params_launch.cuh"
+
 namespace vt::cuda::scaled_mm_c3x_sm90 {
 
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
@@ -185,7 +187,6 @@ cutlass::Status RunProbe(void* d, const void* a, const void* b,
   StrideC dC = cutlass::make_cute_packed_stride(StrideC{}, make_shape(m, n, 1));
   StrideD dD = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
 
-  GemmT gemm;
   typename GemmT::Arguments args;
   args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
   args.problem_shape = make_shape(m, n, k, 1);
@@ -199,11 +200,16 @@ cutlass::Status RunProbe(void* d, const void* a, const void* b,
   args.epilogue.ptr_D = static_cast<ElementD*>(d);
   args.epilogue.dD = dD;
 
-  cutlass::Status s = gemm.can_implement(args);
+  cutlass::Status s = GemmT::can_implement(args);
   if (s != cutlass::Status::kSuccess) return s;
-  s = gemm.initialize(args, workspace, stream);
+  // Launched through the bytes entry point, like the sm_12x TUs: the adapter's
+  // by-value kernel parameter cannot be compiled by MSVC once CUtensorMap keeps
+  // its alignment (cutlass_params_launch.cuh). The 2x1x1 configs go through
+  // ClusterLauncher there.
+  const cudaError_t err =
+      cutlass_launch::Run<typename GemmT::GemmKernel>(args, workspace, stream, &s);
   if (s != cutlass::Status::kSuccess) return s;
-  return gemm.run(args, workspace, stream, nullptr, false);
+  return err == cudaSuccess ? cutlass::Status::kSuccess : cutlass::Status::kErrorInternal;
 }
 
 // Explicit instantiations across the three schedule variants so each wgmma/TMA

@@ -43,6 +43,8 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
+#include "vt/cuda/cutlass_params_launch.cuh"
+
 namespace vt::cuda::nvfp4_sm100 {
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
@@ -152,7 +154,6 @@ cutlass::Status RunProbe(void* d, const void* a, const void* b, const void* a_sf
                          cudaStream_t stream) {
   using GemmT = typename Fp4GemmSm100<Config, cutlass::bfloat16_t>::Gemm;
   using ElementD = typename GemmT::ElementD;
-  GemmT gemm;
   typename GemmT::Arguments args;
   args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
   args.epilogue.thread.alpha_ptr = alpha;
@@ -163,11 +164,16 @@ cutlass::Status RunProbe(void* d, const void* a, const void* b, const void* a_sf
   args.mainloop.ptr_SFB = static_cast<const cutlass::float_ue4m3_t*>(b_sf);
   args.epilogue.ptr_C = static_cast<const ElementD*>(d);
   args.epilogue.ptr_D = static_cast<ElementD*>(d);
-  cutlass::Status s = gemm.can_implement(args);
+  cutlass::Status s = GemmT::can_implement(args);
   if (s != cutlass::Status::kSuccess) return s;
-  s = gemm.initialize(args, workspace, stream);
+  // Launched through the bytes entry point, like the sm_12x TUs: the adapter's
+  // by-value kernel parameter cannot be compiled by MSVC once CUtensorMap keeps
+  // its alignment (cutlass_params_launch.cuh). The 2x1x1 configs go through
+  // ClusterLauncher there.
+  const cudaError_t err =
+      cutlass_launch::Run<typename GemmT::GemmKernel>(args, workspace, stream, &s);
   if (s != cutlass::Status::kSuccess) return s;
-  return gemm.run(args, workspace, stream, nullptr, false);
+  return err == cudaSuccess ? cutlass::Status::kSuccess : cutlass::Status::kErrorInternal;
 }
 
 // Explicit instantiations across the three datacenter configs so each tcgen05
