@@ -638,3 +638,92 @@ TEST_CASE("G6: CPU QuantFp8Group equals CUDA QuantFp8Group byte for byte") {
   }
   b.DestroyQueue(gq);
 }
+
+// ===========================================================================
+// G7 — CPU vs CUDA byte identity on the shapes a block-FP8 decode step actually
+// quantizes, through BOTH CUDA kernels. G6 is f32 at M = 3 only; the production
+// input is bf16, K is a model width (5120, 17408), and M is the decode batch.
+// A 128-wide group on a 16-byte-aligned input takes the 16-lane kernel; the
+// same data offset by one element is unaligned and takes the one-thread
+// kernel, so the two are pinned to the CPU arm, and therefore to each other.
+// K = 384 gives three groups per row, so odd M leaves a warp half without a
+// group, which is the path where only the shuffles may run.
+TEST_CASE("G7: CUDA QuantFp8Group equals CPU on decode shapes, lane and one-thread kernels") {
+  if (!HasCuda()) {
+    MESSAGE("G7 PENDING: no CUDA device on this host, the lane kernel was NOT compared");
+    CHECK(vt::OpRegistered(vt::OpId::kQuantFp8Group, DeviceType::kCPU));
+    return;
+  }
+  vt::Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = b.CreateQueue();
+  Queue cq{Cpu(), nullptr};
+  const Device gpu{DeviceType::kCUDA, 0};
+  constexpr int kGroup = 128;
+
+  for (DType dt : {DType::kBF16, DType::kF32}) {
+    for (int64_t k : {384, 5120, 17408}) {
+      for (int64_t m : {1, 3, 8, 37}) {
+        for (int64_t offset_elems : {0, 1}) {
+          CAPTURE(static_cast<int>(dt));
+          CAPTURE(k);
+          CAPTURE(m);
+          CAPTURE(offset_elems);
+          const int64_t groups = k / kGroup;
+          const size_t n = static_cast<size_t>(m * k);
+          const size_t esz = dt == DType::kBF16 ? 2 : 4;
+          const auto row = G1Row(k, 977u + static_cast<uint32_t>(k), 2.0f);
+          std::vector<float> xf(n);
+          std::vector<uint16_t> xb(n);
+          for (int64_t r = 0; r < m; ++r)
+            for (int64_t c = 0; c < k; ++c) {
+              const float v = row[static_cast<size_t>((c + r * 37) % k)] *
+                              (1.0f + 0.125f * static_cast<float>(r % 7));
+              xf[static_cast<size_t>(r * k + c)] = v;
+              xb[static_cast<size_t>(r * k + c)] = vt::F32ToBF16(v);
+            }
+          void* host_x = dt == DType::kBF16 ? static_cast<void*>(xb.data())
+                                            : static_cast<void*>(xf.data());
+
+          std::vector<uint8_t> cpu_out(n);
+          std::vector<float> cpu_s(static_cast<size_t>(m * groups));
+          Tensor tx_cpu = MakeTensor(host_x, dt, Cpu(), {m, k});
+          Tensor tq_cpu = MakeTensor(cpu_out.data(), DType::kI8, Cpu(), {m, k});
+          Tensor ts_cpu = MakeTensor(cpu_s.data(), DType::kF32, Cpu(), {m, groups});
+          vt::QuantFp8Group(cq, tq_cpu, ts_cpu, tx_cpu, kGroup);
+
+          // One extra element of room so the offset view stays inside the allocation.
+          char* dx = static_cast<char*>(b.Alloc((n + 1) * esz));
+          char* dq = static_cast<char*>(b.Alloc(n + 8));
+          void* ds = b.Alloc(static_cast<size_t>(m * groups) * sizeof(float));
+          char* x_view = dx + offset_elems * static_cast<int64_t>(esz);
+          char* q_view = dq + offset_elems;
+          b.Copy(gq, x_view, host_x, n * esz);
+          Tensor tx_gpu = MakeTensor(x_view, dt, gpu, {m, k});
+          Tensor tq_gpu = MakeTensor(q_view, DType::kI8, gpu, {m, k});
+          Tensor ts_gpu = MakeTensor(ds, DType::kF32, gpu, {m, groups});
+          vt::QuantFp8Group(gq, tq_gpu, ts_gpu, tx_gpu, kGroup);
+          std::vector<uint8_t> gpu_out(n);
+          std::vector<float> gpu_s(static_cast<size_t>(m * groups));
+          b.Copy(gq, gpu_out.data(), q_view, n);
+          b.Copy(gq, gpu_s.data(), ds, gpu_s.size() * sizeof(float));
+          b.Synchronize(gq);
+
+          size_t bad = 0, bad_s = 0, nonzero = 0;
+          for (size_t i = 0; i < n; ++i) {
+            if (cpu_out[i] != gpu_out[i]) ++bad;
+            if ((cpu_out[i] & 0x7Fu) != 0u) ++nonzero;
+          }
+          for (size_t i = 0; i < cpu_s.size(); ++i)
+            if (cpu_s[i] != gpu_s[i]) ++bad_s;
+          CHECK(bad == 0u);
+          CHECK(bad_s == 0u);
+          CHECK(nonzero > n / 2);  // vacuity guard
+          b.Free(dx);
+          b.Free(dq);
+          b.Free(ds);
+        }
+      }
+    }
+  }
+  b.DestroyQueue(gq);
+}

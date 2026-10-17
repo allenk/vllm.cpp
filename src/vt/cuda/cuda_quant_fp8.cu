@@ -136,12 +136,24 @@ void QuantFp8StaticKernelCuda(Queue& q, Tensor& out_fp8, const Tensor& x, float 
 // arm with a reference that spells the divide out.
 //
 // STRUCTURE. Upstream splits one group across 16 lanes and reduces with
-// `__shfl_xor_sync` (:21-40, :106). This kernel gives ONE THREAD the whole
-// group instead. The two agree bit for bit because `fmaxf` is exact and
-// associative over finite inputs, so the reduction ORDER cannot change the
-// result, unlike a floating-point sum. That keeps the arm a correctness mirror
-// with no shared memory and no intra-group synchronisation; a lane-parallel
-// rewrite is a performance question for #1189 M5, which needs a GPU to measure.
+// `__shfl_xor_sync` (:21-40, :106). Two kernels below do the same math:
+// `QuantFp8GroupKernel` gives ONE THREAD the whole group (any group size, any
+// alignment), and `QuantFp8GroupLaneKernel` splits a 128-wide group across 16
+// lanes the way upstream does. They agree bit for bit because `fmaxf` is exact
+// and order-independent (it returns the non-NaN operand, and the eps seed is
+// never NaN), so the reduction ORDER cannot change the result, unlike a
+// floating-point sum; the two divides and the convert are the same expressions.
+// Why both: at M = 1, K = 5120 the one-thread kernel runs 40 threads, each
+// making two passes over its 128 elements with uncoalesced loads, and a dense
+// block-FP8 decode step of Qwen3.8-27B issues 304 of these quants. Measured on
+// an RTX PRO 6000 Blackwell (sm_120a), bf16 input, 304 quants captured in one
+// CUDA graph like a decode step, median of 15 replays, bytes identical:
+//
+//   M x K        one-thread   16-lane
+//   1 x 5120       4.57 ms    0.33 ms
+//   1 x 17408      8.55 ms    0.34 ms
+//   8 x 5120      16.11 ms    0.35 ms
+//   8 x 17408     17.66 ms    0.35 ms
 //
 // This TU is in the UNCONDITIONAL CUDA source list and this kernel, like its
 // neighbour, has no cutlass dependency of any kind — it is a max, two divides
@@ -168,6 +180,76 @@ __global__ void QuantFp8GroupKernel(uint8_t* out, float* scale, const Tin* x, in
   }
 }
 
+// The lane-parallel form of the kernel above, for a group of exactly 128: 16 lanes
+// per group, 8 contiguous elements per lane read with one 16-byte (bf16) or two
+// 16-byte (f32) loads, so a warp covers two groups. The max is seeded with eps in
+// every lane and reduced with xor-shuffles of 8, 4, 2 and 1, which never cross bit
+// 4 of the lane id and therefore stay inside each 16-lane half. Lane 0 of the half
+// writes the scale; every lane writes its 8 bytes with one 8-byte store. The loop
+// bound is uniform across the warp, so a half whose group does not exist still
+// takes part in the shuffles and only skips its stores.
+constexpr int kLaneGroupSize = 128;
+constexpr int kLanesPerGroup = 16;
+constexpr int kElemsPerLane = kLaneGroupSize / kLanesPerGroup;  // 8
+
+__device__ __forceinline__ void LoadLane(const float* p, float (&v)[kElemsPerLane]) {
+  const float4 a = reinterpret_cast<const float4*>(p)[0];
+  const float4 b = reinterpret_cast<const float4*>(p)[1];
+  v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w;
+  v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+}
+__device__ __forceinline__ void LoadLane(const __nv_bfloat16* p, float (&v)[kElemsPerLane]) {
+  const uint4 raw = *reinterpret_cast<const uint4*>(p);
+  const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
+#pragma unroll
+  for (int i = 0; i < kElemsPerLane; ++i) v[i] = __bfloat162float(h[i]);
+}
+
+template <typename Tin>
+__global__ void QuantFp8GroupLaneKernel(uint8_t* out, float* scale, const Tin* x,
+                                        int64_t num_groups) {
+  constexpr float kEps = 1e-10f;
+  constexpr float kFp8MaxV = 448.0f;
+  constexpr float kFp8MinV = -448.0f;
+  const int lane = static_cast<int>(threadIdx.x & 31u);
+  const int half = lane >> 4;
+  const int sub = lane & (kLanesPerGroup - 1);
+  const int64_t warp = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+  const int64_t warp_step = (static_cast<int64_t>(gridDim.x) * blockDim.x) >> 5;
+  for (int64_t w = warp; w * 2 < num_groups; w += warp_step) {
+    const int64_t gid = w * 2 + half;
+    const bool valid = gid < num_groups;
+    const int64_t base = gid * kLaneGroupSize + sub * kElemsPerLane;
+    float v[kElemsPerLane];
+    float amax = kEps;
+    if (valid) {
+      LoadLane(x + base, v);
+#pragma unroll
+      for (int i = 0; i < kElemsPerLane; ++i) amax = fmaxf(amax, fabsf(v[i]));
+    }
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 8));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    if (valid) {
+      const float y_s = amax / kFp8MaxV;
+      if (sub == 0) scale[gid] = y_s;
+      uint32_t word[2] = {0u, 0u};
+#pragma unroll
+      for (int i = 0; i < kElemsPerLane; ++i) {
+        const uint32_t b = F32ToFp8Dev(fminf(fmaxf(v[i] / y_s, kFp8MinV), kFp8MaxV));
+        word[i / 4] |= b << (8 * (i % 4));
+      }
+      *reinterpret_cast<uint2*>(out + base) = make_uint2(word[0], word[1]);
+    }
+  }
+}
+
+bool LaneKernelApplies(const void* x, const void* out, int group_size) {
+  return group_size == kLaneGroupSize && reinterpret_cast<uintptr_t>(x) % 16 == 0 &&
+         reinterpret_cast<uintptr_t>(out) % 8 == 0;
+}
+
 void QuantFp8GroupKernelCuda(Queue& q, Tensor& out_fp8, Tensor& out_scale, const Tensor& x,
                              int group_size) {
   const int64_t m = x.shape[0], k = x.shape[1];
@@ -175,6 +257,22 @@ void QuantFp8GroupKernelCuda(Queue& q, Tensor& out_fp8, Tensor& out_scale, const
   const int64_t num_groups = m * groups_per_row;
   if (num_groups == 0) return;
   cudaStream_t s = AsStream(q);
+  if (LaneKernelApplies(x.data, out_fp8.data, group_size) &&
+      (x.dtype == DType::kF32 || x.dtype == DType::kBF16)) {
+    // 256 threads = 8 warps = 16 groups per block.
+    constexpr int kThreads = 256;
+    constexpr int64_t kGroupsPerBlock = kThreads / 32 * 2;
+    const int lane_blocks =
+        static_cast<int>(std::min<int64_t>((num_groups + kGroupsPerBlock - 1) / kGroupsPerBlock, 65535));
+    if (x.dtype == DType::kF32)
+      QuantFp8GroupLaneKernel<float><<<lane_blocks, kThreads, 0, s>>>(
+          out_fp8.Ptr<uint8_t>(), out_scale.Ptr<float>(), x.Ptr<float>(), num_groups);
+    else
+      QuantFp8GroupLaneKernel<__nv_bfloat16><<<lane_blocks, kThreads, 0, s>>>(
+          out_fp8.Ptr<uint8_t>(), out_scale.Ptr<float>(), x.Ptr<__nv_bfloat16>(), num_groups);
+    Check(cudaGetLastError(), "quant_fp8_group lane launch");
+    return;
+  }
   const int blocks = static_cast<int>(std::min<int64_t>((num_groups + 255) / 256, 65535));
   switch (x.dtype) {
     case DType::kF32:
