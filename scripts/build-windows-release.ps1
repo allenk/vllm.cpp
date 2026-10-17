@@ -946,6 +946,14 @@ Invoke-Checked cmake @(
     # single-SM category is `diagnostic`, whose ids are linux-...-cuda-sm<X>.
     # So the under-declaration was both a smaller product and an unshippable one.
     "-DVLLM_CPP_CUDA_ARCHITECTURES=$(if ($Backend -eq 'cuda') { '80;86;87;89;90a;110;120a;121a' } else { '' })",
+    # CUTLASS is the header-only dependency of FlashAttention-2 and of the
+    # CUTLASS NVFP4 and FP8 GEMMs. Without it CMake leaves the feature table
+    # saying ENABLED and compiles none of them; it only warns. The v0.0.3-vk.1
+    # archive was built that way ("CUDA FA2 compiled-arch manifest: []"):
+    # decode attention ran on the fallback paged-attention kernel and
+    # 128x128 block-FP8 checkpoints were refused at load.
+    # build-linux-accelerator-release.sh passes the same flag.
+    "-DVLLM_CPP_CUTLASS_FETCH=$(if ($Backend -eq 'cuda') { 'ON' } else { 'OFF' })",
     "-DVLLM_CPP_HIP=OFF",
     "-DVLLM_CPP_HIP_ARCHITECTURES=",
     "-DVLLM_CPP_METAL=OFF",
@@ -960,6 +968,28 @@ Invoke-Checked python @(
     "--root", $SourceDir,
     "--build-dir", $BuildDir
 )
+
+# Refuse a CUDA archive without FlashAttention-2. Configure only warns when
+# CUTLASS is missing, and the archive would then ship the fallback attention
+# kernel under the same name, as v0.0.3-vk.1 did. The manifest is the one the
+# runtime reads (src/vllm/platforms/cuda.cpp), generated from the very argument
+# that became nvcc's -gencode list for the FA2 sources.
+if ($Backend -eq "cuda") {
+    $archHeader = Join-Path $BuildDir "include/vllm/platforms/cuda_compiled_archs.h"
+    if (-not (Test-Path -LiteralPath $archHeader)) {
+        throw "configure produced no $archHeader"
+    }
+    $fa2 = ""
+    $match = Select-String -LiteralPath $archHeader -Pattern '#define VLLM_CPP_CUDA_FA2_COMPILED_ARCHS "([^"]*)"'
+    if ($match) { $fa2 = $match.Matches[0].Groups[1].Value }
+    $fa2Archs = @($fa2 -split "," | Where-Object { $_ })
+    foreach ($required in @("80", "86", "89", "120a")) {
+        if ($fa2Archs -notcontains $required) {
+            throw "FlashAttention-2 is not compiled for sm_$required (FA2 compiled-arch manifest: [$fa2]). Is CUTLASS available to the configure?"
+        }
+    }
+    Write-Host "FlashAttention-2 compiled for: $fa2"
+}
 
 $targets = @(
     "server",
