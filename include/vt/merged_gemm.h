@@ -108,6 +108,20 @@ inline constexpr MergedGemmGroup kFp8BlockQkv = {
     /*name=*/"fp8_block_qkv",
 };
 
+// The third merged linear upstream runs over a block-FP8 Qwen3.5/3.6
+// checkpoint: the gated-DeltaNet input projection, one
+// MergedColumnParallelLinear `in_proj_qkvz` over the checkpoint's separately
+// quantized `in_proj_qkv` and `in_proj_z` (models/qwen3_5.py:228-229 and the
+// `packed_modules_mapping` at :315 @ 026f6ab268). `kNone` for the QKV group's
+// reason: the output is sliced into row-strided mixed_qkv and z views, which
+// the causal conv and the gated RMSNorm read in place.
+inline constexpr MergedGemmGroup kFp8BlockGdnQkvz = {
+    /*arity=*/2,
+    /*epilogue=*/MergedEpilogue::kNone,
+    /*fast_op=*/kNoMergedFastOp,
+    /*name=*/"fp8_block_gdn_qkvz",
+};
+
 // The BF16-native SIBLING arm of this gate+up+SwiGLU family (Tier-A4 fold) is NOT a
 // MergedGemmGroup instance: the bf16 grouped-MoE archs (Qwen3-Coder, DeepSeek-V2,
 // kimi) marshal their experts as per-expert weight-POINTER ARRAYS [E] i64 with a
@@ -151,7 +165,8 @@ void MergedGemm(Queue& q, const MergedGemmGroup& desc, Tensor& out, const Tensor
                 const Tensor& gate_w, const Tensor& up_w, const Tensor& expert_ids,
                 float epilogue_scalar, bool force_composite = false);
 
-// Run a BLOCK-WISE FP8 merged group (kFp8BlockGateUpSwiGLU, kFp8BlockQkv).
+// Run a BLOCK-WISE FP8 merged group (kFp8BlockGateUpSwiGLU, kFp8BlockQkv,
+// kFp8BlockGdnQkvz).
 //
 // A SECOND realization function under the SAME descriptor type, not a widening
 // of MergedGemm above: that one's operand list is the grouped-MoE one

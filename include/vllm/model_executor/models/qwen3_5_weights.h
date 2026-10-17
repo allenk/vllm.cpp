@@ -902,6 +902,11 @@ struct GdnLayerWeights {
   Fp8BlockWeight in_proj_qkv_fp8_block;
   Fp8BlockWeight in_proj_z_fp8_block;
   Fp8BlockWeight out_proj_fp8_block;
+  // The two block shards above N-concatenated, qkv rows first: upstream's
+  // merged `in_proj_qkvz` (`vt::kFp8BlockGdnQkvz`). Built lazily-once by
+  // `dense_fp8_block::ResidentFp8BlockMerged` when `ProjectGdnQkvz` takes the
+  // merged arm, and the two shards' own residents are then never built.
+  Fp8BlockMergedResident in_proj_qkvz_fp8_block_merged;
 
   // 27B W4A4 fp4-resident variant of out_proj (compressed-tensors NVFP4, notes
   // §3.6). When populated (real 27B CUDA load) the forward calls vt::MatmulNvfp4

@@ -4507,6 +4507,35 @@ GdnQkvzOutput ProjectGdnQkvzRaw(Dev d, const GdnLayerWeights& w,
   // predictor above derives the SAME dtype for this arm and a disagreement
   // makes vt::GdnPackedDecode throw.
   if (!w.in_proj_qkv_fp8_block.Empty()) {
+    // Upstream's ONE `in_proj_qkvz` GEMM (vt::kFp8BlockGdnQkvz): one activation
+    // quant and one block-scaled GEMM over the N-concatenated shards instead
+    // of two of each. The same gate as the BF16 leaf above, so
+    // VT_GDN_MERGED_QKVZ=0 rolls both back. Under `indt == outdt` the merged
+    // output carries the dtype each split GEMM would have emitted, which is
+    // also what GdnProjectedMixedQkvDType predicts for this arm; each output
+    // element is the same block-scaled dot product, only launched once.
+    if (detail::ShouldUseMergedGdnQkvz(detail::GdnMergedQkvzEligibility{
+            MergedGdnQkvzEnabled(d),
+            vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging(),
+            !w.in_proj_z_fp8_block.Empty(), indt == outdt})) {
+      const dense_fp8_block::Fp8BlockShard qkvz_shards[2] = {
+          {&w.in_proj_qkv_fp8_block, "in_proj_qkv"},
+          {&w.in_proj_z_fp8_block, "in_proj_z"}};
+      const dense_fp8_block::Fp8BlockMergedView qkvz =
+          dense_fp8_block::ResidentFp8BlockMerged(
+              d, vt::kFp8BlockGdnQkvz, "in_proj_qkvz", qkvz_shards, 2,
+              w.in_proj_qkvz_fp8_block_merged);
+      VT_CHECK(w.in_proj_qkv_fp8_block.n == conv_dim &&
+                   w.in_proj_z_fp8_block.n == value_dim,
+               "qwen3_5 merged block-wise FP8 GDN qkvz: the shard widths and "
+               "the layer's conv_dim/value_dim disagree");
+      out.packed_owner.emplace(dense_fp8_block::MatmulFp8BlockMergedD<DBuf>(
+          d, h, qkvz, indt, vt::kFp8BlockGdnQkvz));
+      Tensor packed = out.packed_owner->t();
+      out.mixed = packed.Slice(1, 0, conv_dim);
+      out.z = packed.Slice(1, conv_dim, conv_dim + value_dim);
+      return out;
+    }
     out.mixed_owner.emplace(dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
         d, h, w.in_proj_qkv_fp8_block, indt));
     out.z_owner.emplace(dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(

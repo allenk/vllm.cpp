@@ -371,6 +371,8 @@ vt::DType ActDType(vt::DeviceType dev_type);
 // term no longer excludes a MoE checkpoint; `has_packed_qkvz` still does).
 // Every other combination
 // issues the exact two split GEMMs sliced from the same resident owner.
+// The block-wise FP8 leaf (vt::kFp8BlockGdnQkvz) asks the same question, with
+// `has_packed_qkvz` meaning that both block shards are loaded.
 struct GdnMergedQkvzEligibility {
   bool runtime_enabled = false;
   bool cuda = false;
