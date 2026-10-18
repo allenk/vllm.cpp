@@ -915,6 +915,12 @@ struct MoeFp8BlockResident {
   void* down_s = nullptr;  // i64 [E] device: down f32 scale-grid ptrs
   std::unordered_map<int64_t, void*> tok_map;  // T -> i32 [T*top_k] device
   bool ready = false;
+  // The shared expert as a one-expert table per projection (gate, up, down)
+  // and, per T, an i32 [T] of zeros routing every row to it.
+  void* shared_w[3] = {nullptr, nullptr, nullptr};  // i64 [1] device: fp8 byte ptr
+  void* shared_s[3] = {nullptr, nullptr, nullptr};  // i64 [1] device: scale-grid ptr
+  std::unordered_map<int64_t, void*> zero_ids;  // T -> i32 [T] device, all 0
+  bool shared_ready = false;
 };
 
 MoeFp8BlockResident& MoeFp8BlockResidentFor(const MoeBlockWeights* w) {
@@ -7311,6 +7317,65 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   return dout;
 }
 
+// The block-FP8 shared expert on the grouped op: a one-expert table and every
+// row routed to it, so the projections are the same W8A16 GEMVs (decode) or
+// tiles (prefill) as the routed experts'. SharedExpert's block arm, which the
+// reference loop keeps, runs each projection through the CUTLASS block GEMM
+// with an activation quant and a scale transpose in front of it; at decode
+// sizes those three launches per projection cost several times the GEMV (the
+// 4-layer checkpoint's decode profile averages 7.6 us per block GEMM, plus 1.0
+// and 0.7 us for its quant and transpose). The sigmoid gate and its logit are
+// SharedExpert's.
+DBuf SharedExpertFp8BlockGrouped(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
+                                 const Tensor& dh, const Tensor& xh, int64_t T,
+                                 MoeFp8BlockResident& mr) {
+  const int64_t H = cfg.hidden_size;
+  const int64_t Is = cfg.shared_expert_intermediate_size;
+  const Fp8BlockWeight* proj[3] = {&w.shared_gate_proj_fp8_block, &w.shared_up_proj_fp8_block,
+                                   &w.shared_down_proj_fp8_block};
+  if (!mr.shared_ready) {
+    for (int i = 0; i < 3; ++i) {
+      const int64_t wp =
+          reinterpret_cast<int64_t>(dense_fp8_block::ResidentFp8BlockPacked(d, *proj[i]).data);
+      const int64_t sp =
+          reinterpret_cast<int64_t>(dense_fp8_block::ResidentFp8BlockScale(d, *proj[i]).data);
+      mr.shared_w[i] = d.b.Alloc(sizeof(int64_t));
+      d.b.Copy(d.q, mr.shared_w[i], &wp, sizeof(int64_t));
+      mr.shared_s[i] = d.b.Alloc(sizeof(int64_t));
+      d.b.Copy(d.q, mr.shared_s[i], &sp, sizeof(int64_t));
+    }
+    mr.shared_ready = true;
+  }
+  // Built on a shape's first (eager) step, as the routed row map is; a copy
+  // from pageable host memory has read its source when Copy returns.
+  auto zit = mr.zero_ids.find(T);
+  if (zit == mr.zero_ids.end()) {
+    const std::vector<int32_t> zeros(static_cast<size_t>(T), 0);
+    const size_t zb = static_cast<size_t>(T) * sizeof(int32_t);
+    void* p = d.b.Alloc(zb);
+    d.b.Copy(d.q, p, zeros.data(), zb);
+    zit = mr.zero_ids.emplace(T, p).first;
+  }
+  const Tensor ids = MakeTensor(zit->second, DType::kI32, d.q.device, {T});
+  auto table = [&](void* p) { return MakeTensor(p, DType::kI64, d.q.device, {1}); };
+
+  DBuf sg(d, DType::kBF16, {T, Is});
+  vt::MoeGroupedGemmFp8Block(d.q, sg.t(), xh, ids, nullptr, table(mr.shared_w[0]),
+                             table(mr.shared_s[0]), proj[0]->block_n, proj[0]->block_k);
+  DBuf su(d, DType::kBF16, {T, Is});
+  vt::MoeGroupedGemmFp8Block(d.q, su.t(), xh, ids, nullptr, table(mr.shared_w[1]),
+                             table(mr.shared_s[1]), proj[1]->block_n, proj[1]->block_k);
+  DBuf sact(d, DType::kBF16, {T, Is});
+  vt::MoeSiluMul(d.q, sact.t(), sg.t(), su.t());  // silu(sg) * su -> bf16
+  DBuf sd(d, DType::kBF16, {T, H});
+  vt::MoeGroupedGemmFp8Block(d.q, sd.t(), sact.t(), ids, nullptr, table(mr.shared_w[2]),
+                             table(mr.shared_s[2]), proj[2]->block_n, proj[2]->block_k);
+  DBuf gl = MatmulF32D(d, dh, w.shared_gate);  // [T,1] f32
+  DBuf shared(d, DType::kBF16, {T, H});
+  vt::SharedExpertGate(d.q, shared.t(), sd.t(), gl.t());  // sigmoid(gl)*sd -> bf16
+  return shared;
+}
+
 // --- Grouped block-FP8 MoE block (Qwen/Qwen3.6-35B-A3B-FP8). MoeBlockBf16Cuda's
 // router, top-k, row map and combine, with the three grouped GEMMs reading the
 // experts' checkpoint bytes through vt::MoeGroupedGemmFp8Block (W8A16; ops.h).
@@ -7450,7 +7515,24 @@ DBuf MoeBlockFp8BlockCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
 
   const bool has_shared = cfg.shared_expert_intermediate_size > 0;
   std::optional<DBuf> shared;
-  if (has_shared) shared.emplace(SharedExpert(d, w, cfg, dh, T, false));
+  // The grouped shared expert serves decode-sized steps only: up to 64 rows the
+  // op runs its warp GEMV, and above that its bf16 WMMA tile, which the CUTLASS
+  // fp8 GEMM beats. Measured on the 4-layer checkpoint with a quiet host: c=1
+  // decode about 731 vs 718 tok/s for the grouped shared expert, a 1,160-token
+  // prefill about 67-74K vs 73-79K tok/s in CUTLASS's favour.
+  // VT_MOE_FP8_BLOCK_SHARED_GROUPED=0 keeps every step on SharedExpert's CUTLASS
+  // block arm for a same-binary A/B; default ON.
+  constexpr int64_t kSharedGroupedMaxRows = 64;
+  static const bool shared_grouped = [] {
+    const char* e = std::getenv("VT_MOE_FP8_BLOCK_SHARED_GROUPED");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  if (has_shared) {
+    if (shared_grouped && T <= kSharedGroupedMaxRows && !w.shared_gate_proj_fp8_block.Empty())
+      shared.emplace(SharedExpertFp8BlockGrouped(d, w, cfg, dh, xh, T, mr));
+    else
+      shared.emplace(SharedExpert(d, w, cfg, dh, T, false));
+  }
   DBuf dout(d, DType::kBF16, {T, H});
   vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), has_shared ? &shared->t() : nullptr);
   return dout;
