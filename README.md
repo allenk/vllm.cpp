@@ -121,6 +121,15 @@ memory: about 1.9 times a Q8_0 file, 3.3 to 3.6 times a 4-bit one. The expansion
 an idle RTX PRO 6000. Earlier builds transposed the weights to [K, N], which sent every decode matmul
 to the scalar kernel: about 4 tok/s for the same model. `VT_GGUF_EXPAND_NK=0` reproduces that load.
 
+**Known issue in `0.0.4-vk.1`: some mixed-precision GGUF files fail on CPU and CUDA.** A file that
+stores some tensors as F16 beside block-quantized ones, such as Unsloth's Qwen3.5-2B-UD-Q8_K_XL,
+loads, and its first request then stops the engine with an error. Two checks fire. On CUDA an F16
+token embedding stays F16, and the CUDA embedding kernel takes only f32, bf16 or block-quantized
+tables. On CPU and CUDA, a Qwen3.5 linear-attention layer whose `attn_qkv` is block-quantized
+while its `attn_gate` is F16 is refused.
+`VT_GGUF_KEEP_QUANT=0` runs such a file by expanding every weight to bf16, which costs that memory.
+The Vulkan archives expand GGUF weights anyway and run it.
+
 **Block-FP8 activation quant, on every platform.** The quant in front of each 128x128 block-FP8
 GEMM gave a whole 128-wide group to one thread; it now splits the group across 16 lanes, as
 upstream's kernel does, and its output is bit-identical. A Qwen3.8-27B FP8 decode step runs 304
