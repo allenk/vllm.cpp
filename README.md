@@ -77,16 +77,6 @@ Blackwell, sm_120a) and comparing what ran:
   pages to the OS with `madvise` on Linux and did nothing on Windows; it now calls `VirtualUnlock`.
   Working set after loading Qwen3.6-35B-A3B NVFP4: 21.75 GiB before, 3.55 GiB after.
 
-**The Windows archives start on a host without OpenSSL.** Every `v0.0.3-vk.1` Windows archive
-(CPU, Vulkan and CUDA) imported `libssl-3-x64.dll` and `libcrypto-3-x64.dll` without carrying
-them, so `vllm-server.exe` stopped with `STATUS_DLL_NOT_FOUND` (0xC0000135) unless an OpenSSL
-happened to be on `PATH`. GitHub's Windows runner has one installed, with its `bin` on `PATH`, so
-the build linked it and every check on the runner passed. The `0.0.4-vk.1` Windows archives are
-built without the Hugging Face download: `--model` takes a local checkpoint directory, and
-`--model org/repo` is refused with a message naming the build options. Packaging now refuses a
-Windows archive that imports any DLL other than a Windows component or the backend's host runtime
-(cuBLAS for CUDA). The Linux archives and the container images keep the download.
-
 Measured with local builds of the same source and configuration as the archive (the archive itself
 is built on GitHub's Windows runner, which has no GPU). CUDA 13.2, 350 W power cap, decode tok/s,
 887-token prompt, greedy:
@@ -105,6 +95,24 @@ Qwen3.8-27B FP8                        refused at load
 The dense 27B model runs at the power cap, where single runs vary by about 4%. A 2,295-paragraph
 book translation (3,375 requests at concurrency 8) with Qwen3.8-27B FP8 on the Windows build
 finished with no failed request.
+
+**The Windows archives start on a host without OpenSSL.** Every `v0.0.3-vk.1` Windows archive
+(CPU, Vulkan and CUDA) imported `libssl-3-x64.dll` and `libcrypto-3-x64.dll` without carrying
+them, so `vllm-server.exe` stopped with `STATUS_DLL_NOT_FOUND` (0xC0000135) unless an OpenSSL
+happened to be on `PATH`. GitHub's Windows runner has one installed, with its `bin` on `PATH`, so
+the build linked it and every check on the runner passed. The `0.0.4-vk.1` Windows archives are
+built without the Hugging Face download: `--model` takes a local checkpoint directory, and
+`--model org/repo` is refused with a message naming the build options. Packaging now refuses a
+Windows archive that imports any DLL other than a Windows component or the backend's host runtime
+(cuBLAS for CUDA). The Linux archives and the container images keep the download.
+
+**Running a Windows archive.** Unzip it anywhere and run `bin\vllm-server.exe`. The CUDA archive
+needs an NVIDIA driver that supports CUDA 13 and the CUDA 13 cuBLAS DLLs (`cublasLt64_13.dll`),
+which it does not carry: install the CUDA Toolkit 13.x and put its `bin\x64` folder on `PATH`. The
+Vulkan archive uses the Vulkan loader the GPU driver installs, and is started with
+`--device auto`. Download the checkpoint first, for example
+`hf download Qwen/Qwen3.5-2B --local-dir D:\models\Qwen3.5-2B`, then
+`vllm-server.exe --model D:\models\Qwen3.5-2B --device cuda --port 8000`.
 
 **Block-FP8 activation quant, on every platform.** The quant in front of each 128x128 block-FP8
 GEMM gave a whole 128-wide group to one thread; it now splits the group across 16 lanes, as
