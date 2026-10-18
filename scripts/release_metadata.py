@@ -366,6 +366,29 @@ def windows_dependencies(report_path: Path, backend: str) -> list[dict[str, Any]
         raise ValueError("PE audit debug_paths must be a string array")
     if any(re.match(r"^[A-Za-z]:[\\/]", item) for item in debug_paths):
         raise ValueError("PE audit embeds a developer-drive debug path")
+    # FORK: every import used to be declared a windows-2022 component, so the
+    # runner's OpenSSL (libssl-3-x64.dll, libcrypto-3-x64.dll) went into the
+    # v0.0.3-vk.1 and 0.0.4-vk.1 manifests as one, and the validator, which accepts a
+    # declared import, passed archives whose server could not start without
+    # it. An import must now be a Windows component or this backend's host
+    # runtime, the only two things a Windows archive's host is asked to supply.
+    host_runtime = release_manifest.WINDOWS_HOST_RUNTIME_DLLS.get(backend, frozenset())
+
+    def from_windows(name: str) -> bool:
+        upper = name.upper()
+        return upper in release_manifest.WINDOWS_SYSTEM_DLLS or upper.startswith(
+            ("API-MS-WIN-", "EXT-MS-WIN-")
+        )
+
+    unsupplied = sorted(
+        {name for name in imports if not from_windows(name) and name.upper() not in host_runtime},
+        key=str.upper,
+    )
+    if unsupplied:
+        raise ValueError(
+            f"PE audit imports DLLs that a {backend} archive does not carry and its "
+            f"host does not supply: {unsupplied}"
+        )
     rows = [
         {
             "bundled": False,
@@ -373,7 +396,7 @@ def windows_dependencies(report_path: Path, backend: str) -> list[dict[str, Any]
             "linkage": "dynamic",
             "name": name,
             "role": "runtime",
-            "version": "windows-2022",
+            "version": "windows-2022" if from_windows(name) else "host",
         }
         for name in sorted(set(imports), key=str.upper)
     ]

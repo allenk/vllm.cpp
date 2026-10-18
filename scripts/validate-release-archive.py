@@ -506,13 +506,9 @@ def validate_macho_install_id(install_id: str, forbidden_paths: list[str]) -> li
     return []
 
 
-WINDOWS_SYSTEM_DLLS = {
-    "ADVAPI32.DLL", "BCRYPT.DLL", "COMDLG32.DLL", "CRYPT32.DLL", "DNSAPI.DLL",
-    "GDI32.DLL", "IPHLPAPI.DLL", "KERNEL32.DLL", "NORMALIZ.DLL", "NTDLL.DLL",
-    "OLE32.DLL", "OLEAUT32.DLL", "PSAPI.DLL", "RPCRT4.DLL", "SECUR32.DLL",
-    "SETUPAPI.DLL", "SHELL32.DLL", "SHLWAPI.DLL", "USER32.DLL", "VERSION.DLL",
-    "WINMM.DLL", "WS2_32.DLL",
-}
+# FORK: the set lives in release_manifest.py, where release_metadata.py reads it
+# too, so the producer and this validator agree on what Windows supplies.
+WINDOWS_SYSTEM_DLLS = release_manifest.WINDOWS_SYSTEM_DLLS
 
 
 def validate_pe_audit(

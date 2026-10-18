@@ -933,6 +933,20 @@ Invoke-Checked cmake @(
     "-DVLLM_CPP_BUILD_VERSION=$env:VERSION",
     "-DVLLM_CPP_BUILD_EXAMPLES=ON",
     "-DVLLM_CPP_SERVER=ON",
+    # No HuggingFace download in a Windows archive, named here rather than left
+    # to detection. The windows-2022 image carries OpenSSL 3.6.5 under
+    # C:\Program Files\OpenSSL, so find_package found it and the server linked
+    # libssl-3-x64.dll and libcrypto-3-x64.dll, which the archive does not carry
+    # (validate-release-archive.py refuses a bundled DLL). All three v0.0.3-vk.1
+    # Windows archives and all three 0.0.4-vk.1 dry-run archives stopped with
+    # STATUS_DLL_NOT_FOUND on a host without an OpenSSL on PATH. Every smoke in
+    # this script passed, because the runner's PATH has C:\Program Files\OpenSSL\bin.
+    # OFF is the musl lane's disposition (build-cpu-release.sh): the server
+    # serves a local checkpoint and refuses a repository identifier with a
+    # message naming the build options. release_metadata.py now refuses an
+    # import that is neither a Windows component nor the backend's host runtime,
+    # so a library found on the runner fails this lane instead of a user's host.
+    "-DVLLM_CPP_HF_DOWNLOAD=OFF",
     "-DVLLM_CPP_CUDA=$(if ($Backend -eq 'cuda') { 'ON' } else { 'OFF' })",
     # sm_120a is consumer Blackwell. It is named EXPLICITLY rather than left to
     # detection because a Triton AOT artifact is a cubin and therefore

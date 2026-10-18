@@ -231,7 +231,13 @@ stage or release lane that compiles the server without the development files.
 - macOS and Windows have no resolved TLS lane. `find_package(OpenSSL)` on macOS
   needs a root hint and the release install-name rules restrict what may be
   linked, and cpp-httplib has no Windows Schannel path, so a Windows build
-  needs an OpenSSL to point at. Both are recorded as owed.
+  needs an OpenSSL to point at. The one on GitHub's Windows runner is a pair of
+  DLLs that a Windows archive does not carry, and the `v0.0.3-vk.1` Windows
+  archives linked it and did not start without it, so the Windows release
+  archives are built with `-DVLLM_CPP_HF_DOWNLOAD=OFF` and take a local
+  checkpoint directory. A Windows source build that finds an OpenSSL links it
+  dynamically and needs its DLLs beside the executable or on `PATH`. Both are
+  recorded as owed.
 - There is no gated fetch of a REAL checkpoint from the live hub in the default
   test lane. The hermetic suites run against an in-process fake hub, and the
   one instrument that exercises a live `https` session is

@@ -120,6 +120,38 @@ class WindowsMetadataContract(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.tool.prepare_windows_metadata(args)
 
+    def test_pe_report_refuses_a_dll_that_neither_windows_nor_the_host_runtime_supplies(self) -> None:
+        """The v0.0.3-vk.1 archives imported the runner's OpenSSL, and an
+        archive carries no DLL, so the server stopped with STATUS_DLL_NOT_FOUND
+        on a host without one. cuBLAS in a CPU archive is the same failure."""
+        with tempfile.TemporaryDirectory() as temporary:
+            args = self.fixture(Path(temporary), "cpu")
+            for imports in (
+                ["KERNEL32.dll", "libssl-3-x64.dll", "libcrypto-3-x64.dll"],
+                ["KERNEL32.dll", "cublasLt64_13.dll"],
+            ):
+                report = json.loads(args.pe_report.read_text())
+                report["imports"] = imports
+                args.pe_report.write_text(json.dumps(report), encoding="utf-8")
+                with self.subTest(imports=imports), self.assertRaisesRegex(ValueError, imports[1]):
+                    self.tool.prepare_windows_metadata(args)
+
+    def test_pe_report_declares_windows_components_apart_from_the_host_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "pe.json"
+            report.write_text(json.dumps({
+                "schema": "vllm.cpp.pe-audit.v1", "machine": "8664",
+                "imports": ["kernel32.DLL", "api-ms-win-core-synch-l1-2-0.dll", "cublasLt64_13.dll"],
+                "debug_paths": [],
+            }), encoding="utf-8")
+            rows = {row["name"]: row for row in self.tool.windows_dependencies(report, "cuda")}
+            self.assertEqual(rows["kernel32.DLL"]["version"], "windows-2022")
+            self.assertEqual(rows["api-ms-win-core-synch-l1-2-0.dll"]["version"], "windows-2022")
+            self.assertEqual(rows["cublasLt64_13.dll"]["version"], "host")
+            self.assertEqual(rows["cublasLt64_13.dll"]["linkage"], "dynamic")
+            with self.assertRaisesRegex(ValueError, "cublasLt64_13"):
+                self.tool.windows_dependencies(report, "vulkan")
+
     def test_vulkan_loader_uses_wide_win32_api_and_releases_invalid_dll(self) -> None:
         source = (ROOT / "src/vt/vulkan/vulkan_loader.cpp").read_text(encoding="utf-8")
         self.assertIn("LoadLibraryW(name)", source)

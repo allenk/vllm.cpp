@@ -77,6 +77,16 @@ Blackwell, sm_120a) and comparing what ran:
   pages to the OS with `madvise` on Linux and did nothing on Windows; it now calls `VirtualUnlock`.
   Working set after loading Qwen3.6-35B-A3B NVFP4: 21.75 GiB before, 3.55 GiB after.
 
+**The Windows archives start on a host without OpenSSL.** Every `v0.0.3-vk.1` Windows archive
+(CPU, Vulkan and CUDA) imported `libssl-3-x64.dll` and `libcrypto-3-x64.dll` without carrying
+them, so `vllm-server.exe` stopped with `STATUS_DLL_NOT_FOUND` (0xC0000135) unless an OpenSSL
+happened to be on `PATH`. GitHub's Windows runner has one installed, with its `bin` on `PATH`, so
+the build linked it and every check on the runner passed. The `0.0.4-vk.1` Windows archives are
+built without the Hugging Face download: `--model` takes a local checkpoint directory, and
+`--model org/repo` is refused with a message naming the build options. Packaging now refuses a
+Windows archive that imports any DLL other than a Windows component or the backend's host runtime
+(cuBLAS for CUDA). The Linux archives and the container images keep the download.
+
 Measured with local builds of the same source and configuration as the archive (the archive itself
 is built on GitHub's Windows runner, which has no GPU). CUDA 13.2, 350 W power cap, decode tok/s,
 887-token prompt, greedy:

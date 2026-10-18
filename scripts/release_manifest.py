@@ -80,6 +80,28 @@ STABLE_SUPPLY_CHAIN_EVIDENCE = (
     "archive_checksum", "sbom", "provenance", "licenses"
 )
 
+# FORK: the DLLs Windows itself supplies to a release archive, moved here from
+# validate-release-archive.py so release_metadata.py reads the same set. The
+# API sets (api-ms-win-*, ext-ms-win-*) are Windows components too and are
+# matched by prefix where this is used; the CRT API sets are refused separately.
+WINDOWS_SYSTEM_DLLS = frozenset({
+    "ADVAPI32.DLL", "BCRYPT.DLL", "COMDLG32.DLL", "CRYPT32.DLL", "DNSAPI.DLL",
+    "GDI32.DLL", "IPHLPAPI.DLL", "KERNEL32.DLL", "NORMALIZ.DLL", "NTDLL.DLL",
+    "OLE32.DLL", "OLEAUT32.DLL", "PSAPI.DLL", "RPCRT4.DLL", "SECUR32.DLL",
+    "SETUPAPI.DLL", "SHELL32.DLL", "SHLWAPI.DLL", "USER32.DLL", "VERSION.DLL",
+    "WINMM.DLL", "WS2_32.DLL",
+})
+# FORK: what the host supplies beyond Windows, by backend: the DLLs behind the
+# external-runtime rows release_metadata.py declares (the CUDA toolkit runtime,
+# the Vulkan loader). A Windows archive carries no DLL of its own, so an import
+# in neither set is a library the build found on the runner, and the server
+# does not start without it.
+WINDOWS_HOST_RUNTIME_DLLS = {
+    "cpu": frozenset(),
+    "vulkan": frozenset({"VULKAN-1.DLL"}),
+    "cuda": frozenset({"CUDART64_13.DLL", "CUBLAS64_13.DLL", "CUBLASLT64_13.DLL"}),
+}
+
 # Current compiled CPU inventory. This is intentionally narrower than the ISA
 # names a compiler understands: a tier is listed only when a real kernel TU and
 # runtime selector exist. x86 anchors: CMakeLists.txt:912-923 and

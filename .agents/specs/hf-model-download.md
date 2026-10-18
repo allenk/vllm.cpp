@@ -535,10 +535,11 @@ more.
 | `linux-x86_64-musl-cpu-static` | none, deliberately | OFF | `scripts/build-cpu-release.sh` sets it, and the OFF configuration was built and measured at this head |
 | A developer host with no OpenSSL development files | none | OFF by downgrade | the `else()` branch warns and clears the option. Not exercised on this box, which has OpenSSL 3.0.13 |
 | macOS (`VLLM_CPP_METAL` lanes) | UNRESOLVED, owed | untested | `find_package(OpenSSL)` finds nothing without `OPENSSL_ROOT_DIR` on a Homebrew host, and the Apple branch that links `CoreFoundation` and `Security` is written from `vendor/cpp-httplib/CMakeLists.txt:186-190 @ b10451` and has never been compiled here. No Apple host was available |
-| Windows (`windows-msvc-*`) | UNRESOLVED, owed | untested | cpp-httplib has no Schannel backend, so MSVC needs an OpenSSL to point `find_package` at, and there is none on that runner. The option resolves OFF by downgrade, which is a WARNING and not a failed configure, so the lane is not expected to break |
+| Windows (`windows-msvc-*`) | none in the release archive; UNRESOLVED, owed | OFF, set by `scripts/build-windows-release.ps1` | cpp-httplib has no Schannel backend, so MSVC needs an OpenSSL to point `find_package` at. This row used to say there was none on that runner. There is: OpenSSL 3.6.5 under `C:\Program Files\OpenSSL`, with its `bin` on `PATH`, so the configure found it, the server linked `libssl-3-x64.dll` and `libcrypto-3-x64.dll`, and every check on the runner passed. A Windows archive carries no DLL (`validate-release-archive.py` refuses one), so every `v0.0.3-vk.1` Windows archive declared both in its manifest and stopped with `STATUS_DLL_NOT_FOUND` on a host without an OpenSSL. Measured on all three `v0.0.3-vk.1` archives and all three `0.0.4-vk.1` dry-run archives, `vllm-server.exe --version` with `PATH` reduced to the system directories (plus the CUDA 13.2 runtime for CUDA): exit 0xC0000135 for all six. The control is the same CPU binary with a `PATH` that happens to hold a `libssl-3-x64.dll`, which prints its version. The lane now sets the option OFF, and `release_metadata.py` refuses an import that is neither a Windows component nor the backend's host runtime |
 
-The two unresolved lanes are recorded under `## Owed`. They downgrade rather
-than fail, so neither can turn a green lane red without saying why.
+The two unresolved lanes are recorded under `## Owed`. macOS downgrades rather
+than fails, and Windows is OFF by the lane's own setting, so neither can turn a
+green lane red without saying why.
 
 **Two divergences in the cache directory, and one restored fallback.**
 `HfHubCacheDir` mirrors llama.cpp `common/hf-cache.cpp:37-63 @ b10451`,
@@ -829,9 +830,13 @@ creates the demand for the half that was not.
   `OPENSSL_ROOT_DIR` hint and its `release_macos_metadata.py` install-name rules
   checked against `libssl.dylib`. The Apple branch that links `CoreFoundation`
   and `Security` is written from upstream and has never been compiled here.
-  Windows has no Schannel backend in cpp-httplib, so MSVC needs an OpenSSL to
-  point `find_package` at. Both DOWNGRADE rather than fail, so neither turns a
-  lane red. Row `ENG-HF-MODEL-DOWNLOAD`, issue
+  Windows has no Schannel backend in cpp-httplib, so MSVC needs an OpenSSL,
+  and a Windows archive carries no DLL, so the lane needs either an OpenSSL
+  linked statically and pinned by content, or a validator taught to accept a
+  bundled `libssl`/`libcrypto` pair together with its license notice. Until
+  then the Windows release lanes set `VLLM_CPP_HF_DOWNLOAD=OFF`. macOS
+  DOWNGRADES rather than fails, so it does not turn a lane red. Row
+  `ENG-HF-MODEL-DOWNLOAD`, issue
   [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
 - **The opt-in online fetch test.** `## Gates` item 3. What exists instead is a
   one-off manual measurement of a live https session, recorded there. Row

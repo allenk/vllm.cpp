@@ -320,4 +320,16 @@ nvcc 13.3 + cl.exe + CuTe      The Windows CUDA lane had installed CUDA 13.3 sin
                                and configure refuses the combination. Reproduce a
                                new toolchain on one CuTe-only TU before a lane
                                spends hours on it.
+runner DLL in a Windows zip    The Windows runner has OpenSSL 3.6.5 installed, with
+                               its bin on PATH. find_package found it, the server
+                               linked libssl-3-x64.dll and libcrypto-3-x64.dll,
+                               and every check on the runner passed, while every
+                               v0.0.3-vk.1 Windows archive stopped with
+                               STATUS_DLL_NOT_FOUND on a host without OpenSSL.
+                               The lane sets VLLM_CPP_HF_DOWNLOAD=OFF, and
+                               release_metadata.py refuses an import that is
+                               neither a Windows component nor the backend's
+                               host runtime. Smoke a Windows archive off the
+                               runner, with PATH reduced to System32 and the
+                               CUDA runtime.
 ```

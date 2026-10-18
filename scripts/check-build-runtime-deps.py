@@ -79,9 +79,11 @@ EXEMPT_LANES = {
         "macOS. Same lane and the same recorded debt as metal_arm64"
     ),
     "cpu_windows": (
-        "Windows MSVC, and no apt. cpp-httplib has no Schannel backend, so this "
-        "lane needs an OpenSSL for find_package to point at rather than a Debian "
-        "package. Recorded UNRESOLVED under `## Owed` in "
+        "Windows MSVC, and no apt. cpp-httplib has no Schannel backend, and the "
+        "OpenSSL on the runner is a pair of DLLs the archive cannot carry, so "
+        "scripts/build-windows-release.ps1 configures VLLM_CPP_HF_DOWNLOAD=OFF "
+        "and the server refuses org/repo, as cpu_musl does. A Windows TLS lane "
+        "is recorded UNRESOLVED under `## Owed` in "
         ".agents/specs/hf-model-download.md"
     ),
     "vulkan_windows": (
