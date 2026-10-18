@@ -920,6 +920,11 @@ enum class OpId : uint8_t {
   kScaledRmsNorm,
   kSandwichRmsNorm,
   kCompiledGeluErfMul,
+  // Grouped MoE GEMM over block-wise FP8 experts (Qwen/Qwen3.6-35B-A3B-FP8):
+  // fp8-e4m3fn [N, K] bytes and an f32 [cdiv(N,bn), cdiv(K,bk)] scale grid per
+  // expert, bf16 activations. Appended before kCount so no existing op's id
+  // shifts.
+  kMoeGroupedGemmFp8Block,
   kCount
 };
 
@@ -2338,6 +2343,10 @@ using MoeGroupedGemmNvfp4Fn =
              const Tensor&, const Tensor&);
 using MoeGroupedGemmBf16Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&);
+using MoeGroupedGemmFp8BlockFn =
+    void (*)(Queue&, Tensor& /*out*/, const Tensor& /*act*/, const Tensor& /*expert_ids*/,
+             const Tensor* /*row_map*/, const Tensor& /*weight_ptrs*/,
+             const Tensor& /*scale_ptrs*/, int64_t /*block_n*/, int64_t /*block_k*/);
 // kMoeGroupedGemmBf16GateUpSilu: out[P,N] bf16 = silu(gate)*up, gate/up = grouped
 // bf16 GEMM of act[T|P,K] against per-expert weight-pointer arrays gate_ptrs/
 // up_ptrs [E] i64, expert_ids[P] i32, optional row_map[P] i32. Same convention as
@@ -3448,6 +3457,28 @@ void MoeCombinePreweighted(Queue& q, Tensor& out, const Tensor& expert_out,
 
 // Select the complete native sequence through provider availability.
 bool MoeGroupedBf16NativeAvailable(DeviceType device);
+
+// vt::MoeGroupedGemmFp8Block — grouped MoE GEMM over BLOCK-WISE FP8 experts, the
+// layout Qwen's own FP8 releases ship (`Qwen/Qwen3.6-35B-A3B-FP8`):
+//   out[p, n] = sum_k act[row(p), k] * w_e[n, k] * s_e[n / block_n, k / block_k]
+// with e = expert_ids[p] and row(p) = row_map ? row_map[p] : p. The weight bytes
+// stay the checkpoint's fp8-e4m3fn [N, K] (out x in, K contiguous); the
+// activation stays bf16, so this is W8A16: every e4m3 value is exact in bf16 and
+// f32, products accumulate in f32 per K-block, and the block scale multiplies
+// that partial sum. Upstream's sm_120 path (the Triton fused_moe kernel,
+// fp8_w8a8) also quantizes the activation to fp8 per 128-group; this op does not.
+// Registered on kCUDA; the CPU path keeps the per-expert reference loop.
+//   out          [P, N] f32 or bf16
+//   act          [*, K] bf16
+//   expert_ids   [P] i32 (device) — per-pair expert id
+//   row_map      [P] i32 (device) or nullptr — pair p -> source act row
+//   weight_ptrs  [E] i64 (device) — (uintptr_t) of expert e's fp8 [N, K] bytes
+//   scale_ptrs   [E] i64 (device) — (uintptr_t) of expert e's f32
+//                [cdiv(N, block_n), cdiv(K, block_k)] scale grid
+// K = act.shape[1], N = out.shape[1], P = out.shape[0].
+void MoeGroupedGemmFp8Block(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
+                            const Tensor* row_map, const Tensor& weight_ptrs,
+                            const Tensor& scale_ptrs, int64_t block_n, int64_t block_k);
 
 // MoeGroupedGemmNvfp4Marlin (lift of vLLM moe_wna16_marlin_gemm, ops.cu:543 —
 // the Marlin W4A16 kernel vLLM selects for the 35B's NVFP4 MoE experts). One

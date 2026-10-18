@@ -24,10 +24,17 @@ struct GdnStateCache;
 struct HfConfig;
 struct GdnLayerWeights;
 struct OwnedTensor;
+struct Qwen3_5MoeWeights;
 
 namespace v1 {
 struct GDNAttentionMetadata;
 }  // namespace v1
+
+// True exactly when MoeBlock sends a Qwen3.5/3.6 MoE checkpoint's routed
+// experts to the grouped block-FP8 device block (MoeBlockFp8BlockCuda): the
+// expert compute then stays on the device, so the decode step can be captured
+// like the fp4 blocks'. Defined in qwen3_5.cpp.
+bool MoeFp8BlockGroupedActive(const Qwen3_5MoeWeights& weights, vt::DeviceType device);
 
 // Test-only entry point (SPEC-MTP I5a): run one GDN layer's paged forward over a
 // batched step (spec or non-spec, per `meta`) and return the [T*H] output on host

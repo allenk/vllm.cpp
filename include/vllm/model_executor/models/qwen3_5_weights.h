@@ -1120,10 +1120,11 @@ struct MoeBlockWeights {
 
   // Resident MoE constants, one slot per forward path (issue #237; see
   // ResidentSlot). Exactly one is populated on a given engine — whichever path
-  // this block's experts route through — and all three die with the block.
-  ResidentSlot resident_fused;   // MoeFusedResident   (fp4 fused)
-  ResidentSlot resident_bf16;    // MoeBf16Resident    (bf16 fast)
-  ResidentSlot resident_marlin;  // MoeMarlinResident  (Marlin grouped)
+  // this block's experts route through — and all of them die with the block.
+  ResidentSlot resident_fused;      // MoeFusedResident     (fp4 fused)
+  ResidentSlot resident_bf16;       // MoeBf16Resident      (bf16 fast)
+  ResidentSlot resident_marlin;     // MoeMarlinResident    (Marlin grouped)
+  ResidentSlot resident_fp8_block;  // MoeFp8BlockResident  (block-FP8 grouped)
 };
 
 // One decoder layer: input/post norms + one attention variant + the MoE block.

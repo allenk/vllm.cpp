@@ -900,6 +900,27 @@ MoeBf16Resident& MoeBf16ResidentFor(const MoeBlockWeights* w) {
   return ResidentIn<MoeBf16Resident>(w->resident_bf16);
 }
 
+// --- Block-FP8 grouped-MoE per-layer resident constants (Qwen/Qwen3.6-35B-A3B-FP8).
+// The bf16 analog's shape with two tables per projection: each expert's fp8
+// [N,K] bytes and its f32 scale grid, as uploaded by ResidentFp8BlockPacked /
+// ResidentFp8BlockScale (the Fp8BlockWeight owns those buffers for the model
+// lifetime), plus the pair->token row map. Built once on first touch, during
+// the pre-warm forward, like MoeBf16Resident.
+struct MoeFp8BlockResident {
+  void* gate_w = nullptr;  // i64 [E] device: gate fp8 [I,H] byte ptrs
+  void* gate_s = nullptr;  // i64 [E] device: gate f32 scale-grid ptrs
+  void* up_w = nullptr;    // i64 [E] device: up   fp8 [I,H] byte ptrs
+  void* up_s = nullptr;    // i64 [E] device: up   f32 scale-grid ptrs
+  void* down_w = nullptr;  // i64 [E] device: down fp8 [H,I] byte ptrs
+  void* down_s = nullptr;  // i64 [E] device: down f32 scale-grid ptrs
+  std::unordered_map<int64_t, void*> tok_map;  // T -> i32 [T*top_k] device
+  bool ready = false;
+};
+
+MoeFp8BlockResident& MoeFp8BlockResidentFor(const MoeBlockWeights* w) {
+  return ResidentIn<MoeFp8BlockResident>(w->resident_fp8_block);
+}
+
 // Fast BF16 grouped-MoE path (Qwen3-Coder). DEFAULT ON per the parity-enablers-
 // ship-as-defaults policy: the lever the every-axis speed parity depends on ships
 // default-ON, gated, BEFORE the binding speed run. VT_MOE_BF16_FAST=0 restores the
@@ -909,6 +930,18 @@ MoeBf16Resident& MoeBf16ResidentFor(const MoeBlockWeights* w) {
 bool MoeBf16FastEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_MOE_BF16_FAST");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 rolls back
+  }();
+  return on;
+}
+
+// Grouped block-FP8 MoE (Qwen/Qwen3.6-35B-A3B-FP8), the block-FP8 sibling of
+// the switch above. DEFAULT ON; VT_MOE_FP8_BLOCK_FAST=0 restores the per-expert
+// reference loop (ExpertMlpFp8Block), the correctness oracle the grouped path is
+// gated against, for a same-binary A/B.
+bool MoeFp8BlockFastEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MOE_FP8_BLOCK_FAST");
     return !(e != nullptr && e[0] == '0');  // default ON; =0 rolls back
   }();
   return on;
@@ -7278,6 +7311,127 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   return dout;
 }
 
+// --- Grouped block-FP8 MoE block (Qwen/Qwen3.6-35B-A3B-FP8). MoeBlockBf16Cuda's
+// router, top-k, row map and combine, with the three grouped GEMMs reading the
+// experts' checkpoint bytes through vt::MoeGroupedGemmFp8Block (W8A16; ops.h).
+// It replaces the reference loop's per-expert host round trip
+// (ExpertMlpFp8Block), so nothing in the expert compute touches the host. Gate
+// and up come back bf16, as the reference loop's block GEMMs return them, and
+// the shared expert is SharedExpert's block arm.
+DBuf MoeBlockFp8BlockCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
+                          const Tensor& dh, int64_t T) {
+  const int64_t H = cfg.hidden_size;
+  const int64_t E = cfg.num_experts;
+  const int64_t top_k = cfg.num_experts_per_tok;
+  const int64_t I = cfg.moe_intermediate_size;
+  const int64_t P = T * top_k;
+
+  DBuf dlog(d, DType::kBF16, {T, E});
+  MoeRouterLogits(d, dlog.t(), dh, w.router_gate);  // logits [T,E]
+  DBuf dtw(d, DType::kF32, {T, top_k});
+  DBuf dtid(d, DType::kI32, {T, top_k});
+  vt::MoeRouterTopK(d.q, dtw.t(), dtid.t(), dlog.t(),
+                    vt::MoeRouterTopKArgs{static_cast<int>(top_k), true});
+  Tensor eids = Reshape(dtid.t(), {P});  // [P] i32 expert ids
+
+  const Fp8BlockWeight& g0 = w.expert_gate_fp8_block.front();
+  const Fp8BlockWeight& d0 = w.expert_down_fp8_block.front();
+  MoeFp8BlockResident& mr = MoeFp8BlockResidentFor(&w);
+  if (!mr.ready) {
+    VT_CHECK(static_cast<int64_t>(w.expert_gate_fp8_block.size()) == E &&
+                 static_cast<int64_t>(w.expert_up_fp8_block.size()) == E &&
+                 static_cast<int64_t>(w.expert_down_fp8_block.size()) == E,
+             "grouped block-FP8 MoE: the layer carries " +
+                 std::to_string(w.expert_gate_fp8_block.size()) + " gate, " +
+                 std::to_string(w.expert_up_fp8_block.size()) + " up and " +
+                 std::to_string(w.expert_down_fp8_block.size()) + " down experts where "
+                 "the config declares num_experts=" + std::to_string(E));
+    std::vector<int64_t> gw(static_cast<size_t>(E)), gs(static_cast<size_t>(E)),
+        uw(static_cast<size_t>(E)), us(static_cast<size_t>(E)), dw(static_cast<size_t>(E)),
+        ds(static_cast<size_t>(E));
+    for (int64_t e = 0; e < E; ++e) {
+      const size_t se = static_cast<size_t>(e);
+      const Fp8BlockWeight& g = w.expert_gate_fp8_block[se];
+      const Fp8BlockWeight& u = w.expert_up_fp8_block[se];
+      const Fp8BlockWeight& dn = w.expert_down_fp8_block[se];
+      // One block geometry per projection is what the kernel is told; the
+      // loader reads it from the single quantization_config, so a mismatch
+      // here means a weight reached this block by another route.
+      VT_CHECK(g.n == I && g.k == H && u.n == I && u.k == H && dn.n == H && dn.k == I &&
+                   g.block_n == g0.block_n && g.block_k == g0.block_k &&
+                   u.block_n == g0.block_n && u.block_k == g0.block_k &&
+                   dn.block_n == d0.block_n && dn.block_k == d0.block_k,
+               "grouped block-FP8 MoE: expert " + std::to_string(e) +
+                   " does not have the layer's shapes ([I,H] gate/up, [H,I] down) and "
+                   "block geometry");
+      gw[se] = reinterpret_cast<int64_t>(dense_fp8_block::ResidentFp8BlockPacked(d, g).data);
+      gs[se] = reinterpret_cast<int64_t>(dense_fp8_block::ResidentFp8BlockScale(d, g).data);
+      uw[se] = reinterpret_cast<int64_t>(dense_fp8_block::ResidentFp8BlockPacked(d, u).data);
+      us[se] = reinterpret_cast<int64_t>(dense_fp8_block::ResidentFp8BlockScale(d, u).data);
+      dw[se] = reinterpret_cast<int64_t>(dense_fp8_block::ResidentFp8BlockPacked(d, dn).data);
+      ds[se] = reinterpret_cast<int64_t>(dense_fp8_block::ResidentFp8BlockScale(d, dn).data);
+    }
+    const size_t eb = static_cast<size_t>(E) * sizeof(int64_t);
+    auto up_i64 = [&](const std::vector<int64_t>& h) {
+      void* p = d.b.Alloc(eb);
+      d.b.Copy(d.q, p, h.data(), eb);
+      return p;
+    };
+    mr.gate_w = up_i64(gw);
+    mr.gate_s = up_i64(gs);
+    mr.up_w = up_i64(uw);
+    mr.up_s = up_i64(us);
+    mr.down_w = up_i64(dw);
+    mr.down_s = up_i64(ds);
+    mr.ready = true;
+  }
+  auto tok_it = mr.tok_map.find(T);
+  if (tok_it == mr.tok_map.end()) {
+    std::vector<int32_t> tok_map(static_cast<size_t>(P));
+    for (int64_t p = 0; p < P; ++p)
+      tok_map[static_cast<size_t>(p)] = static_cast<int32_t>(p / top_k);
+    const size_t tb = static_cast<size_t>(P) * sizeof(int32_t);
+    void* p = d.b.Alloc(tb);
+    d.b.Copy(d.q, p, tok_map.data(), tb);
+    tok_it = mr.tok_map.emplace(T, p).first;
+  }
+  auto table = [&](void* p) { return MakeTensor(p, DType::kI64, d.q.device, {E}); };
+  const Tensor gate_w = table(mr.gate_w), gate_s = table(mr.gate_s);
+  const Tensor up_w = table(mr.up_w), up_s = table(mr.up_s);
+  const Tensor down_w = table(mr.down_w), down_s = table(mr.down_s);
+  Tensor dtok = MakeTensor(tok_it->second, DType::kI32, d.q.device, {P});
+
+  // The grouped GEMM reads bf16 activations, so an f32 hidden is cast once;
+  // the router and the shared expert take the hidden as given, as the
+  // reference loop does.
+  DBuf dh_bf16;
+  if (dh.dtype != DType::kBF16) {
+    dh_bf16 = DBuf(d, DType::kBF16, {T, H});
+    vt::CastBf16(d.q, dh_bf16.t(), dh);
+  }
+  const Tensor& xh = dh.dtype == DType::kBF16 ? dh : dh_bf16.t();
+
+  DBuf dg(d, DType::kBF16, {P, I});
+  vt::MoeGroupedGemmFp8Block(d.q, dg.t(), xh, eids, &dtok, gate_w, gate_s, g0.block_n,
+                             g0.block_k);
+  DBuf du(d, DType::kBF16, {P, I});
+  vt::MoeGroupedGemmFp8Block(d.q, du.t(), xh, eids, &dtok, up_w, up_s, g0.block_n,
+                             g0.block_k);
+  DBuf dact(d, DType::kBF16, {P, I});
+  vt::MoeSiluMul(d.q, dact.t(), dg.t(), du.t());  // silu(gate) * up -> bf16
+  DBuf ddown(d, DType::kBF16, {P, H});
+  vt::MoeGroupedGemmFp8Block(d.q, ddown.t(), dact.t(), eids, nullptr, down_w, down_s,
+                             d0.block_n, d0.block_k);
+  Tensor expert_out = Reshape(ddown.t(), {T, top_k, H});
+
+  const bool has_shared = cfg.shared_expert_intermediate_size > 0;
+  std::optional<DBuf> shared;
+  if (has_shared) shared.emplace(SharedExpert(d, w, cfg, dh, T, false));
+  DBuf dout(d, DType::kBF16, {T, H});
+  vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), has_shared ? &shared->t() : nullptr);
+  return dout;
+}
+
 // ─── VT_MOE_SEL_FP — the SELECTED-EXPERT-ID tap (MOEDIV, #2552) ──────────────
 //
 // `VT_Q4EXP_LAYER_FP` (#2547) taps VALUES, and a value tap cannot separate an
@@ -7616,6 +7770,18 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
       vt::OpRegistered(vt::OpId::kMoeGroupedGemmBf16GateUpSilu, d.q.device.type) && MoeBf16FastEnabled() &&
       !w.expert_gate.empty() && MoeBf16FastLayoutOk(w, cfg))
     return MoeBlockBf16Cuda(d, w, cfg, dh, T);
+
+  // Grouped block-FP8 MoE (Qwen/Qwen3.6-35B-A3B-FP8), the block-FP8 sibling of
+  // the bf16 arm above, chosen by the same kind of condition: block-FP8 experts,
+  // the op registered on THIS queue's device, and the switch. DEFAULT ON
+  // (VT_MOE_FP8_BLOCK_FAST); =0 falls through to the reference loop below,
+  // which stays both the fallback and the oracle the arm is gated against.
+  // MoeFp8BlockGroupedActive asks the same three questions for the decode
+  // graph, so the two must change together.
+  if (!w.expert_gate_fp8_block.empty() &&
+      vt::OpRegistered(vt::OpId::kMoeGroupedGemmFp8Block, d.q.device.type) &&
+      MoeFp8BlockFastEnabled())
+    return MoeBlockFp8BlockCuda(d, w, cfg, dh, T);
 
   // W8 (QUANT-CUDA-GATES): device-resident keep-quant grouped MoE — the GGUF
   // k-quant analog of the bf16 arm above, selected at the same site and under
@@ -10533,13 +10699,26 @@ std::vector<int32_t> Qwen3_5VLGenerateGreedyVideo(
 // path executes the identical instruction sequence it did before.
 //
 // DECODE GRAPH: `graph_decode_supported` mirrors `ForwardQwen3_5Moe`'s own
-// routing — the MoE decode graph is taken only on the fp4 CUDA path, so a bf16
-// checkpoint (`Qwen/Qwen3.6-35B-A3B`) decodes eagerly here exactly as it does in
-// production text decode.
+// routing — the MoE decode graph is taken on the fp4 CUDA path and on the
+// grouped block-FP8 path, so a bf16 checkpoint (`Qwen/Qwen3.6-35B-A3B`) decodes
+// eagerly here exactly as it does in production text decode.
+
+// Declared in qwen3_5_internal.h. True exactly when MoeBlock sends this
+// checkpoint's routed experts to MoeBlockFp8BlockCuda: resident pointer tables,
+// persistent scratch and no host round trip, so its decode step can be captured
+// as the fp4 blocks' is. The reference loop it otherwise falls back to
+// downloads the router output every step and cannot be.
+bool MoeFp8BlockGroupedActive(const Qwen3_5MoeWeights& weights, vt::DeviceType device) {
+  return !weights.layers.empty() && !weights.layers.front().moe.expert_gate_fp8_block.empty() &&
+         vt::OpRegistered(vt::OpId::kMoeGroupedGemmFp8Block, device) &&
+         MoeFp8BlockFastEnabled();
+}
+
 namespace {
-bool MoeDecodeGraphSupported(const Qwen3_5MoeWeights& weights) {
+bool MoeDecodeGraphSupported(const Qwen3_5MoeWeights& weights, vt::DeviceType device) {
   return !weights.layers.empty() &&
-         !weights.layers.front().moe.expert_gate_fp4.empty();
+         (!weights.layers.front().moe.expert_gate_fp4.empty() ||
+          MoeFp8BlockGroupedActive(weights, device));
 }
 }  // namespace
 
@@ -10554,7 +10733,7 @@ std::vector<int32_t> Qwen3_5MoeVLGenerateGreedy(
                                          grid_thw, image_token_id);
   return VLGenerateCoreGdn(d, prompt_ids, mm_main, plan.mask, plan.pos3_prefill,
                            plan.delta, eos_token_id, weights, config,
-                           max_new_tokens, MoeDecodeGraphSupported(weights));
+                           max_new_tokens, MoeDecodeGraphSupported(weights, queue.device.type));
 }
 
 std::vector<int32_t> Qwen3_5MoeVLGenerateGreedyVideo(
@@ -10570,7 +10749,7 @@ std::vector<int32_t> Qwen3_5MoeVLGenerateGreedyVideo(
                   video_token_id, vision_start_token_id, vision_end_token_id);
   return VLGenerateCoreGdn(d, prompt_ids, mm_main, plan.mask, plan.pos3_prefill,
                            plan.delta, eos_token_id, weights, config,
-                           max_new_tokens, MoeDecodeGraphSupported(weights));
+                           max_new_tokens, MoeDecodeGraphSupported(weights, queue.device.type));
 }
 
 ForwardLogits Qwen3_5DenseModel::ForwardDevice(

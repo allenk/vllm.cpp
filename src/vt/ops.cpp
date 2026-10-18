@@ -990,6 +990,42 @@ void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& 
       q, out, act, expert_ids, row_map, weight_ptrs);
 }
 
+void MoeGroupedGemmFp8Block(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
+                            const Tensor* row_map, const Tensor& weight_ptrs,
+                            const Tensor& scale_ptrs, int64_t block_n, int64_t block_k) {
+  // The bf16 grouped GEMM's rules, with a second [E] pointer table for the
+  // scale grids.
+  VT_CHECK(out.rank == 2 && act.rank == 2, "moe_grouped_gemm_fp8_block: out/act must be rank-2");
+  const int64_t p = out.shape[0];
+  VT_CHECK(act.dtype == DType::kBF16, "moe_grouped_gemm_fp8_block: act must be bf16");
+  VT_CHECK(IsOutFloat(out.dtype), "moe_grouped_gemm_fp8_block: out must be f32/bf16");
+  VT_CHECK(expert_ids.Numel() == p && expert_ids.dtype == DType::kI32,
+           "moe_grouped_gemm_fp8_block: expert_ids must be i32 [P], one per out row");
+  VT_CHECK(weight_ptrs.rank == 1 && weight_ptrs.dtype == DType::kI64,
+           "moe_grouped_gemm_fp8_block: weight_ptrs must be i64 [E] (device pointers)");
+  VT_CHECK(scale_ptrs.dtype == DType::kI64 && scale_ptrs.Numel() == weight_ptrs.Numel(),
+           "moe_grouped_gemm_fp8_block: scale_ptrs must be i64 [E], one entry per weight "
+           "pointer");
+  VT_CHECK(act.IsContiguous() && out.IsContiguous() && expert_ids.IsContiguous() &&
+               weight_ptrs.IsContiguous() && scale_ptrs.IsContiguous(),
+           "moe_grouped_gemm_fp8_block: contiguous tensors required");
+  VT_CHECK(act.device == q.device && out.device == q.device && expert_ids.device == q.device &&
+               weight_ptrs.device == q.device && scale_ptrs.device == q.device,
+           "moe_grouped_gemm_fp8_block: device mismatch");
+  if (row_map != nullptr) {
+    VT_CHECK(row_map->Numel() == p && row_map->dtype == DType::kI32 && row_map->IsContiguous() &&
+                 row_map->device == q.device,
+             "moe_grouped_gemm_fp8_block: row_map must be contiguous i32 [P] on the queue "
+             "device");
+  }
+  VT_CHECK(block_n > 0 && block_k > 0,
+           "moe_grouped_gemm_fp8_block: block_n and block_k must be positive");
+  reinterpret_cast<MoeGroupedGemmFp8BlockFn>(
+      GetOp(OpId::kMoeGroupedGemmFp8Block, q.device.type))(q, out, act, expert_ids, row_map,
+                                                           weight_ptrs, scale_ptrs, block_n,
+                                                           block_k);
+}
+
 namespace {
 void ValidateMoeGroupedGemmBf16GateUpSilu(Queue& q, const Tensor& out, const Tensor& act,
                                   const Tensor& expert_ids, const Tensor* row_map,
