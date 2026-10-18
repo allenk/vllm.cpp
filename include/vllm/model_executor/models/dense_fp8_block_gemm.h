@@ -238,15 +238,20 @@ inline Tensor ResidentFp8BlockPacked(DevT d, const Fp8BlockWeight& w) {
   // (`ResidentFp8BlockMerged`); the split arm did not, and the loader's own
   // check (`dense_weight_loaders.h::LoadFp8BlockRaw`) does not cover a weight
   // that reached this seam by another route.
-  VT_CHECK(w.packed.bytes.size() ==
-               static_cast<size_t>(w.n) * static_cast<size_t>(w.k),
-           "block-wise FP8: the packed weight carries " +
-               std::to_string(w.packed.bytes.size()) + " bytes where its [" +
-               std::to_string(w.n) + ", " + std::to_string(w.k) +
-               "] shape needs exactly one fp8-e4m3fn byte per element, " +
-               std::to_string(static_cast<size_t>(w.n) *
-                              static_cast<size_t>(w.k)));
+  //
+  // Asserted when the bytes are STAGED, before the first view exists. After
+  // that the device copy is the weight and the host mirror may have been
+  // released (the grouped block-FP8 MoE block frees the routed experts'), so
+  // the host byte count says nothing any more.
   if (!w.d_packed) {
+    VT_CHECK(w.packed.bytes.size() ==
+                 static_cast<size_t>(w.n) * static_cast<size_t>(w.k),
+             "block-wise FP8: the packed weight carries " +
+                 std::to_string(w.packed.bytes.size()) + " bytes where its [" +
+                 std::to_string(w.n) + ", " + std::to_string(w.k) +
+                 "] shape needs exactly one fp8-e4m3fn byte per element, " +
+                 std::to_string(static_cast<size_t>(w.n) *
+                                static_cast<size_t>(w.k)));
     const size_t pb = w.packed.bytes.size();
     void* p = d.b.Alloc(pb);
     d.b.Copy(d.q, p, w.packed.bytes.data(), pb);

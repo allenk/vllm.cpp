@@ -7383,6 +7383,30 @@ DBuf MoeBlockFp8BlockCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
     mr.up_s = up_i64(us);
     mr.down_w = up_i64(dw);
     mr.down_s = up_i64(ds);
+
+    // HOST-MIRROR RELEASE, the bf16 block's mechanism and policy: the routed
+    // experts are nearly the whole checkpoint (about 30 of the 35B FP8
+    // release's 35 GB), and once ResidentFp8BlockPacked has staged them nothing
+    // reads their host bytes again. That function always copies, so the device
+    // buffer is never an alias of the host one. The scale grids are a few KB
+    // per expert and stay. Synchronize first: the H2D copies are stream-async.
+    // VT_MOE_HOST_FREE=0 keeps the host copies for a peak-memory A/B.
+    static const bool host_free_on = [] {
+      const char* e = std::getenv("VT_MOE_HOST_FREE");
+      return !(e != nullptr && e[0] == '0');
+    }();
+    if (vllm::platforms::ShouldReleaseHostWeights(
+            vllm::platforms::GetPlatform(d.q.device.type).residency_policy(),
+            /*committed_compute_path=*/MoeFp8BlockFastEnabled(),
+            /*host_free_env=*/host_free_on)) {
+      d.b.Synchronize(d.q);
+      for (int64_t e = 0; e < E; ++e) {
+        const size_t se = static_cast<size_t>(e);
+        w.expert_gate_fp8_block[se].packed.ReleaseHost();
+        w.expert_up_fp8_block[se].packed.ReleaseHost();
+        w.expert_down_fp8_block[se].packed.ReleaseHost();
+      }
+    }
     mr.ready = true;
   }
   auto tok_it = mr.tok_map.find(T);
