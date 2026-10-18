@@ -64,6 +64,7 @@
 #include <unordered_map>
 
 #include "vt/cuda/graph_safe_scratch.h"
+#include "vt/cuda/fa2_head_dims.h"
 #include "vt/ops.h"
 
 namespace vt::cuda {
@@ -199,13 +200,25 @@ void MlaPrefillAttentionCuda(Queue& q, Tensor& out, Tensor* lse, const Tensor& q
   // columns are sliced back off. For DeepSeek/GLM `d_pad == dqk`, so Q/K pass
   // through natively and only V is padded — byte-identical to before; only
   // MiniCPM3 (dqk 96 -> 128) also pads Q/K.
-  int64_t d_pad;
-  if (dqk <= 128) d_pad = 128;
-  else if (dqk <= 192) d_pad = 192;
-  else if (dqk <= 256) d_pad = 256;
-  else
+  // "Compiled" is this build's: a profile may leave a dim out
+  // (VLLM_CPP_FA2_HEAD_DIMS), and MLA prefill has no other kernel to fall back
+  // to, so it pads to the next dim the build has and refuses when there is none.
+  int64_t d_pad = 0;
+  for (const int64_t cand : {int64_t{128}, int64_t{192}, int64_t{256}}) {
+    if (dqk <= cand && Fa2HeadDimBuilt(cand)) {
+      d_pad = cand;
+      break;
+    }
+  }
+  if (d_pad == 0) {
+    if (dqk > 256)
+      throw std::runtime_error(
+          "cuda mla_prefill_attention: qk_head_dim > 256 has no FA-2 instantiation");
     throw std::runtime_error(
-        "cuda mla_prefill_attention: qk_head_dim > 256 has no FA-2 instantiation");
+        "cuda mla_prefill_attention: this build compiled no FA-2 head dim of 128, 192 or "
+        "256 at or above qk_head_dim " + std::to_string(dqk) +
+        " (VLLM_CPP_FA2_HEAD_DIMS), and MLA prefill has no other kernel");
+  }
   const bool pad_qk = (dqk != d_pad);
 
   // Workspace: padded V [total_k, heads, d_pad] + padded output

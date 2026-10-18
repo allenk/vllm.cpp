@@ -18,6 +18,7 @@
 
 #include "vt/cuda/cuda_embedding_quant.h"  // the KGATHER seam: block-table gather + its error record
 #include "vt/cuda/rmsnorm_decode_fast.h"
+#include "vt/cuda/fa2_head_dims.h"
 #include "vt/ops.h"
 #include "vt/dflash_attn_grid.h"
 #include "vt/dflash_attn_mask.h"
@@ -3699,7 +3700,8 @@ void AttentionDenseFa2KernelCuda(Queue& q, Tensor& out, const Tensor& query, con
   const int64_t fa2_d = query.shape[2];
   const bool fa2_shape = query.dtype == DType::kBF16 && key.dtype == DType::kBF16 &&
                          value.dtype == DType::kBF16 && out.dtype == DType::kBF16 &&
-                         (fa2_d == 64 || fa2_d == 128) && key.shape[1] == query.shape[1] &&
+                         (fa2_d == 64 || fa2_d == 128) && Fa2HeadDimBuilt(fa2_d) &&
+                         key.shape[1] == query.shape[1] &&
                          value.shape[1] == query.shape[1] && !args.causal;
   if (fa2_shape && Fa2DenseEnabled()) {
     // args.causal is false here (fa2_shape requires !args.causal); it is threaded

@@ -500,6 +500,9 @@ target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
 vllm_cpp_add_test(test_cuda_arch_manifest
   vllm/platforms/test_cuda_arch_manifest.cpp)
+# The FA2 head-dim case reads src/vt/cuda/fa2_head_dims.h, the vt gates' copy of
+# VLLM_CPP_FA2_HEAD_DIMS, beside the generated platform manifest.
+target_include_directories(test_cuda_arch_manifest PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_device_selection
   vllm/entrypoints/test_device_selection.cpp)
 # ENG-EXPERT-STREAM #1123: the load-time GGUF device-fit refusal, in two targets

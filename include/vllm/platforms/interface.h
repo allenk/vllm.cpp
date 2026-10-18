@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -452,6 +453,16 @@ class Platform {
   // every other platform: base false — exactly what `device==kCUDA` answered. A
   // future accelerator with a bf16 flash-attention kernel answers true.
   virtual bool supports_fa2_attention() const { return false; }
+
+  // Was the fused flash-attention-2 path built for THIS head dim? A build
+  // profile can compile a subset (VLLM_CPP_FA2_HEAD_DIMS), so a model asks for
+  // its own head dim beside supports_fa2_attention() before presenting bf16
+  // attention operands. CUDA answers from the compiled manifest; every other
+  // platform: false, as for supports_fa2_attention().
+  virtual bool supports_fa2_head_dim(int64_t head_dim) const {
+    (void)head_dim;
+    return false;
+  }
 
   // interface.py:181-187 supported_dtypes. The FIRST entry is the default
   // fallback for the platform ("auto" dtype resolution).

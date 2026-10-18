@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "vt/cuda/cuda_device_caps.h"
+#include "vt/cuda/fa2_head_dims.h"
 #include "vt/ops.h"
 #include "vt/paged_attn_route.h"
 
@@ -2834,7 +2835,8 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
       block_size % 16 == 0 && block_table.stride[1] == 1 &&
       std::is_same<TQ, __nv_bfloat16>::value &&
       std::is_same<TKV, __nv_bfloat16>::value && out.dtype == DType::kBF16;
-  const bool fa2_spec_verify = fa2_spec_common && d == 256 && args.causal &&
+  const bool fa2_spec_verify = fa2_spec_common && d == 256 && Fa2HeadDimBuilt(256) &&
+                               args.causal &&
                                !args.window_size.has_value() &&
                                (fa2_decode_r4 || fa2_decode_r6 || fa2_decode_r8) &&
                                Fa2SpecDecodeEnabled();
@@ -2854,7 +2856,8 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   const bool fa2_dflash_window_ok =
       !args.window_size.has_value() ||
       (args.causal && args.window_size->left >= 0 && args.window_size->right == 0);
-  const bool fa2_dflash_block = fa2_spec_common && d == 128 && num_kv_heads > 0 &&
+  const bool fa2_dflash_block = fa2_spec_common && d == 128 && Fa2HeadDimBuilt(128) &&
+                                num_kv_heads > 0 &&
                                 hq % num_kv_heads == 0 && fa2_dflash_window_ok &&
                                 Fa2DflashBlockEnabled();
   const bool fa2_spec_decode = fa2_spec_verify || fa2_dflash_block;
@@ -2960,8 +2963,9 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   // TTFT lever — vLLM runs Qwen3 prefill on the same flash_attn_varlen_func FA2
   // family (VT_FA2_PREFILL_QWEN3). The d128 arm is scoped to head_dim 128 (only
   // Qwen3-dense; the gate models are d256) so it can NEVER touch the d256 arm.
-  const bool fa2_prefill_d256 = d == 256 && Fa2PrefillEnabled();
-  const bool fa2_prefill_qwen3 = d == 128 && num_kv_heads > 0 && hq % num_kv_heads == 0 &&
+  const bool fa2_prefill_d256 = d == 256 && Fa2HeadDimBuilt(256) && Fa2PrefillEnabled();
+  const bool fa2_prefill_qwen3 = d == 128 && Fa2HeadDimBuilt(128) && num_kv_heads > 0 &&
+                                 hq % num_kv_heads == 0 &&
                                  (!args.window_size.has_value()) && Fa2PrefillQwen3Enabled();
   const bool fa2_prefill = is_prefill && (fa2_prefill_d256 || fa2_prefill_qwen3) &&
                            std::is_same<TQ, __nv_bfloat16>::value &&
@@ -2975,6 +2979,7 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   // The LaunchDecodeFA2Bf16 body is generic in groups/heads; only these gates
   // and the model-side dtype selection need the ratio widened.
   const bool fa2_decode = !is_prefill && num_tokens == num_reqs && d == 256 &&
+                          Fa2HeadDimBuilt(256) &&
                           block_size % 16 == 0 && args.causal &&
                           !args.window_size.has_value() &&
                           block_table.stride[1] == 1 &&
@@ -2987,6 +2992,7 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   // head_dim-128 paged causal pure-decode (only Qwen3-dense hits this; the two
   // gate models are d256) so it can never engage the d256 arms. OPT-IN.
   const bool fa2_decode_qwen3 = !is_prefill && num_tokens == num_reqs && d == 128 &&
+                                Fa2HeadDimBuilt(128) &&
                                 block_size % 16 == 0 && args.causal &&
                                 !args.window_size.has_value() &&
                                 block_table.stride[1] == 1 &&
