@@ -3479,6 +3479,8 @@ vllm_cpp_add_test(test_ops_attention vt/test_ops_attention.cpp)
 # byte-exact scalar kernel, full-key-range coverage, fall-through totality, and the
 # VT_FA2_DENSE A/B knob. CUDA-only content; skips cleanly on a CPU box.
 vllm_cpp_add_test(test_ops_attention_dense_fa2 vt/test_ops_attention_dense_fa2.cpp)
+# Reads src/vt/cuda/fa2_head_dims.h to expect FA-2 only where the build has it.
+target_include_directories(test_ops_attention_dense_fa2 PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # vt::AttentionCross, DIRECTLY, on every backend that registers it. Its own
 # target rather than more cases in test_ops_attention or test_ltx2_device, both
 # of which carry recorded baselines. It exists because the CUDA kernel's whole
@@ -3566,6 +3568,8 @@ target_include_directories(test_ops_conv3d PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_attn_relpos vt/test_ops_attn_relpos.cpp)
 target_include_directories(test_ops_attn_relpos PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
+# Reads src/vt/cuda/fa2_head_dims.h to expect FA-2 only where the build has it.
+target_include_directories(test_ops_paged_attn PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-DFLASH2 W10 (#1857): the host lane-classification seam of the CUDA
 # paged-attention dispatch (include/vt/paged_attn_route.h).
 vllm_cpp_add_test(test_paged_attn_route vt/test_paged_attn_route.cpp)

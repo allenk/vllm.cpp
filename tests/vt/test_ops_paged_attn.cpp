@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "vt/backend.h"
+#include "vt/cuda/fa2_head_dims.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -1629,12 +1630,15 @@ Fa2DecodeRunStats RunFa2DecodeCase(Fa2DecodeCase& c, const char* toggle,
       vt::cuda::testing::Fa2DecodeSplitLaunchesForTesting(),
       vt::cuda::testing::Fa2DecodeNoSplitLaunchesForTesting()};
   vt::cuda::testing::DisableFa2DecodeDebugCounters();
+  // A head dim left out of VLLM_CPP_FA2_HEAD_DIMS has no FA-2 kernel, and the
+  // gate takes the paged fallback instead.
+  const bool fa2 = expect_fa2 && vt::cuda::Fa2HeadDimBuilt(c.d);
   CheckBf16AgainstReference(got, c.Reference(c.seq_lens, window),
-                            expect_fa2 ? "FA2 decode" : "paged fallback");
-  CHECK(stats.launches == (expect_fa2 ? 1U : 0U));
+                            fa2 ? "FA2 decode" : "paged fallback");
+  CHECK(stats.launches == (fa2 ? 1U : 0U));
   CHECK(stats.split_launches + stats.no_split_launches == stats.launches);
   CHECK(vt::cuda::testing::Fa2DecodeScratchShapeCountForTesting(
-            guard.q.device.index, guard.q.handle) == (expect_fa2 ? 1U : 0U));
+            guard.q.device.index, guard.q.handle) == (fa2 ? 1U : 0U));
   return stats;
 }
 
@@ -1686,12 +1690,14 @@ Fa2DecodeRunStats RunFa2VarlenDecodeCase(Fa2DecodeCase& c, const char* toggle,
       vt::cuda::testing::Fa2DecodeNoSplitLaunchesForTesting(),
       vt::cuda::testing::Fa2DecodeSwapLaunchesForTesting()};
   vt::cuda::testing::DisableFa2DecodeDebugCounters();
+  // As in RunFa2DecodeCase: no FA-2 kernel for a head dim the build left out.
+  const bool fa2 = expect_fa2 && vt::cuda::Fa2HeadDimBuilt(c.d);
   CheckBf16AgainstReference(got, c.Reference(c.seq_lens),
-                            expect_fa2 ? "FA2 varlen decode d128" : "paged fallback");
-  CHECK(stats.launches == (expect_fa2 ? 1U : 0U));
+                            fa2 ? "FA2 varlen decode d128" : "paged fallback");
+  CHECK(stats.launches == (fa2 ? 1U : 0U));
   // The swap grid MUST have engaged (or not) as expected — a plain-path fallback
   // that still matched the reference would otherwise pass the port vacuously.
-  CHECK(stats.swap_launches == (expect_swap ? 1U : 0U));
+  CHECK(stats.swap_launches == (expect_swap && fa2 ? 1U : 0U));
   if (out_bits != nullptr) *out_bits = std::move(got);
   return stats;
 }
@@ -1881,13 +1887,15 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode num_splits cap engages a
       Fa2DecodeCase c(ratio.first, ratio.second, lengths,
                       7500U + static_cast<uint32_t>(batch * 31), /*capacity_blocks=*/0,
                       /*head_dim=*/128);
+      // Without the d128 kernel every arm is the fallback and launches nothing.
+      const uint64_t one = vt::cuda::Fa2HeadDimBuilt(128) ? 1U : 0U;
 
       // Uncapped (default OFF) with swap ON: the long context splits.
       std::vector<uint16_t> uncapped;
       const Fa2DecodeRunStats base = RunFa2VarlenDecodeCase(
           c, "1", /*expect_fa2=*/true, /*swap_toggle=*/"1", /*expect_swap=*/true,
           &uncapped, /*nsplits_cap=*/nullptr);
-      CHECK(base.split_launches == 1U);
+      CHECK(base.split_launches == one);
       CHECK(base.no_split_launches == 0U);
 
       // Cap to 1: the same launch collapses onto the no-split kernel, and the
@@ -1897,7 +1905,7 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode num_splits cap engages a
           c, "1", /*expect_fa2=*/true, /*swap_toggle=*/"1", /*expect_swap=*/true,
           &capped1, /*nsplits_cap=*/"1");
       CHECK(cap1.split_launches == 0U);
-      CHECK(cap1.no_split_launches == 1U);
+      CHECK(cap1.no_split_launches == one);
 
       // Cap to 2: a DIFFERENT split count than the uncapped heuristic, still
       // splitting and still correct — near-ties the uncapped output (the cap is a
@@ -1906,7 +1914,7 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode num_splits cap engages a
       const Fa2DecodeRunStats cap2 = RunFa2VarlenDecodeCase(
           c, "1", /*expect_fa2=*/true, /*swap_toggle=*/"1", /*expect_swap=*/true,
           &capped2, /*nsplits_cap=*/"2");
-      CHECK(cap2.split_launches == 1U);
+      CHECK(cap2.split_launches == one);
       REQUIRE(uncapped.size() == capped2.size());
       double max_abs = 0.0;
       for (size_t i = 0; i < uncapped.size(); ++i) {
@@ -2053,9 +2061,10 @@ Fa2DecodeRunStats RunFa2SpecDecodeCase(Fa2DecodeCase& c, const char* toggle,
       vt::cuda::testing::Fa2DecodeNoSplitLaunchesForTesting(),
       vt::cuda::testing::Fa2DecodeSwapLaunchesForTesting()};
   vt::cuda::testing::DisableFa2DecodeDebugCounters();
+  const bool fa2 = expect_fa2 && vt::cuda::Fa2HeadDimBuilt(c.d);
   CheckBf16AgainstReference(got, c.Reference(c.seq_lens),
-                            expect_fa2 ? "FA2 spec-as-decode" : "prefill-lane route");
-  CHECK(stats.launches == (expect_fa2 ? 1U : 0U));
+                            fa2 ? "FA2 spec-as-decode" : "prefill-lane route");
+  CHECK(stats.launches == (fa2 ? 1U : 0U));
   // The spec lane is the PLAIN (non-swapped) presentation: a swap row is a head
   // group, and a causal mask across head groups would be wrong.
   CHECK(stats.swap_launches == 0U);
