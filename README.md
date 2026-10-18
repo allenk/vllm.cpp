@@ -114,12 +114,12 @@ Vulkan archive uses the Vulkan loader the GPU driver installs, and is started wi
 `hf download Qwen/Qwen3.5-2B --local-dir D:\models\Qwen3.5-2B`, then
 `vllm-server.exe --model D:\models\Qwen3.5-2B --device cuda --port 8000`.
 
-**Known issue in `0.0.4-vk.1`: GGUF checkpoints decode slowly on the Vulkan archives.** Vulkan has no
-quantized GEMM in this release, so the GGUF loader expands every weight to bf16, and it does so in
-the [K, N] orientation, while Vulkan's decode GEMV reads [N, K] rows only. Decode then falls to the
-scalar matmul: Qwen3.5-2B Q8_0 decodes at about 4 tok/s on an RTX PRO 6000, where the same model as
-safetensors decodes at about 134. Safetensors checkpoints, and the CPU and CUDA archives, are not
-affected.
+**GGUF on the Vulkan archives expands to bf16.** Vulkan has no quantized GEMM in this release, so
+the loader expands every GGUF weight to bf16 at load, and a checkpoint needs its bf16 size in device
+memory: about 1.9 times a Q8_0 file, 3.3 to 3.6 times a 4-bit one. The expansion keeps the file's
+[N, K] order, the one Vulkan's decode GEMV reads, and Qwen3.5-2B Q8_0 decodes at about 200 tok/s on
+an idle RTX PRO 6000. Earlier builds transposed the weights to [K, N], which sent every decode matmul
+to the scalar kernel: about 4 tok/s for the same model. `VT_GGUF_EXPAND_NK=0` reproduces that load.
 
 **Block-FP8 activation quant, on every platform.** The quant in front of each 128x128 block-FP8
 GEMM gave a whole 128-wide group to one thread; it now splits the group across 16 lanes, as
