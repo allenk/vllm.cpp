@@ -222,6 +222,12 @@ bool GgufQuantComputeAvailable(vt::DeviceType dev);
 // the default follows it with no edit here.
 bool GgufNvfp4ComputeAvailable(vt::DeviceType dev);
 
+// True for a device that should get `GgufLoadPolicy::expand_nk` even when it
+// keeps no quantized weight. Vulkan only: its decode GEMV serves the [N, K]
+// operand alone, so a transposed expansion leaves every M=1 matmul on the
+// scalar kernel. Other devices keep expand_nk on the keep-quant condition.
+bool GgufExpandNkWithoutKeepQuant(vt::DeviceType dev);
+
 // Whether the CIQ G7 i8mm repack-at-load applies to THIS load (#2406).
 //
 // `vt::cpu::QuantRepackActive()` is a pure HOST-ISA probe: it answers whether
@@ -298,7 +304,10 @@ struct GgufLoadPolicy {
   // result is bit-identical to the transposed load. It is tied to the same
   // availability condition as keep_quant (and forced off by cpu_ref) because
   // on a device whose GEMM is not that shared kernel — cuBLASLt picks its algo
-  // from the operand layout — orientation is NOT numerically free.
+  // from the operand layout — orientation is NOT numerically free. Vulkan is
+  // the exception (GgufExpandNkWithoutKeepQuant): there the transposed load
+  // costs the decode GEMV, and [N, K] is the layout its safetensors loads
+  // already run. VT_GGUF_EXPAND_NK=0 restores the transposed load.
   bool expand_nk = false;
   // L6 — keep-f16 residency (OPT-IN, VT_GGUF_KEEP_F16=1; default OFF). An F16
   // matmul weight (and the F16 embedding table) STAYS F16 resident in the file's
@@ -314,8 +323,10 @@ struct GgufLoadPolicy {
   // bf16 buffer for equal-size file-backed f16 pages (RSS-neutral, -52 MB) while
   // moving the f16 first-touch faults into the timed prefill (TTFT regresses
   // below the llama.cpp floor). The remaining RSS gap is the engine's anonymous
-  // activation/KV workspace, not weights. It rides expand_nk (CPU-only, off under
-  // cpu_ref). See docs/BENCHMARKS.md and the leaf spec §L6.
+  // activation/KV workspace, not weights. Its default rides keep_quant's
+  // condition (off under cpu_ref), not expand_nk, so Vulkan's orientation
+  // default does not also turn on f16 residency there. See docs/BENCHMARKS.md
+  // and the leaf spec §L6.
   bool keep_f16 = false;
   // `QUANT-GGUF-NVFP4` column C — native fp4 residency. An NVFP4 matmul/expert
   // weight is repacked at load into the NVFP4 GEMM's operand pair instead of
@@ -367,7 +378,10 @@ struct GgufLoadPolicy {
   // weight view it. Only possible when the head expands in the file's own
   // [N, K] order (expand_nk), because that is the case in which the head's bytes
   // are elementwise IDENTICAL to the embedding table's; the transposing
-  // Matmul-B path builds genuinely different bytes and shares nothing.
+  // Matmul-B path builds genuinely different bytes and shares nothing. The
+  // default stays on the keep-quant condition, so Vulkan's expand_nk default
+  // does not turn it on: there the shared host buffer stayed resident after
+  // upload while the device held two copies anyway.
   bool share_tied_head = false;
   // GDN split-projection orientation (CPU prefill lever, 2026-07-23). The GDN
   // linear-attention layers' expanded in_proj_qkv / in_proj_z / in_proj_b /

@@ -89,6 +89,10 @@ bool GgufNvfp4ComputeAvailable(vt::DeviceType dev) {
   return vt::OpRegistered(vt::OpId::kMatmulNvfp4, dev);
 }
 
+bool GgufExpandNkWithoutKeepQuant(vt::DeviceType dev) {
+  return dev == vt::DeviceType::kVULKAN;
+}
+
 // #2406. See the header for why `host_repack_active` is a parameter and not a
 // call. The device term is the whole fix: everything else here is the
 // pre-existing expression, so on `dev == kCPU` this is character-for-character
@@ -432,8 +436,14 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(
   p.keep_quant = EnvOnOr("VT_GGUF_KEEP_QUANT", GgufQuantComputeAvailable(dev));
   // The orientation win rides the same availability condition, and the oracle
   // switch turns it off with everything else so VT_CPU_REF=1 reproduces the
-  // historical load byte for byte.
-  p.expand_nk = p.keep_quant && !p.cpu_ref;
+  // historical load byte for byte. Vulkan takes it without keep-quant too: its
+  // decode GEMV serves only the [N, K] operand, so the transposed expansion
+  // sends every M=1 matmul to the scalar kernel (Qwen3.5-2B Q8_0 decode 4.2
+  // tok/s, against 134 for the same model from safetensors, which loads
+  // [N, K]). VT_GGUF_EXPAND_NK=0 restores the transposed load for an A/B.
+  p.expand_nk = EnvOnOr("VT_GGUF_EXPAND_NK",
+                        p.keep_quant || GgufExpandNkWithoutKeepQuant(dev)) &&
+                !p.cpu_ref;
   // L6 keep-f16 — now DEFAULT ON (L7, 2026-07-23). Keeps an F16 file weight
   // resident as F16 (mmap-borrowed) and computes on it natively, instead of the
   // load-time expansion to a bf16 anonymous buffer. Mirrors llama.cpp, which keeps
@@ -493,9 +503,12 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(
   //     first. See .agents/specs/oracle-llamacpp-repin-stock.md, row 12.
   //
   // VT_GGUF_KEEP_F16=0 opts out. ROCm requires explicit model values; other
-  // backends retain their expand_nk prerequisite. VT_CPU_REF always expands.
+  // backends keep the keep-quant prerequisite, which is what expand_nk was
+  // before Vulkan took [N, K] on its own: that orientation default is not a
+  // measurement of f16 residency on Vulkan. VT_CPU_REF always expands.
   const bool f16_available = RequiresF16ValueDType(dev)
-      ? p.weight_value_dtype.has_value() && !p.cpu_ref : p.expand_nk;
+      ? p.weight_value_dtype.has_value() && !p.cpu_ref
+      : p.keep_quant && !p.cpu_ref;
   p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", f16_available) && f16_available;
   // `QUANT-GGUF-NVFP4` column C. Same shape as the keep-quant default: ON
   // wherever the running device can execute the NVFP4 GEMM (CUDA today; a CPU
@@ -529,7 +542,11 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(
   // environment-only run resolves byte-for-byte as before. `VT_CPU_REF` still wins
   // over both: the oracle switch is not a residency preference.
   p.mmap_residency = ResolveGgufMmap(p.keep_quant || p.keep_f16) && !p.cpu_ref;
-  const bool share_available = p.expand_nk || p.keep_f16;
+  // The tied-head share keeps the keep-quant condition. Vulkan's expand_nk
+  // default does not bring it along: there the shared bf16 vocab matrix stayed
+  // resident on the host after upload (+0.95 GiB private on Qwen3.5-2B Q8_0)
+  // while the device still held both copies.
+  const bool share_available = (p.expand_nk && p.keep_quant) || p.keep_f16;
   p.share_tied_head = EnvOnOr("VT_GGUF_SHARE_TIED_HEAD", share_available) && share_available;
   // GDN split-projection orientation. Rides expand_nk (so VT_CPU_REF=1
   // reproduces the historical transpose); VT_GGUF_GDN_NK=0 is the narrow

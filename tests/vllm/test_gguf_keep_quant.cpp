@@ -1198,6 +1198,49 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
   ::unsetenv("VT_GGUF_KEEP_QUANT");
 }
 
+// Vulkan's decode GEMV serves only the [N, K] operand, so a transposed expansion
+// runs every M=1 matmul on the scalar kernel. The orientation default there does
+// not wait for keep-quant; keep-f16 and the tied-head share still do, and both
+// the oracle switch and VT_GGUF_EXPAND_NK=0 restore the transposed load. Every
+// other device keeps the orientation on the keep-quant condition.
+TEST_CASE("GgufLoadPolicy::FromEnv keeps [N, K] on Vulkan without keep-quant") {
+  for (const char* v : {"VT_CPU_REF", "VT_GGUF_EXPAND_NK", "VT_GGUF_KEEP_F16",
+                        "VT_GGUF_GDN_NK", "VT_GGUF_SHARE_TIED_HEAD"}) {
+    ::unsetenv(v);
+  }
+  ::setenv("VT_GGUF_KEEP_QUANT", "0", 1);
+  CHECK(vllm::GgufExpandNkWithoutKeepQuant(vt::DeviceType::kVULKAN));
+  {
+    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv(vt::DeviceType::kVULKAN);
+    CHECK_FALSE(p.keep_quant);
+    CHECK(p.expand_nk);
+    CHECK(p.gdn_expand_nk);
+    CHECK_FALSE(p.share_tied_head);
+    CHECK_FALSE(p.keep_f16);
+    CHECK(p.Route(vllm::GgufTensorInfo{"w", {8, 256}, kQ4_K, nullptr, 0},
+                  GgufTensorRole::kMatmulWeight) == GgufResidency::kExpandBf16);
+  }
+  for (vt::DeviceType d : {vt::DeviceType::kCPU, vt::DeviceType::kCUDA,
+                           vt::DeviceType::kROCM, vt::DeviceType::kMETAL,
+                           vt::DeviceType::kTENSTORRENT}) {
+    CAPTURE(std::string(vt::DeviceTypeName(d)));
+    CHECK_FALSE(vllm::GgufExpandNkWithoutKeepQuant(d));
+    CHECK_FALSE(GgufLoadPolicy::FromEnv(d).expand_nk);
+  }
+  ::setenv("VT_GGUF_EXPAND_NK", "0", 1);
+  {
+    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv(vt::DeviceType::kVULKAN);
+    CHECK_FALSE(p.expand_nk);
+    CHECK_FALSE(p.gdn_expand_nk);
+    CHECK_FALSE(p.share_tied_head);
+  }
+  ::unsetenv("VT_GGUF_EXPAND_NK");
+  ::setenv("VT_CPU_REF", "1", 1);
+  CHECK_FALSE(GgufLoadPolicy::FromEnv(vt::DeviceType::kVULKAN).expand_nk);
+  ::unsetenv("VT_CPU_REF");
+  ::unsetenv("VT_GGUF_KEEP_QUANT");
+}
+
 // The default is only correct if it means "a block weight has a consumer". On
 // this CPU test binary the quantized GEMM IS registered, so the availability
 // probe must say so — otherwise the flip above would be vacuous.
