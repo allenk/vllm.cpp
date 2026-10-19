@@ -302,6 +302,8 @@ const char* OpNameImpl(OpId op) {
       return "CompiledGeluErfMul";
     case OpId::kMoeGroupedGemmFp8Block:
       return "MoeGroupedGemmFp8Block";
+    case OpId::kMoeGroupedGemmFp8BlockGateUpSilu:
+      return "MoeGroupedGemmFp8BlockGateUpSilu";
     case OpId::kSiluAndMul:
       return "SiluAndMul";
     case OpId::kRopeNeox:

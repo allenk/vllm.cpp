@@ -925,6 +925,10 @@ enum class OpId : uint8_t {
   // expert, bf16 activations. Appended before kCount so no existing op's id
   // shifts.
   kMoeGroupedGemmFp8Block,
+  // kMoeGroupedGemmFp8Block for a gate and an up table in one launch, with the
+  // SwiGLU between them fused (decode). Appended before kCount so no existing
+  // op's id shifts.
+  kMoeGroupedGemmFp8BlockGateUpSilu,
   kCount
 };
 
@@ -2347,6 +2351,11 @@ using MoeGroupedGemmFp8BlockFn =
     void (*)(Queue&, Tensor& /*out*/, const Tensor& /*act*/, const Tensor& /*expert_ids*/,
              const Tensor* /*row_map*/, const Tensor& /*weight_ptrs*/,
              const Tensor& /*scale_ptrs*/, int64_t /*block_n*/, int64_t /*block_k*/);
+using MoeGroupedGemmFp8BlockGateUpSiluFn =
+    void (*)(Queue&, Tensor& /*out*/, const Tensor& /*act*/, const Tensor& /*expert_ids*/,
+             const Tensor* /*row_map*/, const Tensor& /*gate_ptrs*/,
+             const Tensor& /*gate_scale_ptrs*/, const Tensor& /*up_ptrs*/,
+             const Tensor& /*up_scale_ptrs*/, int64_t /*block_n*/, int64_t /*block_k*/);
 // kMoeGroupedGemmBf16GateUpSilu: out[P,N] bf16 = silu(gate)*up, gate/up = grouped
 // bf16 GEMM of act[T|P,K] against per-expert weight-pointer arrays gate_ptrs/
 // up_ptrs [E] i64, expert_ids[P] i32, optional row_map[P] i32. Same convention as
@@ -3479,6 +3488,25 @@ bool MoeGroupedBf16NativeAvailable(DeviceType device);
 void MoeGroupedGemmFp8Block(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                             const Tensor* row_map, const Tensor& weight_ptrs,
                             const Tensor& scale_ptrs, int64_t block_n, int64_t block_k);
+
+// vt::MoeGroupedGemmFp8BlockGateUpSilu — MoeGroupedGemmFp8Block against a gate
+// and an up table of one block geometry, with the SwiGLU between them:
+//   out[p, n] = silu(bf16(gate[p, n])) * bf16(up[p, n])      (bf16 out)
+// where gate and up are MoeGroupedGemmFp8Block's sums over gate_ptrs /
+// gate_scale_ptrs and up_ptrs / up_scale_ptrs. Bit-identical to those two
+// grouped GEMMs into bf16 followed by MoeSiluMul; one launch reads both weights
+// against one activation load. Built for decode-sized P: any P is correct, but
+// every pair re-reads its expert's bytes, so large P belongs to
+// MoeGroupedGemmFp8Block's grouped tile. Registered on kCUDA.
+//   out          [P, N] bf16
+//   act          [*, K] bf16
+//   expert_ids   [P] i32 (device); row_map [P] i32 (device) or nullptr
+//   gate_ptrs, gate_scale_ptrs, up_ptrs, up_scale_ptrs   [E] i64 (device)
+void MoeGroupedGemmFp8BlockGateUpSilu(Queue& q, Tensor& out, const Tensor& act,
+                                      const Tensor& expert_ids, const Tensor* row_map,
+                                      const Tensor& gate_ptrs, const Tensor& gate_scale_ptrs,
+                                      const Tensor& up_ptrs, const Tensor& up_scale_ptrs,
+                                      int64_t block_n, int64_t block_k);
 
 // MoeGroupedGemmNvfp4Marlin (lift of vLLM moe_wna16_marlin_gemm, ops.cu:543 —
 // the Marlin W4A16 kernel vLLM selects for the 35B's NVFP4 MoE experts). One

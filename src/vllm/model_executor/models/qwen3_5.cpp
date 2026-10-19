@@ -7324,11 +7324,18 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
 // with an activation quant and a scale transpose in front of it; at decode
 // sizes those three launches per projection cost several times the GEMV (the
 // 4-layer checkpoint's decode profile averages 7.6 us per block GEMM, plus 1.0
-// and 0.7 us for its quant and transpose). The sigmoid gate and its logit are
-// SharedExpert's.
-DBuf SharedExpertFp8BlockGrouped(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
-                                 const Tensor& dh, const Tensor& xh, int64_t T,
-                                 MoeFp8BlockResident& mr) {
+// and 0.7 us for its quant and transpose). The gate logit is SharedExpert's; the
+// sigmoid gate is left to the caller, which folds it into the combine
+// (MoeCombineGate) or runs SharedExpertGate. `fused` runs gate, up and the SiLU-mul
+// as one MoeGroupedGemmFp8BlockGateUpSilu launch, bit-identical to the three.
+struct SharedExpertTerms {
+  DBuf sd;  // [T, H] bf16 down projection, before the sigmoid gate
+  DBuf gl;  // [T, 1] f32 gate logit
+};
+SharedExpertTerms SharedExpertFp8BlockGrouped(Dev d, const MoeBlockWeights& w,
+                                              const HfConfig& cfg, const Tensor& dh,
+                                              const Tensor& xh, int64_t T,
+                                              MoeFp8BlockResident& mr, bool fused) {
   const int64_t H = cfg.hidden_size;
   const int64_t Is = cfg.shared_expert_intermediate_size;
   const Fp8BlockWeight* proj[3] = {&w.shared_gate_proj_fp8_block, &w.shared_up_proj_fp8_block,
@@ -7359,21 +7366,26 @@ DBuf SharedExpertFp8BlockGrouped(Dev d, const MoeBlockWeights& w, const HfConfig
   const Tensor ids = MakeTensor(zit->second, DType::kI32, d.q.device, {T});
   auto table = [&](void* p) { return MakeTensor(p, DType::kI64, d.q.device, {1}); };
 
-  DBuf sg(d, DType::kBF16, {T, Is});
-  vt::MoeGroupedGemmFp8Block(d.q, sg.t(), xh, ids, nullptr, table(mr.shared_w[0]),
-                             table(mr.shared_s[0]), proj[0]->block_n, proj[0]->block_k);
-  DBuf su(d, DType::kBF16, {T, Is});
-  vt::MoeGroupedGemmFp8Block(d.q, su.t(), xh, ids, nullptr, table(mr.shared_w[1]),
-                             table(mr.shared_s[1]), proj[1]->block_n, proj[1]->block_k);
   DBuf sact(d, DType::kBF16, {T, Is});
-  vt::MoeSiluMul(d.q, sact.t(), sg.t(), su.t());  // silu(sg) * su -> bf16
+  if (fused && proj[0]->block_n == proj[1]->block_n && proj[0]->block_k == proj[1]->block_k) {
+    vt::MoeGroupedGemmFp8BlockGateUpSilu(d.q, sact.t(), xh, ids, nullptr, table(mr.shared_w[0]),
+                                         table(mr.shared_s[0]), table(mr.shared_w[1]),
+                                         table(mr.shared_s[1]), proj[0]->block_n,
+                                         proj[0]->block_k);
+  } else {
+    DBuf sg(d, DType::kBF16, {T, Is});
+    vt::MoeGroupedGemmFp8Block(d.q, sg.t(), xh, ids, nullptr, table(mr.shared_w[0]),
+                               table(mr.shared_s[0]), proj[0]->block_n, proj[0]->block_k);
+    DBuf su(d, DType::kBF16, {T, Is});
+    vt::MoeGroupedGemmFp8Block(d.q, su.t(), xh, ids, nullptr, table(mr.shared_w[1]),
+                               table(mr.shared_s[1]), proj[1]->block_n, proj[1]->block_k);
+    vt::MoeSiluMul(d.q, sact.t(), sg.t(), su.t());  // silu(sg) * su -> bf16
+  }
   DBuf sd(d, DType::kBF16, {T, H});
   vt::MoeGroupedGemmFp8Block(d.q, sd.t(), sact.t(), ids, nullptr, table(mr.shared_w[2]),
                              table(mr.shared_s[2]), proj[2]->block_n, proj[2]->block_k);
   DBuf gl = MatmulF32D(d, dh, w.shared_gate);  // [T,1] f32
-  DBuf shared(d, DType::kBF16, {T, H});
-  vt::SharedExpertGate(d.q, shared.t(), sd.t(), gl.t());  // sigmoid(gl)*sd -> bf16
-  return shared;
+  return {std::move(sd), std::move(gl)};
 }
 
 // --- Grouped block-FP8 MoE block (Qwen/Qwen3.6-35B-A3B-FP8). MoeBlockBf16Cuda's
@@ -7500,14 +7512,34 @@ DBuf MoeBlockFp8BlockCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   }
   const Tensor& xh = dh.dtype == DType::kBF16 ? dh : dh_bf16.t();
 
-  DBuf dg(d, DType::kBF16, {P, I});
-  vt::MoeGroupedGemmFp8Block(d.q, dg.t(), xh, eids, &dtok, gate_w, gate_s, g0.block_n,
-                             g0.block_k);
-  DBuf du(d, DType::kBF16, {P, I});
-  vt::MoeGroupedGemmFp8Block(d.q, du.t(), xh, eids, &dtok, up_w, up_s, g0.block_n,
-                             g0.block_k);
+  // Decode-sized steps fuse the glue around the grouped GEMMs, bit-identically:
+  // gate, up and the SiLU-mul run as one MoeGroupedGemmFp8BlockGateUpSilu launch
+  // (up to 64 pairs, where the grouped op runs its warp kernel and so does the
+  // fused one), and the shared expert's sigmoid gate folds into the combine
+  // (MoeCombineGate) instead of a SharedExpertGate launch before it.
+  // VT_MOE_FP8_BLOCK_FUSED_GATEUP=0 keeps the separate launches for a same-binary
+  // A/B; default ON.
+  static const bool fused_on = [] {
+    const char* e = std::getenv("VT_MOE_FP8_BLOCK_FUSED_GATEUP");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  constexpr int64_t kFusedGateUpMaxPairs = 64;
+  const bool fused_gate_up =
+      fused_on && vt::OpRegistered(vt::OpId::kMoeGroupedGemmFp8BlockGateUpSilu, d.q.device.type);
   DBuf dact(d, DType::kBF16, {P, I});
-  vt::MoeSiluMul(d.q, dact.t(), dg.t(), du.t());  // silu(gate) * up -> bf16
+  if (fused_gate_up && P <= kFusedGateUpMaxPairs) {
+    // The load-time check above holds gate and up to g0's block geometry.
+    vt::MoeGroupedGemmFp8BlockGateUpSilu(d.q, dact.t(), xh, eids, &dtok, gate_w, gate_s, up_w,
+                                         up_s, g0.block_n, g0.block_k);
+  } else {
+    DBuf dg(d, DType::kBF16, {P, I});
+    vt::MoeGroupedGemmFp8Block(d.q, dg.t(), xh, eids, &dtok, gate_w, gate_s, g0.block_n,
+                               g0.block_k);
+    DBuf du(d, DType::kBF16, {P, I});
+    vt::MoeGroupedGemmFp8Block(d.q, du.t(), xh, eids, &dtok, up_w, up_s, g0.block_n,
+                               g0.block_k);
+    vt::MoeSiluMul(d.q, dact.t(), dg.t(), du.t());  // silu(gate) * up -> bf16
+  }
   DBuf ddown(d, DType::kBF16, {P, H});
   vt::MoeGroupedGemmFp8Block(d.q, ddown.t(), dact.t(), eids, nullptr, down_w, down_s,
                              d0.block_n, d0.block_k);
@@ -7527,13 +7559,20 @@ DBuf MoeBlockFp8BlockCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
     const char* e = std::getenv("VT_MOE_FP8_BLOCK_SHARED_GROUPED");
     return !(e != nullptr && e[0] == '0');
   }();
-  if (has_shared) {
-    if (shared_grouped && T <= kSharedGroupedMaxRows && !w.shared_gate_proj_fp8_block.Empty())
-      shared.emplace(SharedExpertFp8BlockGrouped(d, w, cfg, dh, xh, T, mr));
-    else
-      shared.emplace(SharedExpert(d, w, cfg, dh, T, false));
-  }
   DBuf dout(d, DType::kBF16, {T, H});
+  if (has_shared) {
+    if (shared_grouped && T <= kSharedGroupedMaxRows && !w.shared_gate_proj_fp8_block.Empty()) {
+      SharedExpertTerms st = SharedExpertFp8BlockGrouped(d, w, cfg, dh, xh, T, mr, fused_gate_up);
+      if (fused_on && vt::OpRegistered(vt::OpId::kMoeCombineGate, d.q.device.type)) {
+        vt::MoeCombineGate(d.q, dout.t(), expert_out, dtw.t(), st.sd.t(), st.gl.t());
+        return dout;
+      }
+      shared.emplace(d, DType::kBF16, std::vector<int64_t>{T, H});
+      vt::SharedExpertGate(d.q, shared->t(), st.sd.t(), st.gl.t());  // sigmoid(gl)*sd -> bf16
+    } else {
+      shared.emplace(SharedExpert(d, w, cfg, dh, T, false));
+    }
+  }
   vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), has_shared ? &shared->t() : nullptr);
   return dout;
 }

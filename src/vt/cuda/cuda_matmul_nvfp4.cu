@@ -1812,6 +1812,138 @@ void MoeGroupedGemmFp8BlockKernelCuda(Queue& q, Tensor& out, const Tensor& act,
   }
 }
 
+// --- Block-wise FP8 grouped gate+up+SwiGLU (kMoeGroupedGemmFp8BlockGateUpSilu) --
+// One launch for the decode triplet {MoeGroupedGemmFp8Block(gate) -> bf16;
+// MoeGroupedGemmFp8Block(up) -> bf16; MoeSiluMul -> bf16}. A pair's gate row n and
+// up row n belong to the same expert and multiply the same activation row, so one
+// warp computes both sums against one activation load. Bit-identical to the
+// triplet: each sum is accumulated exactly as the kernels above accumulate it
+// (lane chunk order, per-K-block scale fold, butterfly; the naive kernel's
+// sequential K), both are rounded through bf16 as the two GEMMs' bf16 stores round
+// them, and the epilogue is MoeSiluMulKernel's (cuda_moe.cu) f32 math.
+
+__device__ __forceinline__ float SiluMulOfBf16Sums(float g, float u) {
+  const float gb = __bfloat162float(__float2bfloat16(g));
+  const float ub = __bfloat162float(__float2bfloat16(u));
+  const float sv = gb / (1.0f + expf(-gb));  // == MoeSiluMulKernel (cuda_moe.cu)
+  return sv * ub;
+}
+
+// MoeGroupedGemmFp8BlockNaive for two tables: any K and block_k.
+__global__ void MoeGroupedGemmFp8BlockGateUpSiluNaive(
+    __nv_bfloat16* out, const __nv_bfloat16* act, const int32_t* expert_ids,
+    const int32_t* row_map, const int64_t* gate_ptrs, const int64_t* gate_scale_ptrs,
+    const int64_t* up_ptrs, const int64_t* up_scale_ptrs, int64_t p_rows, int64_t n_cols,
+    int64_t k_dim, int64_t block_n, int64_t block_k) {
+  const int64_t n = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (n >= n_cols) return;
+  const int64_t k_blocks = (k_dim + block_k - 1) / block_k;
+  for (int64_t p = blockIdx.y; p < p_rows; p += gridDim.y) {
+    const int64_t e = expert_ids[p];
+    const int64_t r = row_map != nullptr ? row_map[p] : p;
+    const auto* wg =
+        reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(gate_ptrs[e])) + n * k_dim;
+    const auto* wu =
+        reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(up_ptrs[e])) + n * k_dim;
+    const int64_t srow = (n / block_n) * k_blocks;
+    const auto* sg =
+        reinterpret_cast<const float*>(static_cast<uintptr_t>(gate_scale_ptrs[e])) + srow;
+    const auto* su =
+        reinterpret_cast<const float*>(static_cast<uintptr_t>(up_scale_ptrs[e])) + srow;
+    const __nv_bfloat16* arow = act + r * k_dim;
+    float g = 0.0f, u = 0.0f;
+    for (int64_t kb = 0; kb < k_blocks; ++kb) {
+      const int64_t k0 = kb * block_k;
+      const int64_t k1 = k0 + block_k < k_dim ? k0 + block_k : k_dim;
+      float pg = 0.0f, pu = 0.0f;
+      for (int64_t kk = k0; kk < k1; ++kk) {
+        const float a = __bfloat162float(arow[kk]);
+        pg = fmaf(F8E4M3ToF32Dev(wg[kk]), a, pg);
+        pu = fmaf(F8E4M3ToF32Dev(wu[kk]), a, pu);
+      }
+      g = fmaf(sg[kb], pg, g);
+      u = fmaf(su[kb], pu, u);
+    }
+    Store(out, p * n_cols + n, SiluMulOfBf16Sums(g, u));
+  }
+}
+
+// MoeGroupedGemmFp8BlockWarp for two tables: one warp per output column n of one
+// pair row; K % 16 == 0 and block_k % 16 == 0.
+template <int WARPS>
+__global__ __launch_bounds__(WARPS * 32) void MoeGroupedGemmFp8BlockGateUpSiluWarp(
+    __nv_bfloat16* out, const __nv_bfloat16* act, const int32_t* expert_ids,
+    const int32_t* row_map, const int64_t* gate_ptrs, const int64_t* gate_scale_ptrs,
+    const int64_t* up_ptrs, const int64_t* up_scale_ptrs, int64_t p_rows, int64_t n_cols,
+    int64_t k_dim, int64_t block_n, int64_t block_k) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int64_t n =
+      static_cast<int64_t>(blockIdx.x) * WARPS + (static_cast<int>(threadIdx.x) >> 5);
+  if (n >= n_cols) return;  // n is warp-uniform, so whole warps leave together
+  const int64_t chunks = k_dim / 16;
+  const int64_t k_blocks = (k_dim + block_k - 1) / block_k;
+  const int64_t chunks_per_block = block_k / 16;
+  for (int64_t p = blockIdx.y; p < p_rows; p += gridDim.y) {
+    const int64_t e = expert_ids[p];
+    const int64_t r = row_map != nullptr ? row_map[p] : p;
+    const auto* wg =
+        reinterpret_cast<const uint4*>(static_cast<uintptr_t>(gate_ptrs[e])) + n * chunks;
+    const auto* wu =
+        reinterpret_cast<const uint4*>(static_cast<uintptr_t>(up_ptrs[e])) + n * chunks;
+    const int64_t srow = (n / block_n) * k_blocks;
+    const auto* sg =
+        reinterpret_cast<const float*>(static_cast<uintptr_t>(gate_scale_ptrs[e])) + srow;
+    const auto* su =
+        reinterpret_cast<const float*>(static_cast<uintptr_t>(up_scale_ptrs[e])) + srow;
+    const auto* a = reinterpret_cast<const uint4*>(act + r * k_dim);
+    float g = 0.0f, u = 0.0f;
+    for (int64_t c = lane; c < chunks; c += 32) {
+      const uint4 a_lo = a[2 * c], a_hi = a[2 * c + 1];
+      const int64_t kb = c / chunks_per_block;
+      g = fmaf(sg[kb], Fp8x16DotBf16(wg[c], a_lo, a_hi), g);
+      u = fmaf(su[kb], Fp8x16DotBf16(wu[c], a_lo, a_hi), u);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      g += __shfl_xor_sync(0xffffffffu, g, off);
+      u += __shfl_xor_sync(0xffffffffu, u, off);
+    }
+    if (lane == 0) Store(out, p * n_cols + n, SiluMulOfBf16Sums(g, u));
+  }
+}
+
+void MoeGroupedGemmFp8BlockGateUpSiluCuda(Queue& q, Tensor& out, const Tensor& act,
+                                          const Tensor& expert_ids, const Tensor* row_map,
+                                          const Tensor& gate_ptrs, const Tensor& gate_scale_ptrs,
+                                          const Tensor& up_ptrs, const Tensor& up_scale_ptrs,
+                                          int64_t block_n, int64_t block_k) {
+  const int64_t p = out.shape[0], n = out.shape[1], k = act.shape[1];
+  if (p == 0 || n == 0) return;
+  VT_CHECK(out.dtype == DType::kBF16,
+           "cuda moe_grouped_gemm_fp8_block_gate_up_silu: out must be bf16");
+  cudaStream_t s = AsStream(q);
+  const int32_t* eids = expert_ids.Ptr<int32_t>();
+  const int32_t* rmap = row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr;
+  const unsigned y = static_cast<unsigned>(p < 65535 ? p : 65535);
+  if ((k % 16 == 0) && (block_k % 16 == 0)) {
+    constexpr int kWarps = 8;
+    const dim3 grid(static_cast<unsigned>((n + kWarps - 1) / kWarps), y);
+    MoeGroupedGemmFp8BlockGateUpSiluWarp<kWarps><<<grid, kWarps * 32, 0, s>>>(
+        out.Ptr<__nv_bfloat16>(), act.Ptr<__nv_bfloat16>(), eids, rmap,
+        gate_ptrs.Ptr<int64_t>(), gate_scale_ptrs.Ptr<int64_t>(), up_ptrs.Ptr<int64_t>(),
+        up_scale_ptrs.Ptr<int64_t>(), p, n, k, block_n, block_k);
+    Check(cudaGetLastError(), "moe_grouped_gemm_fp8_block_gate_up_silu kernel launch (warp)");
+    return;
+  }
+  constexpr int kBlock = 256;
+  const dim3 grid(static_cast<unsigned>((n + kBlock - 1) / kBlock), y);
+  MoeGroupedGemmFp8BlockGateUpSiluNaive<<<grid, kBlock, 0, s>>>(
+      out.Ptr<__nv_bfloat16>(), act.Ptr<__nv_bfloat16>(), eids, rmap, gate_ptrs.Ptr<int64_t>(),
+      gate_scale_ptrs.Ptr<int64_t>(), up_ptrs.Ptr<int64_t>(), up_scale_ptrs.Ptr<int64_t>(), p, n,
+      k, block_n, block_k);
+  Check(cudaGetLastError(), "moe_grouped_gemm_fp8_block_gate_up_silu kernel launch (naive)");
+}
+
 // --- Tier-A4: SHARED fused BF16 grouped-MoE gate+up+SwiGLU (kMoeGroupedGemmBf16-
 // GateUpSilu) ------------------------------------------------------------------
 // ONE vt entry replaces the {MoeGroupedGemmBf16(gate); MoeGroupedGemmBf16(up);
@@ -3065,6 +3197,9 @@ struct Registrar {
     RegisterOp(OpId::kMoeGroupedGemmFp8Block, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MoeGroupedGemmFp8BlockFn>(
                    &MoeGroupedGemmFp8BlockKernelCuda)));
+    RegisterOp(OpId::kMoeGroupedGemmFp8BlockGateUpSilu, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmFp8BlockGateUpSiluFn>(
+                   &MoeGroupedGemmFp8BlockGateUpSiluCuda)));
   }
 } registrar;
 

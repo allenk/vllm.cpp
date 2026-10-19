@@ -990,40 +990,68 @@ void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& 
       q, out, act, expert_ids, row_map, weight_ptrs);
 }
 
-void MoeGroupedGemmFp8Block(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
-                            const Tensor* row_map, const Tensor& weight_ptrs,
-                            const Tensor& scale_ptrs, int64_t block_n, int64_t block_k) {
-  // The bf16 grouped GEMM's rules, with a second [E] pointer table for the
-  // scale grids.
-  VT_CHECK(out.rank == 2 && act.rank == 2, "moe_grouped_gemm_fp8_block: out/act must be rank-2");
+namespace {
+// The bf16 grouped GEMM's rules, with a second [E] pointer table for the scale
+// grids. `op` prefixes every message.
+void ValidateMoeGroupedGemmFp8Block(const std::string& op, Queue& q, const Tensor& out,
+                                    const Tensor& act, const Tensor& expert_ids,
+                                    const Tensor* row_map, const Tensor& weight_ptrs,
+                                    const Tensor& scale_ptrs, int64_t block_n, int64_t block_k) {
+  VT_CHECK(out.rank == 2 && act.rank == 2, op + ": out/act must be rank-2");
   const int64_t p = out.shape[0];
-  VT_CHECK(act.dtype == DType::kBF16, "moe_grouped_gemm_fp8_block: act must be bf16");
-  VT_CHECK(IsOutFloat(out.dtype), "moe_grouped_gemm_fp8_block: out must be f32/bf16");
+  VT_CHECK(act.dtype == DType::kBF16, op + ": act must be bf16");
+  VT_CHECK(IsOutFloat(out.dtype), op + ": out must be f32/bf16");
   VT_CHECK(expert_ids.Numel() == p && expert_ids.dtype == DType::kI32,
-           "moe_grouped_gemm_fp8_block: expert_ids must be i32 [P], one per out row");
+           op + ": expert_ids must be i32 [P], one per out row");
   VT_CHECK(weight_ptrs.rank == 1 && weight_ptrs.dtype == DType::kI64,
-           "moe_grouped_gemm_fp8_block: weight_ptrs must be i64 [E] (device pointers)");
+           op + ": weight_ptrs must be i64 [E] (device pointers)");
   VT_CHECK(scale_ptrs.dtype == DType::kI64 && scale_ptrs.Numel() == weight_ptrs.Numel(),
-           "moe_grouped_gemm_fp8_block: scale_ptrs must be i64 [E], one entry per weight "
-           "pointer");
+           op + ": scale_ptrs must be i64 [E], one entry per weight pointer");
   VT_CHECK(act.IsContiguous() && out.IsContiguous() && expert_ids.IsContiguous() &&
                weight_ptrs.IsContiguous() && scale_ptrs.IsContiguous(),
-           "moe_grouped_gemm_fp8_block: contiguous tensors required");
+           op + ": contiguous tensors required");
   VT_CHECK(act.device == q.device && out.device == q.device && expert_ids.device == q.device &&
                weight_ptrs.device == q.device && scale_ptrs.device == q.device,
-           "moe_grouped_gemm_fp8_block: device mismatch");
+           op + ": device mismatch");
   if (row_map != nullptr) {
     VT_CHECK(row_map->Numel() == p && row_map->dtype == DType::kI32 && row_map->IsContiguous() &&
                  row_map->device == q.device,
-             "moe_grouped_gemm_fp8_block: row_map must be contiguous i32 [P] on the queue "
-             "device");
+             op + ": row_map must be contiguous i32 [P] on the queue device");
   }
-  VT_CHECK(block_n > 0 && block_k > 0,
-           "moe_grouped_gemm_fp8_block: block_n and block_k must be positive");
+  VT_CHECK(block_n > 0 && block_k > 0, op + ": block_n and block_k must be positive");
+}
+}  // namespace
+
+void MoeGroupedGemmFp8Block(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
+                            const Tensor* row_map, const Tensor& weight_ptrs,
+                            const Tensor& scale_ptrs, int64_t block_n, int64_t block_k) {
+  ValidateMoeGroupedGemmFp8Block("moe_grouped_gemm_fp8_block", q, out, act, expert_ids, row_map,
+                                 weight_ptrs, scale_ptrs, block_n, block_k);
   reinterpret_cast<MoeGroupedGemmFp8BlockFn>(
       GetOp(OpId::kMoeGroupedGemmFp8Block, q.device.type))(q, out, act, expert_ids, row_map,
                                                            weight_ptrs, scale_ptrs, block_n,
                                                            block_k);
+}
+
+void MoeGroupedGemmFp8BlockGateUpSilu(Queue& q, Tensor& out, const Tensor& act,
+                                      const Tensor& expert_ids, const Tensor* row_map,
+                                      const Tensor& gate_ptrs, const Tensor& gate_scale_ptrs,
+                                      const Tensor& up_ptrs, const Tensor& up_scale_ptrs,
+                                      int64_t block_n, int64_t block_k) {
+  // Each table under MoeGroupedGemmFp8Block's rules, one expert count for both,
+  // and the bf16 output the replaced triplet stores.
+  const std::string op = "moe_grouped_gemm_fp8_block_gate_up_silu";
+  ValidateMoeGroupedGemmFp8Block(op, q, out, act, expert_ids, row_map, gate_ptrs,
+                                 gate_scale_ptrs, block_n, block_k);
+  ValidateMoeGroupedGemmFp8Block(op, q, out, act, expert_ids, row_map, up_ptrs, up_scale_ptrs,
+                                 block_n, block_k);
+  VT_CHECK(up_ptrs.Numel() == gate_ptrs.Numel(),
+           op + ": gate and up tables must have one entry per expert each");
+  VT_CHECK(out.dtype == DType::kBF16, op + ": out must be bf16");
+  reinterpret_cast<MoeGroupedGemmFp8BlockGateUpSiluFn>(
+      GetOp(OpId::kMoeGroupedGemmFp8BlockGateUpSilu, q.device.type))(
+      q, out, act, expert_ids, row_map, gate_ptrs, gate_scale_ptrs, up_ptrs, up_scale_ptrs,
+      block_n, block_k);
 }
 
 namespace {

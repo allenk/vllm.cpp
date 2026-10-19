@@ -256,6 +256,142 @@ void RunCase(const Case& c) {
   CheckAgainstReference(f, Run(f));
 }
 
+// --- vt::MoeGroupedGemmFp8BlockGateUpSilu --------------------------------------
+// `w`'s weights against `a`'s activation and routing, in double: the up
+// projection of a gate/up pair whose activation came from the gate fixture.
+std::vector<double> RefSums(const Fixture& w, const Fixture& a) {
+  const Case& c = a.c;
+  std::vector<double> ref(static_cast<size_t>(a.P * c.n_cols), 0.0);
+  for (int64_t p = 0; p < a.P; ++p) {
+    const auto e = static_cast<size_t>(a.expert_ids[static_cast<size_t>(p)]);
+    const int64_t r = c.use_row_map ? a.row_map[static_cast<size_t>(p)] : p;
+    for (int64_t n = 0; n < c.n_cols; ++n) {
+      double acc = 0.0;
+      for (int64_t b = 0; b < a.kb; ++b) {
+        const int64_t k0 = b * c.block_k;
+        const int64_t k1 = std::min(k0 + c.block_k, c.k_dim);
+        double part = 0.0;
+        for (int64_t k = k0; k < k1; ++k)
+          part += static_cast<double>(vt::F8E4M3ToF32(w.w[e][static_cast<size_t>(n * c.k_dim + k)])) *
+                  static_cast<double>(vt::BF16ToF32(a.act[static_cast<size_t>(r * c.k_dim + k)]));
+        acc += part * static_cast<double>(w.s[e][static_cast<size_t>((n / c.block_n) * a.kb + b)]);
+      }
+      ref[static_cast<size_t>(p * c.n_cols + n)] = acc;
+    }
+  }
+  return ref;
+}
+
+struct GateUpOut {
+  std::vector<uint16_t> triplet;  // two grouped GEMMs into bf16, then MoeSiluMul
+  std::vector<uint16_t> fused;    // MoeGroupedGemmFp8BlockGateUpSilu
+};
+
+// One activation and routing (g's), gate weights from g, up weights from u.
+GateUpOut RunGateUp(const Fixture& g, const Fixture& u) {
+  const Case& c = g.c;
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceBuffer dact(gpu, gq.q, DType::kBF16, {g.act_rows, c.k_dim}, g.act.data());
+  DeviceBuffer deids(gpu, gq.q, DType::kI32, {g.P}, g.expert_ids.data());
+  DeviceBuffer drow(gpu, gq.q, DType::kI32, {g.P}, g.row_map.data());
+  std::vector<std::unique_ptr<DeviceBuffer>> bufs;
+  auto tables = [&](const Fixture& f, std::vector<int64_t>& wp, std::vector<int64_t>& sp) {
+    for (int64_t e = 0; e < c.e_count; ++e) {
+      bufs.push_back(std::make_unique<DeviceBuffer>(
+          gpu, gq.q, DType::kI8, std::vector<int64_t>{c.n_cols, c.k_dim},
+          f.w[static_cast<size_t>(e)].data()));
+      wp.push_back(reinterpret_cast<int64_t>(bufs.back()->ptr()));
+      bufs.push_back(std::make_unique<DeviceBuffer>(
+          gpu, gq.q, DType::kF32, std::vector<int64_t>{f.nb, f.kb},
+          f.s[static_cast<size_t>(e)].data()));
+      sp.push_back(reinterpret_cast<int64_t>(bufs.back()->ptr()));
+    }
+  };
+  std::vector<int64_t> gw, gs, uw, us;
+  tables(g, gw, gs);
+  tables(u, uw, us);
+  DeviceBuffer dgw(gpu, gq.q, DType::kI64, {c.e_count}, gw.data());
+  DeviceBuffer dgs(gpu, gq.q, DType::kI64, {c.e_count}, gs.data());
+  DeviceBuffer duw(gpu, gq.q, DType::kI64, {c.e_count}, uw.data());
+  DeviceBuffer dus(gpu, gq.q, DType::kI64, {c.e_count}, us.data());
+  const Tensor* rmap = c.use_row_map ? &drow.tensor() : nullptr;
+
+  DeviceBuffer dg(gpu, gq.q, DType::kBF16, {g.P, c.n_cols});
+  DeviceBuffer du(gpu, gq.q, DType::kBF16, {g.P, c.n_cols});
+  DeviceBuffer dtrip(gpu, gq.q, DType::kBF16, {g.P, c.n_cols});
+  vt::MoeGroupedGemmFp8Block(gq.q, dg.tensor(), dact.tensor(), deids.tensor(), rmap,
+                             dgw.tensor(), dgs.tensor(), c.block_n, c.block_k);
+  vt::MoeGroupedGemmFp8Block(gq.q, du.tensor(), dact.tensor(), deids.tensor(), rmap,
+                             duw.tensor(), dus.tensor(), c.block_n, c.block_k);
+  vt::MoeSiluMul(gq.q, dtrip.tensor(), dg.tensor(), du.tensor());
+  DeviceBuffer dfused(gpu, gq.q, DType::kBF16, {g.P, c.n_cols});
+  vt::MoeGroupedGemmFp8BlockGateUpSilu(gq.q, dfused.tensor(), dact.tensor(), deids.tensor(),
+                                       rmap, dgw.tensor(), dgs.tensor(), duw.tensor(),
+                                       dus.tensor(), c.block_n, c.block_k);
+  GateUpOut out;
+  out.triplet.resize(static_cast<size_t>(g.P * c.n_cols));
+  out.fused.resize(out.triplet.size());
+  dtrip.Download(gq.q, out.triplet.data());
+  dfused.Download(gq.q, out.fused.data());
+  return out;
+}
+
+// silu(bf16(g)) * bf16(u) from the double sums, against the fused output. The
+// bf16 rounding of each sum sits on f32 sums that differ from the double ones in
+// the last bits, so one of them can land a bf16 ulp away; the tolerance allows a
+// few.
+void CheckGateUpAgainstReference(const Fixture& g, const Fixture& u,
+                                 const std::vector<uint16_t>& got) {
+  const std::vector<double> uref = RefSums(u, g);
+  std::vector<double> ref(got.size());
+  double ss = 0.0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    const double gb = vt::BF16ToF32(vt::F32ToBF16(static_cast<float>(g.ref[i])));
+    const double ub = vt::BF16ToF32(vt::F32ToBF16(static_cast<float>(uref[i])));
+    ref[i] = gb / (1.0 + std::exp(-gb)) * ub;
+    ss += ref[i] * ref[i];
+  }
+  const double rms = std::sqrt(ss / static_cast<double>(ref.size()));
+  size_t bad = 0, first_bad = 0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    const double v = vt::BF16ToF32(got[i]);
+    if (!(std::fabs(v - ref[i]) <= 3e-2 * std::fabs(ref[i]) + 3e-2 * rms)) {
+      if (bad == 0) first_bad = i;
+      ++bad;
+    }
+  }
+  if (bad != 0) {
+    CAPTURE(bad);
+    CAPTURE(first_bad);
+    CAPTURE(vt::BF16ToF32(got[first_bad]));
+    CAPTURE(ref[first_bad]);
+    CAPTURE(rms);
+  }
+  CHECK(bad == 0);
+}
+
+// The up fixture: the same shape and routing, other weights (its own activation
+// is not used).
+Fixture BuildUp(const Case& c) {
+  Case uc = c;
+  uc.seed = c.seed + 7777;
+  return Build(uc);
+}
+
+void RunGateUpCase(const Case& c, bool expect_bit_identical) {
+  const Fixture g = Build(c);
+  const Fixture u = BuildUp(c);
+  const GateUpOut out = RunGateUp(g, u);
+  CheckGateUpAgainstReference(g, u, out.fused);
+  if (expect_bit_identical) {
+    size_t diff = 0;
+    for (size_t i = 0; i < out.fused.size(); ++i) diff += out.fused[i] != out.triplet[i] ? 1 : 0;
+    CAPTURE(diff);
+    CHECK(diff == 0);
+  }
+}
+
 }  // namespace
 
 // K = 40 is not a multiple of 16 -> one thread per output. block_k = 24 leaves a
@@ -355,4 +491,59 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block is bit-reproducible run to run") {
     CheckAgainstReference(f, first);
     for (int rep = 0; rep < 3; ++rep) CHECK(Run(f) == first);
   }
+}
+
+// The fused gate+up+SwiGLU op is the decode triplet bit for bit wherever the
+// triplet's GEMMs run their warp or one-thread kernels (P <= 64), and is correct
+// at any P.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu equals the gate, up and silu-mul triplet") {
+  if (!HasCuda()) {
+    MESSAGE("CUDA backend unavailable; skipping");
+    return;
+  }
+  // The Qwen decode shape at a small scale: P = 16 pairs, block 128, two K-blocks.
+  Case c;
+  c.e_count = 5; c.t_rows = 4; c.top_k = 4; c.k_dim = 256; c.n_cols = 96; c.seed = 700;
+  RunGateUpCase(c, /*expect_bit_identical=*/true);
+  // A short last K-block (176 = 2 * 64 + 48), a 32-row scale block, identity routing.
+  Case d = c;
+  d.k_dim = 176; d.block_k = 64; d.block_n = 32; d.use_row_map = false; d.seed = 710;
+  RunGateUpCase(d, true);
+  // K = 40, block_k = 24: the one-thread kernel on both sides.
+  Case n = c;
+  n.k_dim = 40; n.n_cols = 33; n.block_n = 16; n.block_k = 24; n.seed = 720;
+  RunGateUpCase(n, true);
+  // Every finite e4m3 code.
+  Case r = c;
+  r.full_range = true; r.seed = 730;
+  RunGateUpCase(r, true);
+  // P = 64, the largest step the MoE block sends here (c=8 decode).
+  Case w = c;
+  w.t_rows = 8; w.top_k = 8; w.k_dim = 512; w.n_cols = 128; w.seed = 740;
+  RunGateUpCase(w, true);
+}
+
+TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu is correct above the warp range") {
+  if (!HasCuda()) {
+    MESSAGE("CUDA backend unavailable; skipping");
+    return;
+  }
+  // P = 160: the triplet's GEMMs run the BM=16 tile, which sums in another order,
+  // so only the reference applies.
+  Case c;
+  c.e_count = 7; c.t_rows = 20; c.top_k = 8; c.k_dim = 256; c.n_cols = 192; c.seed = 800;
+  RunGateUpCase(c, /*expect_bit_identical=*/false);
+}
+
+TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu is bit-reproducible run to run") {
+  if (!HasCuda()) {
+    MESSAGE("CUDA backend unavailable; skipping");
+    return;
+  }
+  Case c;
+  c.e_count = 6; c.t_rows = 2; c.top_k = 8; c.k_dim = 512; c.n_cols = 128; c.seed = 900;
+  const Fixture g = Build(c);
+  const Fixture u = BuildUp(c);
+  const std::vector<uint16_t> first = RunGateUp(g, u).fused;
+  for (int rep = 0; rep < 3; ++rep) CHECK(RunGateUp(g, u).fused == first);
 }
