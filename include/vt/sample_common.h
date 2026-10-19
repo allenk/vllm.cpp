@@ -43,6 +43,9 @@ VT_SAMPLE_HD inline uint64_t SplitMix64(uint64_t x) {
 // fills with `q.exponential_()` (vllm/v1/sample/ops/topk_topp_sampler.py).
 // Upstream draws a whole tensor from a torch Generator; we hash the coordinate
 // instead, so a row's draw does not depend on how many rows share the batch.
+// The Sampler hands each row StreamSeed(PositionKey(request seed, position),
+// row), below, so what a request draws depends on its seed and the position
+// being sampled, not on the step's batch layout.
 // Exact torch-Philox parity is the documented M1.7 T1 carry.
 //
 // The `-log(u)` is evaluated in DOUBLE. That is WIDER than upstream's default
@@ -64,6 +67,24 @@ VT_SAMPLE_HD inline double ExpNoise(uint64_t seed, int64_t row, int64_t col) {
 // sample_with_exponential_noise). The argmax over a row of these IS the sample.
 VT_SAMPLE_HD inline float GumbelScore(float prob, uint64_t seed, int64_t row, int64_t col) {
   return prob / static_cast<float>(ExpNoise(seed, row, col));
+}
+
+// The noise key of the draw at position `pos` of a request seeded with `seed`
+// (vLLM V2 keys its Gumbel noise by (seed, pos, token), gumbel.py
+// murmur3_hash32): every position of a request draws fresh noise, and the same
+// (seed, pos) always draws the same.
+VT_SAMPLE_HD inline uint64_t PositionKey(uint64_t seed, int64_t pos) {
+  return SplitMix64(seed ^ SplitMix64(static_cast<uint64_t>(pos)));
+}
+
+// The seed to hand ExpNoise for batch row `row` so that the row draws from
+// `key` alone. ExpNoise keys a row by SplitMix64(seed + 0x9E37...7C15 * row);
+// passing key - 0x9E37...7C15 * row cancels the row term (unsigned arithmetic
+// wraps), so a request's draws stop depending on where the batch put it. The
+// multiplier must stay ExpNoise's; tests/vllm/v1/sample/test_sampler.cpp
+// checks the cancellation.
+VT_SAMPLE_HD inline uint64_t StreamSeed(uint64_t key, int64_t row) {
+  return key - 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(row);
 }
 
 // The "no real index yet" marker, INT64_MAX, so that any real index beats an

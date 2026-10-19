@@ -24,6 +24,7 @@
 #include "vllm/v1/sample/metadata.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/sample_common.h"
 #include "vt/tensor.h"
 
 using vllm::v1::MinTokensState;
@@ -741,8 +742,8 @@ std::vector<float> PseudoRandomLogits(size_t count, uint32_t seed) {
 }
 
 // `n` random rows exercising every per-row vector the random path uploads:
-// temperature, top_k (some rows the whole vocab), top_p (some rows 1.0) and a
-// per-request seed on the odd rows.
+// temperature, top_k (some rows the whole vocab), top_p (some rows 1.0) and the
+// draw keys, as InputBatch fills them (a seed and a position per row).
 SamplingMetadata RandomBatch(int64_t n, int64_t vocab) {
   SamplingMetadata sm;
   sm.all_greedy = false;
@@ -754,6 +755,8 @@ SamplingMetadata RandomBatch(int64_t n, int64_t vocab) {
     top_k.push_back(static_cast<int32_t>(i % 3 == 0 ? vocab : 5 + i));
     top_p.push_back(i % 2 == 0 ? 0.9f : 1.0f);
     if (i % 2 == 1) sm.generators[static_cast<int>(i)] = 1000 + static_cast<uint64_t>(i);
+    sm.rng_seeds.push_back(1000 + static_cast<uint64_t>(i));
+    sm.positions.push_back(17 + 3 * i);
   }
   sm.temperature = temp;
   sm.top_k = top_k;
@@ -860,6 +863,125 @@ TEST_CASE("Sampler: CUDA all-random batch samples device-resident, same ids as t
     gpu.Free(la);
     gpu.Free(lb);
     gpu.Free(ids);
+  }
+  gpu.DestroyQueue(q);
+}
+
+// ---------------------------------------------------------------------------
+// The random draws are keyed by the request's seed and the position being
+// sampled (SamplingMetadata.rng_seeds / positions), not by the step's batch
+// layout. Before, the key was (seed, batch row, token) with nothing that moves
+// between steps, and an unseeded row always took seed 0: a request drew the
+// same noise at every step, and so did every unseeded request in that row.
+TEST_CASE("Sampler: StreamSeed cancels the batch row that ExpNoise mixes in") {
+  for (uint64_t key : {0ULL, 1ULL, 0xDEADBEEFCAFEF00DULL, 0x9E3779B97F4A7C15ULL}) {
+    for (int64_t row : {0, 1, 7, 1000}) {
+      for (int64_t col : {0, 5, 248319}) {
+        CHECK(vt::sample::ExpNoise(vt::sample::StreamSeed(key, row), row, col) ==
+              vt::sample::ExpNoise(key, 0, col));
+      }
+    }
+  }
+}
+
+namespace {
+
+// Sample row `row_of_x` of `logits` ([n, vocab]) with request seed `seed` at
+// position `pos`; the other rows get seeds and positions of their own.
+int32_t DrawAt(std::vector<float> logits, int64_t n, int64_t vocab, int64_t row_of_x,
+               uint64_t seed, int64_t pos) {
+  SamplingMetadata sm;
+  sm.all_greedy = false;
+  sm.all_random = true;
+  sm.temperature = std::vector<float>(static_cast<size_t>(n), 1.0f);
+  sm.max_num_logprobs = std::nullopt;
+  for (int64_t i = 0; i < n; ++i) {
+    sm.rng_seeds.push_back(1000 + static_cast<uint64_t>(i));
+    sm.positions.push_back(3 + i);
+  }
+  sm.rng_seeds[static_cast<size_t>(row_of_x)] = seed;
+  sm.positions[static_cast<size_t>(row_of_x)] = pos;
+  Sampler sampler;
+  Queue q = Q();
+  Tensor t = Logits(logits, n, vocab);
+  return sampler.forward(q, t, sm).sampled_token_ids[static_cast<size_t>(row_of_x)][0];
+}
+
+}  // namespace
+
+// The same request (same logits, seed, position) alone in row 0 and third in a
+// three-row batch draws the same token. Sixteen requests, so a row-keyed draw
+// cannot pass by luck.
+TEST_CASE("Sampler: a request draws the same token wherever it sits in the batch") {
+  const int64_t V = 64;
+  for (uint32_t k = 0; k < 16; ++k) {
+    const std::vector<float> x = PseudoRandomLogits(static_cast<size_t>(V), 100 + k);
+    std::vector<float> third = PseudoRandomLogits(static_cast<size_t>(2 * V), 200 + k);
+    third.insert(third.end(), x.begin(), x.end());
+    CHECK(DrawAt(x, 1, V, 0, 77 + k, 12) == DrawAt(third, 3, V, 2, 77 + k, 12));
+  }
+}
+
+// Eight equal logits make every draw uniform over the eight tokens. Keyed by
+// position, 1,600 positions of one request spread evenly; keyed by seed and row
+// alone they all land on the same token. The hash is deterministic, so this
+// always passes or always fails.
+TEST_CASE("Sampler: successive positions of one request draw fresh noise") {
+  const int64_t V = 8;
+  const int64_t kDraws = 1600;
+  std::vector<int> count(static_cast<size_t>(V), 0);
+  for (int64_t pos = 0; pos < kDraws; ++pos) {
+    const int32_t tok = DrawAt(std::vector<float>(static_cast<size_t>(V), 0.0f), 1, V, 0, 5, pos);
+    REQUIRE(tok >= 0);
+    REQUIRE(tok < V);
+    ++count[static_cast<size_t>(tok)];
+  }
+  // Pearson chi-square against uniform, 7 degrees of freedom; 24.3 is the
+  // 0.001 tail.
+  const double expected = static_cast<double>(kDraws) / static_cast<double>(V);
+  double chi2 = 0.0;
+  for (int c : count) chi2 += (c - expected) * (c - expected) / expected;
+  CHECK(chi2 < 24.3);
+}
+
+// The same on CUDA at the Qwen3.5 / 3.6 vocabulary: a request alone and the
+// same request third in a batch of three draw the same token.
+TEST_CASE("Sampler: CUDA draws do not depend on the batch row either") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  vt::Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = gpu.CreateQueue();
+  const Device dev{DeviceType::kCUDA, 0};
+  const int64_t V = 248320;
+  Sampler sampler;
+  auto draw = [&](const std::vector<float>& logits, int64_t n, int64_t row_of_x, uint64_t seed) {
+    SamplingMetadata sm;
+    sm.all_greedy = false;
+    sm.all_random = true;
+    sm.temperature = std::vector<float>(static_cast<size_t>(n), 0.7f);
+    sm.max_num_logprobs = std::nullopt;
+    for (int64_t i = 0; i < n; ++i) {
+      sm.rng_seeds.push_back(500 + static_cast<uint64_t>(i));
+      sm.positions.push_back(40 + i);
+    }
+    sm.rng_seeds[static_cast<size_t>(row_of_x)] = seed;
+    sm.positions[static_cast<size_t>(row_of_x)] = 321;
+    const size_t bytes = logits.size() * sizeof(float);
+    void* d = gpu.Alloc(bytes);
+    gpu.Copy(q, d, logits.data(), bytes);
+    Tensor t = Tensor::Contiguous(d, DType::kF32, dev, {n, V});
+    const int32_t tok =
+        sampler.forward(q, t, sm).sampled_token_ids[static_cast<size_t>(row_of_x)][0];
+    gpu.Free(d);
+    return tok;
+  };
+  for (uint32_t k = 0; k < 4; ++k) {
+    const std::vector<float> x = PseudoRandomLogits(static_cast<size_t>(V), 300 + k);
+    std::vector<float> third = PseudoRandomLogits(static_cast<size_t>(2 * V), 400 + k);
+    third.insert(third.end(), x.begin(), x.end());
+    CHECK(draw(x, 1, 0, 9000 + k) == draw(third, 3, 2, 9000 + k));
   }
   gpu.DestroyQueue(q);
 }

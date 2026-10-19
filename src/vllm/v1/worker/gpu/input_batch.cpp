@@ -148,6 +148,7 @@ InputBatch::InputBatch(int max_num_reqs, int max_model_len,
   repetition_penalties_cpu.assign(n, 0.0f);
   min_p_cpu.assign(n, 0.0f);
   seeds.assign(n, std::nullopt);
+  rng_seeds.assign(n, 0);
   // Speculative decoding: by default 1 token is generated per request
   // (gpu_input_batch.py:240-243). Overwritten by the rejection sampler after a
   // verify step; stays 1 on the default (no-speculator) path.
@@ -284,6 +285,10 @@ int InputBatch::add_request(const CachedRequestState& request) {
 
   // Per-request RNG seed (upstream request.generator == sampling_params.seed).
   seeds[static_cast<size_t>(req_index)] = sp.seed;
+  // The seed its draws are keyed by: its own, else a fresh one (V2
+  // sample/states.py:54-58), so unseeded requests do not share noise.
+  rng_seeds[static_cast<size_t>(req_index)] =
+      sp.seed.has_value() ? static_cast<uint64_t>(*sp.seed) : rng_seed_source_();
 
   // ─── ROAD-V1-C7 SAMPLE-CORE / SAMPLE-LOGIT-FILTERS per-slot controls ───────
   // min_p (gpu_input_batch.py:414-419-style; MinPLogitsProcessor).
@@ -406,6 +411,12 @@ const SamplingMetadata& InputBatch::make_sampling_metadata() const {
     sampling_metadata_cache_ = build_sampling_metadata();
     sampling_metadata_dirty_ = false;
   }
+  // The position each row samples at moves every step, so it is refreshed
+  // on every call, not only when the batch changed. The token being sampled
+  // sits at num_tokens_no_spec, the count before this step's token is added
+  // (both runner paths sample before they advance it).
+  sampling_metadata_cache_.positions.assign(
+      num_tokens_no_spec.begin(), num_tokens_no_spec.begin() + num_reqs());
   return sampling_metadata_cache_;
 }
 
@@ -498,6 +509,11 @@ SamplingMetadata InputBatch::build_sampling_metadata() const {
     }
   }
 
+  // rng_seeds: every row's draw seed (V2 SamplingStates.seeds). The
+  // positions that go with them move every step, so make_sampling_metadata
+  // refreshes those on each call rather than here.
+  md.rng_seeds.assign(rng_seeds.begin(), rng_seeds.begin() + n);
+
   // ─── ROAD-V1-C7 SAMPLE-CORE / SAMPLE-LOGPROBS / SAMPLE-LOGIT-FILTERS ───────
   // max_num_logprobs (gpu_input_batch.py:950 / :1150-1151): max requested count
   // across the batch, or None. Default (no request asked) => None => the sampler
@@ -571,6 +587,7 @@ std::optional<int> InputBatch::remove_request(const std::string& req_id) {
   req_output_token_ids[static_cast<size_t>(req_index)] = std::nullopt;
   spec_token_ids[static_cast<size_t>(req_index)].clear();
   seeds[static_cast<size_t>(req_index)] = std::nullopt;
+  rng_seeds[static_cast<size_t>(req_index)] = 0;
   block_table.clear_row(req_index);
 
   // Discard from the sampling-predicate sets (LoRA / generators / logprobs /
@@ -772,6 +789,8 @@ void InputBatch::condense() {
     seeds[static_cast<size_t>(empty_index)] =
         seeds[static_cast<size_t>(last_req_index)];
     seeds[static_cast<size_t>(last_req_index)] = std::nullopt;
+    rng_seeds[static_cast<size_t>(empty_index)] =
+        rng_seeds[static_cast<size_t>(last_req_index)];
 
     // ROAD-V1-C7 per-slot controls move with the row (gpu_input_batch.py
     // :819-830). min_p is an array; the index-keyed maps pop-and-reinsert; the
@@ -897,6 +916,7 @@ void InputBatch::swap_states(int i1, int i2) {
   std::swap(repetition_penalties_cpu[static_cast<size_t>(i1)],
             repetition_penalties_cpu[static_cast<size_t>(i2)]);
   std::swap(seeds[static_cast<size_t>(i1)], seeds[static_cast<size_t>(i2)]);
+  std::swap(rng_seeds[static_cast<size_t>(i1)], rng_seeds[static_cast<size_t>(i2)]);
 
   // ROAD-V1-C7 per-slot controls (gpu_input_batch.py:686-700). min_p is an
   // array swap; the index-keyed maps use swap_dict_values; the allowed-ids mask

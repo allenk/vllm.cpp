@@ -5823,10 +5823,12 @@ void ComputeLogprobs(Queue& q, Tensor& logprobs, const Tensor& logits);
 // random_sample (topk_topp_sampler.py::random_sample +
 // sample_with_exponential_noise): exponential-noise gumbel-max. For each element
 // draw q ~ Exponential(1); pick `argmax_j(probs[i,j] / q[i,j])`. Per-request
-// seeded RNG: `seeds[i]` is the resolved per-row seed (the Sampler picks the
-// per-request override from `SamplingMetadata.generators` or the batch default —
-// M1.7 Task 4). token_ids [num_reqs] i64; probs [num_reqs, vocab] f32;
-// seeds [num_reqs] i64.
+// seeded RNG: `seeds[i]` is the resolved per-row seed. The Sampler passes
+// StreamSeed(PositionKey(request seed, position), i) (vt/sample_common.h), so a
+// request's draws depend on its seed and the position being sampled and not on
+// its batch row; a hand-built SamplingMetadata without rng_seeds falls back to
+// `SamplingMetadata.generators` or the batch default (M1.7 Task 4).
+// token_ids [num_reqs] i64; probs [num_reqs, vocab] f32; seeds [num_reqs] i64.
 //
 // RNG DEVIATION (recorded, T1 carry): the Exponential(1) draws come from a
 // deterministic splitmix64 hash of (seed, row, vocab_index) mapped through the

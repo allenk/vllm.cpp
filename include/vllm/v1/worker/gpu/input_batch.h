@@ -77,6 +77,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -442,6 +443,13 @@ class InputBatch {
   // make_sampling_metadata).
   std::vector<std::optional<int64_t>> seeds;
 
+  // Per-slot seed every random draw of the request is keyed by (emitted as
+  // SamplingMetadata.rng_seeds): `seeds[i]` when the request has one, else a
+  // value drawn from `rng_seed_source_` at add_request, as vLLM V2 does
+  // (vllm/v1/worker/gpu/sample/states.py:54-58). Without it every unseeded
+  // request would share one noise stream.
+  std::vector<uint64_t> rng_seeds;
+
   // Per-slot speculative token ids (gpu_input_batch.py:286). Empty on the
   // default path; set by update_req_spec_token_ids when a verify step schedules
   // drafts. Kept as a per-slot list so _get_active_token_count / condense swap
@@ -504,6 +512,9 @@ class InputBatch {
   // every batch mutation (add_request / remove_request / condense / swap_states).
   mutable SamplingMetadata sampling_metadata_cache_;
   mutable bool sampling_metadata_dirty_ = true;
+
+  // Source of the seeds of requests that bring none (rng_seeds above).
+  std::mt19937_64 rng_seed_source_{std::random_device{}()};
 };
 
 }  // namespace vllm::v1

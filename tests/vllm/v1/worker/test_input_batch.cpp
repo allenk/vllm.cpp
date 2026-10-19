@@ -12,6 +12,7 @@
 // seed (prefill_token_ids). See the header for the deferred slot state.
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <set>
@@ -963,4 +964,54 @@ TEST_CASE("logprob_token_ids: a default request leaves the optional unset") {
   const auto& md = batch.make_sampling_metadata();
   CHECK(batch.logprob_token_ids.empty());
   CHECK_FALSE(md.logprob_token_ids.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// What the random draws are keyed by (SamplingMetadata.rng_seeds / positions,
+// as vLLM V2's sample/states.py keys them): a request with a seed keeps it, one
+// without gets one of its own, and the position follows num_tokens_no_spec from
+// step to step without a batch change.
+TEST_CASE("make_sampling_metadata: a draw seed per request, a position per step") {
+  InputBatch batch = make_batch();
+  SamplingParams seeded;
+  seeded.seed = 42;
+  batch.add_request(make_req("a", {1, 2, 3}, {}, {0}));
+  batch.add_request(make_req("b", {4, 5}, {}, {1}));
+  batch.add_request(make_req("c", {6}, {7}, {2}, seeded));
+
+  const vllm::v1::SamplingMetadata md = batch.make_sampling_metadata();
+  REQUIRE(md.rng_seeds.size() == 3);
+  CHECK(md.rng_seeds[2] == 42);
+  CHECK(md.rng_seeds[0] != md.rng_seeds[1]);  // two unseeded requests, two streams
+  CHECK(md.generators.size() == 1);           // still only the explicit seed
+  REQUIRE(md.positions.size() == 3);
+  CHECK(md.positions[0] == 3);
+  CHECK(md.positions[1] == 2);
+  CHECK(md.positions[2] == 2);  // one prompt token and one output token
+
+  // A decode step advances the count the runner keeps. The batch did not
+  // change, and the next metadata samples one position further on.
+  batch.num_tokens_no_spec[0] += 1;
+  const vllm::v1::SamplingMetadata next = batch.make_sampling_metadata();
+  CHECK(next.positions[0] == 4);
+  CHECK(next.positions[1] == 2);
+  CHECK(next.rng_seeds == md.rng_seeds);
+}
+
+TEST_CASE("condense and swap_states move the draw seed with the request") {
+  InputBatch batch = make_batch();
+  SamplingParams s7;
+  s7.seed = 7;
+  SamplingParams s9;
+  s9.seed = 9;
+  batch.add_request(make_req("r0", {1}, {}, {0}, s7));
+  batch.add_request(make_req("r1", {2}, {}, {1}));
+  batch.add_request(make_req("r2", {3}, {}, {2}, s9));
+  batch.remove_request("r1");
+  batch.condense();  // r2 slides into slot 1
+  CHECK(batch.make_sampling_metadata().rng_seeds ==
+        std::vector<uint64_t>{7, 9});
+  batch.swap_states(0, 1);
+  CHECK(batch.make_sampling_metadata().rng_seeds ==
+        std::vector<uint64_t>{9, 7});
 }
