@@ -413,12 +413,18 @@ class Scheduler {
   // Backing store for prefix_cache_metrics(); written only by schedule().
   CachingMetrics prefix_cache_metrics_;
 
-  // This step's take-and-swap prefix-cache delta, stashed by schedule() when it
-  // drains make_prefix_cache_stats() (the SAME observation fed to CachingMetrics
-  // and, via make_stats(), to SchedulerStats.prefix_cache_stats). Reset to empty
-  // on a step that produced no observation so make_stats() never re-reports a
-  // stale delta.
-  PrefixCacheStats last_prefix_cache_stats_;
+  // The prefix-cache deltas schedule() drained from make_prefix_cache_stats()
+  // (the SAME observations fed to CachingMetrics) since make_stats() last
+  // published them as SchedulerStats.prefix_cache_stats. ACCUMULATED and
+  // cleared on publish, not overwritten: under async scheduling EngineCore's
+  // batch queue runs a schedule() it does not follow with a make_stats()
+  // (step_with_batch_queue returns before popping while the queue has room),
+  // so an overwrite dropped the lookups of every step that admitted a
+  // request and /metrics read 0 queries with prefix caching on. Upstream
+  // takes the delta inside make_stats (scheduler.py:2399-2436), which
+  // accumulates across schedules the same way. Mutable because make_stats()
+  // is const and publishing is what consumes it.
+  mutable PrefixCacheStats last_prefix_cache_stats_;
 
   // This step's speculative-decoding aggregate, stashed by update_from_output
   // for make_stats() (#2770). Same arrangement, and the same reason, as

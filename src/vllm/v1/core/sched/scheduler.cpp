@@ -1092,14 +1092,18 @@ SchedulerOutput Scheduler::schedule() {
   // history out of the window.
   if (auto stats = kv_cache_manager->make_prefix_cache_stats()) {
     prefix_cache_metrics_.observe(*stats);
-    // Stash the SAME per-step delta so make_stats() can hand it to the
-    // Prometheus logger without a second take-and-swap (which would return an
-    // empty observation). scheduler.py builds SchedulerStats from this delta.
-    last_prefix_cache_stats_ = *stats;
-  } else {
-    // No observation this step (prefix caching off): make_stats() must not
-    // re-report the prior step's delta.
-    last_prefix_cache_stats_ = PrefixCacheStats{};
+    // Add the SAME delta to what make_stats() publishes next, without a second
+    // take-and-swap (which would return an empty observation). Accumulated,
+    // because a schedule() is not always followed by a make_stats() (see the
+    // member's comment).
+    PrefixCacheStats& pending = last_prefix_cache_stats_;
+    pending.reset = pending.reset || stats->reset;
+    pending.requests += stats->requests;
+    pending.queries += stats->queries;
+    pending.hits += stats->hits;
+    pending.preempted_requests += stats->preempted_requests;
+    pending.preempted_queries += stats->preempted_queries;
+    pending.preempted_hits += stats->preempted_hits;
   }
 
   // KV-OFFLOAD W4: build_connector_meta drains + RESETS the connector's per-step
@@ -1666,6 +1670,7 @@ SchedulerStats Scheduler::make_stats() const {
   stats.num_waiting_reqs = static_cast<int64_t>(waiting->size());
   stats.kv_cache_usage = kv_cache_manager->usage();
   stats.prefix_cache_stats = last_prefix_cache_stats_;
+  last_prefix_cache_stats_ = PrefixCacheStats{};  // published once
   // scheduler.py:2696,2708 `spec_stats = spec_decoding_stats` ->
   // SchedulerStats(spec_decoding_stats=spec_stats). Empty unless
   // update_from_output verified a draft this step (#2770).

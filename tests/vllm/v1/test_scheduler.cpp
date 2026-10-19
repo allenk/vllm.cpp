@@ -1999,3 +1999,28 @@ TEST_CASE("Scheduler.schedule: preemption RELEASES the victim's encoder cache sl
       /*num_embeds=*/4, /*encoder_compute_budget=*/64,
       /*num_embeds_to_schedule=*/0));
 }
+
+// ---------------------------------------------------------------------------
+// make_stats() publishes every prefix-cache lookup since its last call, even
+// when more than one schedule() ran in between -- which is what EngineCore's
+// batch queue does under async scheduling: it returns before popping while the
+// queue has room, so the step that admitted a request is followed by another
+// schedule() before any make_stats(). The delta used to be overwritten there,
+// and /metrics read 0 prefix-cache queries with caching on.
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.make_stats: prefix-cache lookups survive a second schedule()") {
+  auto scheduler = CreateScheduler();
+  auto requests = CreateRequests(/*num_requests=*/1, /*num_tokens=*/40, {"0"});
+  Request* req = AddRequest(*scheduler, std::move(requests[0]));
+
+  scheduler->schedule();  // admits "0": one lookup of 40 tokens
+  req->AppendOutputToken(0);
+  scheduler->schedule();  // decodes "0": no lookup
+
+  const auto stats = scheduler->make_stats();
+  CHECK(stats.prefix_cache_stats.requests == 1);
+  CHECK(stats.prefix_cache_stats.queries == 40);
+
+  // Published once: the next snapshot starts from zero.
+  CHECK(scheduler->make_stats().prefix_cache_stats.queries == 0);
+}
