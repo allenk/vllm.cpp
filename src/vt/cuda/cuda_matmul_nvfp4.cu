@@ -1944,6 +1944,196 @@ void MoeGroupedGemmFp8BlockGateUpSiluCuda(Queue& q, Tensor& out, const Tensor& a
   Check(cudaGetLastError(), "moe_grouped_gemm_fp8_block_gate_up_silu kernel launch (naive)");
 }
 
+// --- Block-wise W8A8 FP8 GEMV, activation quant fused (kMatmulFp8BlockScaledGemv) --
+// The dense block-FP8 linear at decode sizes in one launch. Every CTA first runs
+// vt::QuantFp8Group's math over all M rows of x into shared memory: an eps-seeded
+// max per block_k group (fmaxf is exact and order-free, so 32 lanes reach the value
+// cuda_quant_fp8.cu's 16-lane kernel reaches), the scale and the element as two
+// divides, the saturating round-to-nearest-even convert. The bytes and scales are
+// therefore that op's. Then one warp per output column n reads its weight row in
+// 16-byte chunks, converts each chunk once, and adds a_scale * w_scale times the
+// chunk's exact e4m3 products to every row's sum. This replaces the quant launch,
+// MatmulFp8BlockScaled's scale transpose and its CUTLASS tile; the output is
+// rounded through bf16 as that op's store rounds it.
+
+__device__ __forceinline__ void E4m3x16ToFloat(uint4 v, float (&f)[16]) {
+  const uint32_t vv[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float2 lo = Fp8x2E4m3ToFloat2(vv[i]);
+    const float2 hi = Fp8x2E4m3ToFloat2(vv[i] >> 16);
+    f[4 * i + 0] = lo.x;
+    f[4 * i + 1] = lo.y;
+    f[4 * i + 2] = hi.x;
+    f[4 * i + 3] = hi.y;
+  }
+}
+
+// Four consecutive elements of x as f32: one 8-byte (bf16) or 16-byte (f32) load.
+__device__ __forceinline__ void LoadQuad(const __nv_bfloat16* p, float (&v)[4]) {
+  const uint2 raw = *reinterpret_cast<const uint2*>(p);
+  const auto* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) v[i] = __bfloat162float(h[i]);
+}
+__device__ __forceinline__ void LoadQuad(const float* p, float (&v)[4]) {
+  const float4 raw = *reinterpret_cast<const float4*>(p);
+  v[0] = raw.x;
+  v[1] = raw.y;
+  v[2] = raw.z;
+  v[3] = raw.w;
+}
+
+constexpr int kFp8GemvGroup = 128;  // the activation quant's group: the weight's block_k
+
+template <typename Tin, typename Tout, int MAXM, int WARPS>
+__global__ __launch_bounds__(WARPS * 32) void MatmulFp8BlockGemvKernel(
+    Tout* out, const Tin* x, const uint8_t* w, const float* w_scale, int m_rows,
+    int64_t n_cols, int64_t k_dim, int64_t block_n) {
+  extern __shared__ __align__(16) uint8_t fp8_gemv_smem[];
+  const int64_t k_blocks = k_dim / kFp8GemvGroup;
+  uint8_t* q = fp8_gemv_smem;                                                 // [M, K] e4m3
+  float* a_scale = reinterpret_cast<float*>(fp8_gemv_smem + m_rows * k_dim);  // [M, k_blocks]
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+
+  // The activation quant. A warp takes four groups per pass, loading all four
+  // before it reduces any; a lane holds four consecutive elements of each.
+  constexpr int kUnroll = 4;
+  const int64_t groups = m_rows * k_blocks;
+  for (int64_t g0 = warp; g0 < groups; g0 += kUnroll * WARPS) {
+    float v[kUnroll][4];
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int64_t g = g0 + u * WARPS;
+      if (g < groups)
+        LoadQuad(x + (g / k_blocks) * k_dim + (g % k_blocks) * kFp8GemvGroup + lane * 4, v[u]);
+    }
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int64_t g = g0 + u * WARPS;
+      if (g >= groups) break;  // warp-uniform, so the shuffles below stay full-warp
+      float amax = 1e-10f;     // the eps seed of QuantFp8Group's max
+#pragma unroll
+      for (int i = 0; i < 4; ++i) amax = fmaxf(amax, fabsf(v[u][i]));
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+      const float y_s = amax / 448.0f;
+      if (lane == 0) a_scale[g] = y_s;
+      uint32_t word = 0u;
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+        word |= static_cast<uint32_t>(__nv_cvt_float_to_fp8(
+                    fminf(fmaxf(v[u][i] / y_s, -448.0f), 448.0f), __NV_SATFINITE, __NV_E4M3))
+                << (8 * i);
+      *reinterpret_cast<uint32_t*>(q + (g / k_blocks) * k_dim + (g % k_blocks) * kFp8GemvGroup +
+                                   lane * 4) = word;
+    }
+  }
+  __syncthreads();
+
+  const int64_t n = static_cast<int64_t>(blockIdx.x) * WARPS + warp;
+  if (n >= n_cols) return;  // warp-uniform, and after the barrier
+  const int64_t chunks = k_dim / 16;
+  constexpr int64_t chunks_per_block = kFp8GemvGroup / 16;
+  const auto* wrow = reinterpret_cast<const uint4*>(w + n * k_dim);
+  const float* ws = w_scale + (n / block_n) * k_blocks;
+  float acc[MAXM];
+#pragma unroll
+  for (int r = 0; r < MAXM; ++r) acc[r] = 0.0f;
+  // Up to four weight chunks per lane are loaded before any is consumed: one
+  // 16-byte load in flight per lane leaves a decode-sized grid (N = 2048 is 256
+  // CTAs) well short of the memory bandwidth. Each lane still adds its chunks
+  // in ascending order.
+  constexpr int kLoads = 4;
+  for (int64_t c0 = lane; c0 < chunks; c0 += 32 * kLoads) {
+    uint4 wv[kLoads];
+#pragma unroll
+    for (int u = 0; u < kLoads; ++u)
+      if (c0 + 32 * u < chunks) wv[u] = wrow[c0 + 32 * u];
+#pragma unroll
+    for (int u = 0; u < kLoads; ++u) {
+      const int64_t c = c0 + 32 * u;
+      if (c >= chunks) break;
+      float wf[16];
+      E4m3x16ToFloat(wv[u], wf);
+      const int64_t kb = c / chunks_per_block;
+      const float sw = ws[kb];
+#pragma unroll
+      for (int r = 0; r < MAXM; ++r) {
+        if (r < m_rows) {
+          float af[16];
+          E4m3x16ToFloat(reinterpret_cast<const uint4*>(q + r * k_dim)[c], af);
+          float part = 0.0f;
+#pragma unroll
+          for (int j = 0; j < 16; ++j) part = fmaf(wf[j], af[j], part);
+          acc[r] = fmaf(a_scale[r * k_blocks + kb] * sw, part, acc[r]);
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < MAXM; ++r) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], off);
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (int r = 0; r < MAXM; ++r)
+      if (r < m_rows) Store(out, r * n_cols + n, __bfloat162float(__float2bfloat16(acc[r])));
+  }
+}
+
+template <typename Tin, typename Tout>
+void LaunchFp8BlockGemv(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w_fp8,
+                        const Tensor& w_scale, int m, int64_t n, int64_t k, int64_t block_n) {
+  constexpr int kWarps = 8;
+  const dim3 grid(static_cast<unsigned>((n + kWarps - 1) / kWarps));
+  const size_t smem = static_cast<size_t>(m) * static_cast<size_t>(k) +
+                      static_cast<size_t>(m) * static_cast<size_t>(k / kFp8GemvGroup) *
+                          sizeof(float);
+  Tout* o = out.Ptr<Tout>();
+  const Tin* xp = x.Ptr<Tin>();
+  const auto* wp = static_cast<const uint8_t*>(w_fp8.data);
+  const float* sp = w_scale.Ptr<float>();
+  if (m <= 1)
+    MatmulFp8BlockGemvKernel<Tin, Tout, 1, kWarps>
+        <<<grid, kWarps * 32, smem, s>>>(o, xp, wp, sp, m, n, k, block_n);
+  else if (m <= 2)
+    MatmulFp8BlockGemvKernel<Tin, Tout, 2, kWarps>
+        <<<grid, kWarps * 32, smem, s>>>(o, xp, wp, sp, m, n, k, block_n);
+  else if (m <= 4)
+    MatmulFp8BlockGemvKernel<Tin, Tout, 4, kWarps>
+        <<<grid, kWarps * 32, smem, s>>>(o, xp, wp, sp, m, n, k, block_n);
+  else
+    MatmulFp8BlockGemvKernel<Tin, Tout, 8, kWarps>
+        <<<grid, kWarps * 32, smem, s>>>(o, xp, wp, sp, m, n, k, block_n);
+  Check(cudaGetLastError(), "matmul_fp8_block_scaled_gemv kernel launch");
+}
+
+void MatmulFp8BlockScaledGemvCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& w_fp8,
+                                  const Tensor& w_scale, int64_t block_n, int64_t block_k) {
+  const int64_t m = x.shape[0], k = x.shape[1], n = w_fp8.shape[0];
+  if (m == 0 || n == 0) return;
+  VT_CHECK(block_k == kFp8GemvGroup,
+           "cuda matmul_fp8_block_scaled_gemv: the activation quant group is 128 here");
+  cudaStream_t s = AsStream(q);
+  const int mi = static_cast<int>(m);
+  if (x.dtype == DType::kBF16) {
+    if (out.dtype == DType::kBF16)
+      LaunchFp8BlockGemv<__nv_bfloat16, __nv_bfloat16>(s, out, x, w_fp8, w_scale, mi, n, k,
+                                                       block_n);
+    else
+      LaunchFp8BlockGemv<__nv_bfloat16, float>(s, out, x, w_fp8, w_scale, mi, n, k, block_n);
+  } else {
+    if (out.dtype == DType::kBF16)
+      LaunchFp8BlockGemv<float, __nv_bfloat16>(s, out, x, w_fp8, w_scale, mi, n, k, block_n);
+    else
+      LaunchFp8BlockGemv<float, float>(s, out, x, w_fp8, w_scale, mi, n, k, block_n);
+  }
+}
+
 // --- Tier-A4: SHARED fused BF16 grouped-MoE gate+up+SwiGLU (kMoeGroupedGemmBf16-
 // GateUpSilu) ------------------------------------------------------------------
 // ONE vt entry replaces the {MoeGroupedGemmBf16(gate); MoeGroupedGemmBf16(up);
@@ -3200,6 +3390,9 @@ struct Registrar {
     RegisterOp(OpId::kMoeGroupedGemmFp8BlockGateUpSilu, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MoeGroupedGemmFp8BlockGateUpSiluFn>(
                    &MoeGroupedGemmFp8BlockGateUpSiluCuda)));
+    RegisterOp(OpId::kMatmulFp8BlockScaledGemv, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<MatmulFp8BlockScaledGemvFn>(
+                   &MatmulFp8BlockScaledGemvCuda)));
   }
 } registrar;
 

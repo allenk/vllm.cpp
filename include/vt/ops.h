@@ -929,6 +929,10 @@ enum class OpId : uint8_t {
   // SwiGLU between them fused (decode). Appended before kCount so no existing
   // op's id shifts.
   kMoeGroupedGemmFp8BlockGateUpSilu,
+  // The block-wise W8A8 FP8 linear at decode sizes, with its activation quant
+  // fused (MatmulFp8BlockScaledGemv). Appended before kCount so no existing op's
+  // id shifts.
+  kMatmulFp8BlockScaledGemv,
   kCount
 };
 
@@ -2356,6 +2360,9 @@ using MoeGroupedGemmFp8BlockGateUpSiluFn =
              const Tensor* /*row_map*/, const Tensor& /*gate_ptrs*/,
              const Tensor& /*gate_scale_ptrs*/, const Tensor& /*up_ptrs*/,
              const Tensor& /*up_scale_ptrs*/, int64_t /*block_n*/, int64_t /*block_k*/);
+using MatmulFp8BlockScaledGemvFn =
+    void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*w_fp8*/,
+             const Tensor& /*w_scale*/, int64_t /*block_n*/, int64_t /*block_k*/);
 // kMoeGroupedGemmBf16GateUpSilu: out[P,N] bf16 = silu(gate)*up, gate/up = grouped
 // bf16 GEMM of act[T|P,K] against per-expert weight-pointer arrays gate_ptrs/
 // up_ptrs [E] i64, expert_ids[P] i32, optional row_map[P] i32. Same convention as
@@ -3507,6 +3514,26 @@ void MoeGroupedGemmFp8BlockGateUpSilu(Queue& q, Tensor& out, const Tensor& act,
                                       const Tensor& gate_ptrs, const Tensor& gate_scale_ptrs,
                                       const Tensor& up_ptrs, const Tensor& up_scale_ptrs,
                                       int64_t block_n, int64_t block_k);
+
+// vt::MatmulFp8BlockScaledGemv — the block-wise W8A8 FP8 linear for a few rows
+// (decode), in one launch:
+//   (q, a_scale) = QuantFp8Group(x, block_k)      recomputed inside, same bytes
+//   out[m, n]    = sum_kb a_scale[m, kb] * w_scale[n / block_n, kb]
+//                         * sum_{k in kb} q[m, k] * w_fp8[n, k]
+// rounded through bf16 as MatmulFp8BlockScaled's store rounds it (an f32 out
+// holds the bf16 value). The same math as QuantFp8Group followed by
+// MatmulFp8BlockScaled, without the scale transpose and the tile: one warp per
+// output column reads its weight row once for every row of x. The f32 sums run in
+// another order than the tensor-core tile's, so the two agree to rounding, not
+// bit for bit. Any N. Use MatmulFp8BlockScaledGemvApplies for the shapes it takes.
+// Registered on kCUDA.
+//   out      [M, N] f32/bf16      x        [M, K] f32/bf16
+//   w_fp8    [N, K] i8 (e4m3fn)   w_scale  [cdiv(N, block_n), K / block_k] f32
+void MatmulFp8BlockScaledGemv(Queue& q, Tensor& out, const Tensor& x, const Tensor& w_fp8,
+                              const Tensor& w_scale, int64_t block_n, int64_t block_k);
+// M <= 8, block_k == 128 (every block-FP8 release so far), K % 128 == 0, and the
+// rows' quantized bytes and scales fit the launch's 48 KiB of shared memory.
+bool MatmulFp8BlockScaledGemvApplies(int64_t m, int64_t k, int64_t block_k);
 
 // MoeGroupedGemmNvfp4Marlin (lift of vLLM moe_wna16_marlin_gemm, ops.cu:543 —
 // the Marlin W4A16 kernel vLLM selects for the 35B's NVFP4 MoE experts). One

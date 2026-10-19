@@ -1054,6 +1054,44 @@ void MoeGroupedGemmFp8BlockGateUpSilu(Queue& q, Tensor& out, const Tensor& act,
       block_n, block_k);
 }
 
+bool MatmulFp8BlockScaledGemvApplies(int64_t m, int64_t k, int64_t block_k) {
+  // Shared memory per CTA: the rows' e4m3 bytes, then one f32 scale per group.
+  constexpr int64_t kMaxRows = 8, kGroup = 128, kSmemBytes = 48 * 1024;
+  if (m < 1 || m > kMaxRows || k < 1 || block_k != kGroup || k % kGroup != 0) return false;
+  return m * k + m * (k / kGroup) * static_cast<int64_t>(sizeof(float)) <= kSmemBytes;
+}
+
+void MatmulFp8BlockScaledGemv(Queue& q, Tensor& out, const Tensor& x, const Tensor& w_fp8,
+                              const Tensor& w_scale, int64_t block_n, int64_t block_k) {
+  const std::string op = "matmul_fp8_block_scaled_gemv";
+  VT_CHECK(out.rank == 2 && x.rank == 2 && w_fp8.rank == 2 && w_scale.rank == 2,
+           op + ": out, x, w_fp8 and w_scale must be rank-2");
+  const int64_t m = x.shape[0], k = x.shape[1], n = w_fp8.shape[0];
+  VT_CHECK(x.dtype == DType::kF32 || x.dtype == DType::kBF16, op + ": x must be f32/bf16");
+  VT_CHECK(IsOutFloat(out.dtype), op + ": out must be f32/bf16");
+  VT_CHECK(w_fp8.dtype == DType::kI8 && w_fp8.shape[1] == k,
+           op + ": w_fp8 must be i8 (e4m3fn) [N, K] with x's K");
+  VT_CHECK(out.shape[0] == m && out.shape[1] == n, op + ": out must be [M, N]");
+  VT_CHECK(block_n > 0 && block_k > 0, op + ": block_n and block_k must be positive");
+  VT_CHECK(w_scale.dtype == DType::kF32 && w_scale.shape[0] == (n + block_n - 1) / block_n &&
+               w_scale.shape[1] == (k + block_k - 1) / block_k,
+           op + ": w_scale must be f32 [cdiv(N, block_n), cdiv(K, block_k)]");
+  VT_CHECK(MatmulFp8BlockScaledGemvApplies(m, k, block_k),
+           op + ": needs M <= 8, block_k == 128, K % 128 == 0 and the rows' quantized bytes "
+                "within 48 KiB (M=" +
+               std::to_string(m) + ", K=" + std::to_string(k) + ", block_k=" +
+               std::to_string(block_k) + ")");
+  VT_CHECK(out.IsContiguous() && x.IsContiguous() && w_fp8.IsContiguous() &&
+               w_scale.IsContiguous(),
+           op + ": contiguous tensors required");
+  VT_CHECK(out.device == q.device && x.device == q.device && w_fp8.device == q.device &&
+               w_scale.device == q.device,
+           op + ": device mismatch");
+  reinterpret_cast<MatmulFp8BlockScaledGemvFn>(
+      GetOp(OpId::kMatmulFp8BlockScaledGemv, q.device.type))(q, out, x, w_fp8, w_scale, block_n,
+                                                             block_k);
+}
+
 namespace {
 void ValidateMoeGroupedGemmBf16GateUpSilu(Queue& q, const Tensor& out, const Tensor& act,
                                   const Tensor& expert_ids, const Tensor* row_map,

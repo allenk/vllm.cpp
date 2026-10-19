@@ -3351,6 +3351,10 @@ target_include_directories(test_fp8_per_tensor_dispatch PRIVATE ${CMAKE_SOURCE_D
 # is not a pass and must not be reported as one.
 vllm_cpp_add_test(test_ops_matmul_fp8_block_cuda vt/test_ops_matmul_fp8_block_cuda.cpp)
 target_include_directories(test_ops_matmul_fp8_block_cuda PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The decode arm of the same linear: QuantFp8Group fused into a W8A8 GEMV
+# (vt::MatmulFp8BlockScaledGemv), against a double reference built on the CPU
+# QuantFp8Group's bytes. CUDA cases skip without a device.
+vllm_cpp_add_test(test_ops_matmul_fp8_block_gemv vt/test_ops_matmul_fp8_block_gemv.cpp)
 # fp8 plan-cache arms, re-pinned by FIX-FP8-PLAN-CAPTURE-1843: the cache is
 # DEFAULT ON (on CUDA 13.3 the uncached lane queries the cuBLASLt heuristic
 # inside CUDA-graph capture and dies — #1843), so the cache-ON arm of the
