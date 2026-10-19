@@ -1007,3 +1007,18 @@ TEST_CASE("W1 KVBytesPerBlock reads a SlidingWindowMLASpec group's PADDED page")
                                             swa}}};
   CHECK(KVBytesPerBlock(config) == 2 * 37440);
 }
+
+// KV-MAMBA-ALIGN: in mode "align" the runner keeps one recurrent state row per
+// block id, so the Mamba group's rows are part of every block and the pool's
+// block count must pay for them.
+TEST_CASE("KVBytesPerBlock: an align-mode Mamba group is part of every block") {
+  auto mamba = new_mamba_spec();
+  mamba->mamba_cache_mode = "align";
+  KVCacheConfig hybrid{
+      /*num_blocks=*/10,
+      /*kv_cache_tensors=*/{},
+      /*kv_cache_groups=*/
+      {KVCacheGroupSpec{{"attn_layer"}, new_kv_cache_spec()},
+       KVCacheGroupSpec{{"mamba_a", "mamba_b"}, mamba}}};
+  CHECK(KVBytesPerBlock(hybrid) == 16384 + 2 * mamba->page_size_bytes());
+}

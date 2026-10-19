@@ -525,6 +525,28 @@ class LoadedEngine {
                                bool serves_one_sequence_per_step);
   static bool ResolveEnablePrefixCaching(const EngineParams& params,
                                          const ModelInfo& model_info);
+  // KV-MAMBA-ALIGN: whether prefix caching runs this model's recurrent layers
+  // in Mamba "align" mode -- prefix caching resolved on for a hybrid whose
+  // registration supports it (model_executor/models/config.py::
+  // MambaModelConfig, which selects align whenever prefix caching is on).
+  // THROWS when prefix caching is on for a hybrid that cannot keep its state
+  // at block boundaries, or together with speculative decoding (phase 1 of
+  // .agents/specs/mamba-align-retention.md): both used to admit cache hits
+  // whose recurrent layers then resumed from a state that was not theirs.
+  static bool UsesMambaAlign(const EngineParams& params, const ModelInfo& model_info,
+                             const std::optional<vllm::SpeculativeConfig>& spec);
+  // The engine block size: in align mode the attention block that holds one
+  // recurrent state page (platforms/interface.py::_align_hybrid_block_size:
+  // B = A * cdiv(mamba_page, A * attn_bytes_per_token), A = max(16, the
+  // requested block size)), else the requested size or 32.
+  static int ResolveEngineBlockSize(
+      const LoadedModel& model, const HfConfig& config, const EngineParams& params,
+      const std::optional<vllm::SpeculativeConfig>& spec);
+  // The arithmetic of ResolveEngineBlockSize on an already-built KV config whose
+  // attention spec pages at `align` tokens: the smallest multiple of `align`
+  // whose attention page (all K and V bytes of one token, times the block) holds
+  // the config's recurrent state page.
+  static int MambaAlignBlockSize(const vllm::v1::KVCacheConfig& probe, int align);
   // ARCH-ONE-SURFACE ROW 8: the EXPLICIT arms of the device-selection policy
   // behind SelectQueue, factored pure over the "is the CUDA platform
   // registered" probe answer so the CPU tier can gate the whole matrix without

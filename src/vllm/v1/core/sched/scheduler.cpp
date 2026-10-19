@@ -289,8 +289,63 @@ Scheduler::Scheduler(SchedulerConfig scheduler_config,
   // config this scheduler carries.
   max_num_encoder_input_tokens_ = scheduler_config.max_num_encoder_input_tokens;
   disable_chunked_mm_input_ = scheduler_config.disable_chunked_mm_input;
+
+  // KV-MAMBA-ALIGN (scheduler.py:316-318 @ 0.28.0): upstream reads
+  // `has_mamba_layers and cache_config.mamba_cache_mode == "align"`; this
+  // config carries the mode on the Mamba spec itself.
+  for (const auto& group : kv_cache_config_.kv_cache_groups) {
+    const auto* mamba = dynamic_cast<const MambaSpec*>(group.kv_cache_spec.get());
+    if (mamba != nullptr && mamba->mamba_cache_mode == "align") {
+      need_mamba_block_aligned_split_ = true;
+    }
+  }
   encoder_cache_manager = std::make_unique<core::EncoderCacheManager>(
       scheduler_config.encoder_cache_size);
+}
+
+int Scheduler::mamba_block_aligned_split(const Request& request, int num_new_tokens,
+                                         int num_new_local_computed_tokens,
+                                         int num_external_computed_tokens) const {
+  const int start = request.num_computed_tokens + num_new_local_computed_tokens +
+                    num_external_computed_tokens;
+  // Split only during prefill: `num_tokens - 1` extends this to resumed
+  // requests replaying their output tokens.
+  const int prefill_end = std::max(request.num_prompt_tokens, request.NumTokens() - 1);
+  if (start >= prefill_end) {
+    return num_new_tokens;
+  }
+
+  const int block_size = block_size_;
+  // The last block-aligned position whose state can be cached (no EAGLE block
+  // drop here: use_eagle is false).
+  const int last_cache_position = request.NumTokens() - request.NumTokens() % block_size;
+
+  int end = start + num_new_tokens;
+  // Chunk ends must be block aligned, except the prompt's last chunk, whose
+  // block decode advances to the boundary. A block too wide for one chunk
+  // advances sub-block and re-aligns at the next boundary.
+  if (end < prefill_end) {
+    int max_prefill_tokens = max_num_scheduled_tokens;
+    if (long_prefill_token_threshold_ > 0) {
+      max_prefill_tokens = std::min(max_prefill_tokens, long_prefill_token_threshold_);
+    }
+    const int aligned_end = end / block_size * block_size;
+    if (aligned_end > start || block_size <= max_prefill_tokens) {
+      end = aligned_end;
+    }
+  }
+
+  // A chunk that starts mid-block stops at the boundary rather than running
+  // past it, and no chunk runs past the last cacheable boundary: stop at the
+  // earliest of these strictly inside the chunk.
+  const int next_block_boundary = (start / block_size + 1) * block_size;
+  for (const int stop : {start % block_size != 0 ? next_block_boundary : 0,
+                         last_cache_position}) {
+    if (start < stop && stop < end) {
+      end = stop;
+    }
+  }
+  return std::max(end - start, 0);
 }
 
 void Scheduler::shutdown() {
@@ -690,6 +745,12 @@ SchedulerOutput Scheduler::schedule() {
         std::min(num_new_tokens, max_model_len - request->num_computed_tokens -
                                      num_sampled_tokens_per_step_);
 
+    // Apply the Mamba alignment before the encoder caps (scheduler.py:578-582
+    // @ 0.28.0). A 0 is handled by the `continue` below.
+    if (need_mamba_block_aligned_split_) {
+      num_new_tokens = mamba_block_aligned_split(*request, num_new_tokens);
+    }
+
     // Schedule encoder inputs (scheduler.py:522-536). May CLAMP num_new_tokens
     // — including to 0, which the `continue` below then handles exactly as
     // upstream's reason 2/3 ("the encoder budget/cache is exhausted"). Empty and
@@ -909,6 +970,17 @@ SchedulerOutput Scheduler::schedule() {
       }
       num_new_tokens = std::min(num_new_tokens, token_budget);
       assert(num_new_tokens > 0);
+
+      // Apply the Mamba alignment before the encoder caps (scheduler.py:969-977
+      // @ 0.28.0); a chunk that cannot advance to a boundary waits.
+      if (need_mamba_block_aligned_split_) {
+        num_new_tokens = mamba_block_aligned_split(
+            *request, num_new_tokens, num_new_local_computed_tokens,
+            num_external_computed_tokens);
+        if (num_new_tokens == 0) {
+          break;
+        }
+      }
 
       // Schedule encoder inputs (scheduler.py:862-876). The CLAMP is what keeps
       // a chunked prefill from covering placeholder rows whose encoder could not

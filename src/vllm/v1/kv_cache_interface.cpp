@@ -251,10 +251,18 @@ int64_t KVBytesPerBlock(const KVCacheConfig& config) {
     return bytes;
   }
   // Uniform path: sum each attention group's page over the layers it covers.
-  // Mamba/GDN groups do not scale with the block count in our runner, so they
-  // are skipped (dynamic_cast to AttentionSpec fails for MambaSpec).
+  // A Mamba/GDN group in mode "none" holds one state per sequence, which does
+  // not scale with the block count, so it is skipped; in mode "align" the
+  // runner keeps one state row per block id (KV-MAMBA-ALIGN), so its rows are
+  // part of every block.
   int64_t bytes = 0;
   for (const auto& group : config.kv_cache_groups) {
+    if (const auto* mamba = dynamic_cast<const MambaSpec*>(group.kv_cache_spec.get());
+        mamba != nullptr && mamba->mamba_cache_mode == "align") {
+      bytes += mamba->page_size_bytes() *
+               static_cast<int64_t>(group.layer_names.size());
+      continue;
+    }
     const auto* attn =
         dynamic_cast<const AttentionSpec*>(group.kv_cache_spec.get());
     if (attn == nullptr) {

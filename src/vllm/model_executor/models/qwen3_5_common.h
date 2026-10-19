@@ -26,6 +26,7 @@ inline constexpr ModelInfo kQwen3_5Info{
     .is_pooling_model = false,
     .is_hybrid = true,
     .has_inner_state = false,
+    .supports_mamba_align = true,
     .supports_multimodal = true,
     .score_type = "bi-encoder",
 };
@@ -44,6 +45,7 @@ inline constexpr ModelInfo kQwen3_5TextInfo{
     .is_pooling_model = false,
     .is_hybrid = true,
     .has_inner_state = false,
+    .supports_mamba_align = true,
     .supports_multimodal = false,
     .score_type = "bi-encoder",
 };

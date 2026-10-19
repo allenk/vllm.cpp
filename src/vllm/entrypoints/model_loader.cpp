@@ -1405,6 +1405,64 @@ bool LoadedEngine::ResolveEnablePrefixCaching(const EngineParams& params,
   return !model_info.is_hybrid && !model_info.has_inner_state;
 }
 
+bool LoadedEngine::UsesMambaAlign(
+    const EngineParams& params, const ModelInfo& model_info,
+    const std::optional<vllm::SpeculativeConfig>& spec) {
+  if (!model_info.is_hybrid || !ResolveEnablePrefixCaching(params, model_info)) {
+    return false;
+  }
+  if (!model_info.supports_mamba_align) {
+    throw std::invalid_argument(
+        "prefix caching is not supported for this hybrid model: its recurrent "
+        "layers do not keep their state at block boundaries (mamba_cache_mode "
+        "align), so a cache hit would resume them from another request's "
+        "state. Drop --enable-prefix-caching.");
+  }
+  if (spec.has_value()) {
+    throw std::invalid_argument(
+        "prefix caching on a hybrid model is not supported together with "
+        "speculative decoding yet (the recurrent state copy does not handle "
+        "draft tokens). Drop --enable-prefix-caching or the speculative config.");
+  }
+  return true;
+}
+
+int LoadedEngine::ResolveEngineBlockSize(
+    const LoadedModel& model, const HfConfig& config, const EngineParams& params,
+    const std::optional<vllm::SpeculativeConfig>& spec) {
+  if (!UsesMambaAlign(params, model.registration().info, spec)) {
+    return params.block_size > 0 ? params.block_size : 32;
+  }
+  // Upstream's A is max(the attention backend's smallest kernel block, the
+  // configured block size); FlashAttention's kernel block is any multiple of
+  // 16 and upstream's default block is 16.
+  const int align = std::max(16, params.block_size);
+  return MambaAlignBlockSize(
+      MakeKVCacheMaybeSpec(model, config, align, /*num_blocks=*/1, spec), align);
+}
+
+int LoadedEngine::MambaAlignBlockSize(const vllm::v1::KVCacheConfig& probe, int align) {
+  const vllm::v1::AttentionSpec* attn = nullptr;
+  const vllm::v1::MambaSpec* mamba = nullptr;
+  for (const auto& group : probe.kv_cache_groups) {
+    if (attn == nullptr) {
+      attn = dynamic_cast<const vllm::v1::AttentionSpec*>(group.kv_cache_spec.get());
+    }
+    if (mamba == nullptr) {
+      mamba = dynamic_cast<const vllm::v1::MambaSpec*>(group.kv_cache_spec.get());
+    }
+  }
+  VT_CHECK(attn != nullptr && mamba != nullptr,
+           "mamba align: a hybrid KV config needs an attention and a Mamba group");
+  const int64_t attn_bytes_per_token =
+      attn->real_page_size_bytes() / attn->storage_block_size();
+  const int64_t mamba_page = mamba->page_size_bytes();
+  VT_CHECK(attn_bytes_per_token > 0 && mamba_page > 0,
+           "mamba align: zero attention or recurrent page");
+  const int64_t per_block = align * attn_bytes_per_token;
+  return static_cast<int>(align * ((mamba_page + per_block - 1) / per_block));
+}
+
 // ARCH-ONE-SURFACE ROW 8: the explicit arms of the device-selection policy —
 // see the contract in model_loader.h. Ported semantics:
 // vllm/config/device.py:61-66 @ 555967922 (an explicit device string is
@@ -1845,9 +1903,27 @@ vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheResolved(
   // ctor's kv_cfg_ member initializer), and ApplyResolvedCacheDType below runs
   // up to twice.
   WarnUncalibratedKvScales(params);
+  // KV-MAMBA-ALIGN: the spec builders emit mode "none"; upstream reads the
+  // mode from CacheConfig when it builds the spec
+  // (model_executor/layers/mamba/abstract.py:72-91), so it is set here, where
+  // the engine knows prefix caching is on. Before ResolveNumBlocks, because an
+  // align-mode Mamba group is part of every block (KVBytesPerBlock).
+  const bool mamba_align = UsesMambaAlign(params, model.registration().info, spec);
+  const auto set_align_mode = [mamba_align](vllm::v1::KVCacheConfig& kv) {
+    if (!mamba_align) return;
+    for (auto& group : kv.kv_cache_groups) {
+      const auto* mamba =
+          dynamic_cast<const vllm::v1::MambaSpec*>(group.kv_cache_spec.get());
+      if (mamba == nullptr) continue;
+      auto aligned = std::make_shared<vllm::v1::MambaSpec>(*mamba);
+      aligned->mamba_cache_mode = "align";
+      group.kv_cache_spec = std::move(aligned);
+    }
+  };
   const int probe_blocks = params.num_blocks > 0 ? params.num_blocks : 256;
   vllm::v1::KVCacheConfig probe =
       MakeKVCacheMaybeSpec(model, config, block_size, probe_blocks, spec);
+  set_align_mode(probe);
   // KV-FP8 W3 — the storage dtype is applied to the PROBE, before
   // ResolveNumBlocks reads its geometry. That ordering IS the halved-block
   // feature: `KVBytesPerBlock(probe)` is the divisor knob 2 sizes the pool with,
@@ -1862,6 +1938,7 @@ vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheResolved(
   }
   vllm::v1::KVCacheConfig sized =
       MakeKVCacheMaybeSpec(model, config, block_size, resolved, spec);
+  set_align_mode(sized);
   ApplyResolvedCacheDType(params, sized);
   return sized;
 }
@@ -2200,7 +2277,8 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // it. `ResolveKVBlockSize` is idempotent, so the funnel below re-resolving
       // it is a guarantee for direct callers rather than a second policy.
       block_size_(ModelRegistry::ResolveKVBlockSize(
-          model_->registration(), params.block_size > 0 ? params.block_size : 32)),
+          model_->registration(),
+          ResolveEngineBlockSize(*model_, config_, params, resolved_spec_config_))),
       kv_cfg_(MakeKVCacheResolved(*model_, config_, block_size_, params,
                                   resolved_spec_config_)),
       // The serving length, checked (pinned) or auto-fitted (unpinned) against
@@ -2332,6 +2410,21 @@ LoadedEngine::LoadedEngine(HfConfig config,
                  std::to_string(block_size_) +
                  ". A page wider than the stride is read as the wrong tokens, "
                  "not as an error.");
+  }
+  // KV-MAMBA-ALIGN: say what upstream says when prefix caching raises a
+  // hybrid's block size (platforms/interface.py: "Setting attention block size
+  // to %d tokens to ensure that attention page size is >= mamba page size").
+  for (const auto& group : kv_cfg_.kv_cache_groups) {
+    const auto* mamba =
+        dynamic_cast<const vllm::v1::MambaSpec*>(group.kv_cache_spec.get());
+    if (mamba != nullptr && mamba->mamba_cache_mode == "align") {
+      std::cerr << "vllm.cpp: prefix caching on a hybrid model: Mamba cache mode "
+                   "'align', attention block size "
+                << block_size_
+                << " tokens so that one block holds one recurrent state page; "
+                << kv_cfg_.num_blocks << " blocks\n";
+      break;
+    }
   }
   // issue #371: REFUSE an unservable recurrent-state budget instead of
   // allocating it. Speculation widens the Mamba/GDN state to k+1 snapshot slots

@@ -737,6 +737,20 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   const int spec_cols = spec_on() ? num_spec() + 1 : 1;
   const int64_t base_slots = max_num_reqs_ > 0 ? max_num_reqs_ : num_blocks_;
   gdn_state_slots_ = base_slots * spec_cols;
+  // KV-MAMBA-ALIGN: in align mode a state lives in its KV block, so the pool
+  // has a row per block id and no per-request slot is handed out. The
+  // loader refuses align with speculation, so spec_cols is 1 here.
+  gdn_align_ = false;
+  gdn_align_block_size_ = 0;
+  for (const auto& group : kv_cache_config.kv_cache_groups) {
+    const auto* mamba = dynamic_cast<const MambaSpec*>(group.kv_cache_spec.get());
+    if (mamba != nullptr && mamba->mamba_cache_mode == "align") {
+      VT_CHECK(!spec_on(), "runner: Mamba align mode with speculative decoding");
+      gdn_align_ = true;
+      gdn_align_block_size_ = mamba->block_size;
+    }
+  }
+  if (gdn_align_) gdn_state_slots_ = num_blocks_;
   gdn_slot_of_req_.clear();
   gdn_free_slots_.clear();
   gdn_free_slots_.reserve(static_cast<size_t>(base_slots));
@@ -1078,6 +1092,11 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     }
     gdn_conv_cache_dtype_ = state_dtypes[0];
     gdn_ssm_cache_dtype_ = state_dtypes[1];
+    gdn_state_row_bytes_.clear();
+    for (size_t i = 0; i < num_states; ++i) {
+      gdn_state_row_bytes_.push_back(static_cast<size_t>(state_row_elems[i]) *
+                                     vt::SizeOf(state_dtypes[i]));
+    }
     // The per-slot byte cost the allocator will use IS the spec's page size —
     // upstream's `MambaSpec.page_size_bytes` is the sum of `prod(shape) *
     // dtype_size` over the state tensors (`kv_cache_interface.py:698-707`).
@@ -1977,6 +1996,45 @@ void GPUModelRunner::remap_gdn_state_slots(
   }
 }
 
+void GPUModelRunner::select_gdn_align_state_blocks(std::vector<int32_t>& gdn_bt,
+                                                   int gdn_cols,
+                                                   const StepInputs& step) {
+  const int block = gdn_align_block_size_;
+  VT_CHECK(block > 0, "GDN align: no block size");
+  const int num_reqs = static_cast<int>(step.seq_lens.size());
+  VT_CHECK(step.num_scheduled_tokens.size() == step.seq_lens.size(),
+           "GDN align: step carries no per-request scheduled token counts");
+  vt::Backend& backend = vt::GetBackend(queue_.device.type);
+  for (int r = 0; r < num_reqs; ++r) {
+    const int seq_len = step.seq_lens[static_cast<size_t>(r)];
+    const int num_computed = seq_len - step.num_scheduled_tokens[static_cast<size_t>(r)];
+    VT_CHECK(seq_len > 0 && num_computed >= 0, "GDN align: bad sequence length");
+    const int curr = (seq_len - 1) / block;
+    const int prev = num_computed > 0 ? (num_computed - 1) / block : -1;
+    VT_CHECK(curr < gdn_cols, "GDN align: state column past the block table");
+    const size_t row = static_cast<size_t>(r) * static_cast<size_t>(gdn_cols);
+    const int32_t dst = gdn_bt[row + static_cast<size_t>(curr)];
+    VT_CHECK(dst > 0 && dst < gdn_state_slots_,
+             "GDN align: the running state block is not allocated");
+    if (prev >= 0 && prev != curr) {
+      const int32_t src = gdn_bt[row + static_cast<size_t>(prev)];
+      VT_CHECK(src > 0 && src < gdn_state_slots_,
+               "GDN align: the previous state block is not allocated");
+      // Every GDN layer, every published state: one row each. Queued on the
+      // main queue ahead of this step's forward, after the previous step's.
+      for (auto& layer : recurrent_state_buf_) {
+        for (size_t i = 0; i < layer.size(); ++i) {
+          const size_t bytes = gdn_state_row_bytes_[i];
+          auto* base = static_cast<uint8_t*>(layer[i]->data());
+          backend.Copy(queue_, base + static_cast<size_t>(dst) * bytes,
+                       base + static_cast<size_t>(src) * bytes, bytes);
+        }
+      }
+    }
+    gdn_bt[row] = dst;
+  }
+}
+
 // ─── ENG-MM-INPUT-PIPELINE P2 (#2379): the runner's multimodal path ──────────
 //
 // Three hops separate `Request.mm_features` from `ModelForwardInput::mm`. The
@@ -2816,7 +2874,11 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     // max_num_reqs (one recurrent state per sequence) rather than the attention
     // num_blocks, and no two live sequences ever collide on one slot. Only col 0
     // (state indices) is read downstream.
-    remap_gdn_state_slots(gdn_bt, gdn_cols, num_reqs, input_batch_.req_ids);
+    if (gdn_align_) {
+      select_gdn_align_state_blocks(gdn_bt, gdn_cols, step);
+    } else {
+      remap_gdn_state_slots(gdn_bt, gdn_cols, num_reqs, input_batch_.req_ids);
+    }
     if (GdnDiagStepLogEnabled()) {
       std::cerr << "[VT_GDN_DIAG] step num_reqs=" << num_reqs
                 << " gdn_free_slots=" << gdn_free_slots_.size()

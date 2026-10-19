@@ -2348,6 +2348,10 @@ target_include_directories(test_loaded_engine_dense PRIVATE ${CMAKE_SOURCE_DIR}/
 # checkpoint k/v-scale path, entered through the LoadedEngine loader.
 vllm_cpp_add_test(test_kv_cache_fp8_wiring vllm/entrypoints/test_kv_cache_fp8_wiring.cpp)
 vllm_cpp_add_test(test_dspark_block_size_guard vllm/entrypoints/test_dspark_block_size_guard.cpp)
+# KV-MAMBA-ALIGN: when prefix caching puts a hybrid in Mamba align mode, and the
+# attention block it needs, checked on the shipped Qwen3.5 KV specs.
+vllm_cpp_add_test(test_mamba_align_config vllm/entrypoints/test_mamba_align_config.cpp)
+target_include_directories(test_mamba_align_config PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace cache walk entered through
 # the production loader, with a repository identifier rather than a path. The
 # transformers_utils suite calls the function directly and cannot see a deleted

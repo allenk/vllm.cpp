@@ -67,7 +67,7 @@
 //     prefill_capacity_bound), PAUSE state, streaming/resumable sessions,
 //     skipped_waiting, priority scheduling (SchedulingPolicy::kPriority throws).
 //   - Structured-output grammar, LoRA gating, KV-connector / EC-connector,
-//     mamba block-aligned split, defer_block_free / deferred_frees, kv-cache
+//     defer_block_free / deferred_frees, kv-cache
 //     metrics, MFU perf metrics, kv_cache_events. (log-stats events /
 //     take_events are un-deferred for SERVE-RESPONSE-METRICS: schedule() records
 //     QUEUED/SCHEDULED/PREEMPTED per request, drained onto EngineCoreOutput.)
@@ -182,6 +182,21 @@ class Scheduler {
 
   // schedule(): the core token-budget algorithm. See the file header.
   SchedulerOutput schedule();
+
+  // scheduler.py::_mamba_block_aligned_split @ 0.28.0: clip a prefill chunk
+  // so it ends where the Mamba state must be cached. Block p of a request's
+  // Mamba block table holds the state after exactly (p + 1) * block_size
+  // tokens, and the state is written at chunk ends, so a chunk that does not
+  // finish the prefill ends on a block boundary, a chunk that starts mid-block
+  // stops at the next boundary, and no chunk runs past the last cacheable
+  // boundary. Decode is untouched. Not ported: EAGLE's block drop (this
+  // scheduler runs use_eagle false), partial hits (hash block == block) and
+  // shared-prefix junctions. schedule() applies it when
+  // need_mamba_block_aligned_split_; public because the tests drive it with
+  // hand-worked cases, as upstream's tests call the Python method.
+  int mamba_block_aligned_split(const Request& request, int num_new_tokens,
+                                int num_new_local_computed_tokens = 0,
+                                int num_external_computed_tokens = 0) const;
 
   // get_grammar_bitmask (scheduler.py:1477-1499): collect the scheduled
   // structured-output request ids (skipping requests still in a prefill chunk),
@@ -561,6 +576,10 @@ class Scheduler {
   // check can convert its block-granular match into tokens for the threshold
   // comparison (see maybe_reorder_waiting_for_lpm).
   int block_size_ = 0;
+  // KV-MAMBA-ALIGN (scheduler.py:316-318 @ 0.28.0): a Mamba group in "align"
+  // mode keeps its state at block boundaries, so prefill chunks must end on
+  // them (mamba_block_aligned_split).
+  bool need_mamba_block_aligned_split_ = false;
   // max_num_encoder_input_tokens (scheduler.py:226-228): the PER-STEP encoder
   // compute budget in encoder tokens, reset at the top of every schedule().
   int max_num_encoder_input_tokens_ = 0;
