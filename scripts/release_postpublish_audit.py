@@ -88,7 +88,7 @@ def expected_names(matrix: dict[str, Any], version: str) -> tuple[set[str], set[
 
 def _canonical_index_bytes(
     remote_bytes: dict[str, bytes], matrix: dict[str, Any], declaration: dict[str, Any],
-    source_sha: str,
+    source_sha: str, repo: str,
 ) -> tuple[bytes, bytes]:
     """Regenerate both indexes from authenticated downloaded triplet bytes."""
     with tempfile.TemporaryDirectory(prefix="vllm-release-index-audit-") as temporary:
@@ -125,7 +125,7 @@ def _canonical_index_bytes(
         try:
             release_index_tool.generate_index(
                 assets, handoff, json_output, markdown_output,
-                matrix["retention"]["ci_artifacts_days"],
+                matrix["retention"]["ci_artifacts_days"], repo,
             )
         except (
             OSError,
@@ -300,7 +300,7 @@ def validate_remote_release(
         if proofs != [expected_proof]:
             raise ValueError(f"{archive} must have exactly one valid bound attestation")
     expected_json, expected_markdown = _canonical_index_bytes(
-        remote_bytes, matrix, declaration, source_sha
+        remote_bytes, matrix, declaration, source_sha, repo
     )
     if remote_bytes["release-index.json"] != expected_json:
         raise ValueError(

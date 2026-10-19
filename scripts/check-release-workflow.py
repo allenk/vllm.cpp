@@ -719,6 +719,7 @@ def validate(text: str) -> list[str]:
                 "--json-output": "verified/release-index.json",
                 "--markdown-output": "verified/RELEASE_INDEX.md",
                 "--retention-days": "7",
+                "--repository": "${{ github.repository }}",
             },
         ),
         upload_is_bound(

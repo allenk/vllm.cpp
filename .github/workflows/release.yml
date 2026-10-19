@@ -802,7 +802,8 @@ jobs:
             --handoff verified/verified-handoff.json \
             --json-output verified/release-index.json \
             --markdown-output verified/RELEASE_INDEX.md \
-            --retention-days 7
+            --retention-days 7 \
+            --repository '${{ github.repository }}'
       - name: Upload immutable verified handoff
         id: upload
         uses: actions/upload-artifact@v4

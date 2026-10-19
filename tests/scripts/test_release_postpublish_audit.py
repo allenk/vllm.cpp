@@ -146,7 +146,9 @@ class PostPublishAuditContract(unittest.TestCase):
             }
             index_path = root / "release-index.json"
             markdown_path = root / "RELEASE_INDEX.md"
-            self.indexer.generate_index(assets, handoff, index_path, markdown_path)
+            self.indexer.generate_index(
+                assets, handoff, index_path, markdown_path, repository=REPO
+            )
             remote_bytes["release-index.json"] = index_path.read_bytes()
             remote_bytes["RELEASE_INDEX.md"] = markdown_path.read_bytes()
         assets = [

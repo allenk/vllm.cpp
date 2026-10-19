@@ -101,6 +101,25 @@ class ReleaseIndexContract(unittest.TestCase):
             ])
             self.assertIn("linux-x86_64-glibc-cpu", markdown_out.read_text())
 
+    def test_markdown_links_are_download_urls_when_a_repository_is_given(self) -> None:
+        # The Markdown doubles as the GitHub release body, where ./<name>
+        # resolves against .../releases/tag/<tag> and 404s.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets, handoff = self.assets(root)
+            markdown_out = root / "RELEASE_INDEX.md"
+            index = self.tool.generate_index(
+                assets, handoff, root / "i.json", markdown_out, repository="allenk/vllm.cpp"
+            )
+            text = markdown_out.read_text()
+            base = f"https://github.com/allenk/vllm.cpp/releases/download/{index['release_tag']}/"
+            self.assertIn(f"]({base}{index['artifacts'][0]['archive']})", text)
+            self.assertNotIn("](./", text)
+            with self.assertRaises(ValueError):
+                self.tool.generate_index(
+                    assets, handoff, root / "j.json", root / "j.md", repository="not a slug"
+                )
+
     def test_index_reads_windows_zip_from_explicit_handoff_format(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

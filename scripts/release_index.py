@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 import tarfile
 import zipfile
@@ -56,9 +57,12 @@ def generate_index(
     json_output: Path,
     markdown_output: Path,
     retention_days: int = 7,
+    repository: str | None = None,
 ) -> dict[str, Any]:
     if handoff.get("verified") is not True:
         raise ValueError("release index requires a verified handoff")
+    if repository is not None and not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise ValueError("release index repository must be owner/name")
     retention = handoff.get("retention")
     if retention != {
         "ci_artifacts_days": retention_days,
@@ -192,12 +196,21 @@ def generate_index(
         "| Artifact | Channel | Host ABI | Backend | CPU tiers / CUDA SMs | Boundary and limitations |",
         "|---|---|---|---|---|---|",
     ]
+    # The Markdown is the GitHub release BODY as well as an asset. On the release
+    # page a relative `./<name>` resolves against .../releases/tag/<tag> and
+    # 404s, which is what every link of v0.0.3-vk.1 and v0.0.4-vk.1 did. With a
+    # repository the links are the release's own download URLs; without one
+    # (an offline index beside the archives) they stay relative.
+    base = (
+        f"https://github.com/{repository}/releases/download/{index['release_tag']}/"
+        if repository is not None else "./"
+    )
     for row in rows:
         host = row["host"]
         capabilities = ", ".join(row["cpu_tiers"] or row["sms"] or ["platform-native"])
         boundary = "; ".join([row["static_boundary"], row["driver_boundary"], *row["limitations"]])
         lines.append(
-            f"| [{row['id']}](./{row['archive']}) ([sha256](./{row['checksum']})) "
+            f"| [{row['id']}]({base}{row['archive']}) ([sha256]({base}{row['checksum']})) "
             f"| {row['channel']} | {host['os']}/{host['arch']}/{host['abi']} {host['abi_version']} "
             f"| {row['backend']} | {capabilities} | {boundary} |"
         )
@@ -220,6 +233,8 @@ def main() -> int:
     parser.add_argument("--json-output", type=Path, required=True)
     parser.add_argument("--markdown-output", type=Path, required=True)
     parser.add_argument("--retention-days", type=int, default=7)
+    parser.add_argument("--repository", default=None,
+                        help="owner/name; makes the Markdown links absolute download URLs")
     args = parser.parse_args()
     try:
         handoff = json.loads(args.handoff.read_text(encoding="utf-8"))
@@ -229,6 +244,7 @@ def main() -> int:
             args.json_output,
             args.markdown_output,
             args.retention_days,
+            args.repository,
         )
     except (OSError, json.JSONDecodeError, tarfile.TarError, zipfile.BadZipFile, ValueError) as exc:
         print(f"release index error: {exc}", file=sys.stderr)

@@ -105,22 +105,33 @@ def write_tar_archive(stage_dir: Path, temporary: Path, epoch: int) -> None:
                         bundle.addfile(info)
 
 
+# Deflate at level 9, the level the tar.gz path's GzipFile uses, so both
+# formats compress the same way and stay byte-reproducible for one zlib. The
+# zip was STORED until 0.0.4-vk.2: the 8-SM Windows CUDA archive shipped its
+# 507 MiB server uncompressed, where deflate gives 123.5 MiB -- the size class
+# of the 10-SM Linux tar.gz (135 MiB). The fatbin is most of that binary and it
+# compresses to about a quarter.
+ZIP_LEVEL = 9
+
+
 def write_zip_archive(stage_dir: Path, temporary: Path, epoch: int) -> None:
     # ZIP timestamps cannot represent dates before 1980 and have two-second precision.
     timestamp = time.gmtime(max(epoch, 315532800))[:6]
     timestamp = (*timestamp[:5], timestamp[5] - timestamp[5] % 2)
-    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED, strict_timestamps=True) as bundle:
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED,
+                         compresslevel=ZIP_LEVEL, strict_timestamps=True) as bundle:
         for path in archive_paths(stage_dir):
             relative = path.relative_to(stage_dir).as_posix()
             directory = path.is_dir()
             info = zipfile.ZipInfo(relative + ("/" if directory else ""), timestamp)
             info.create_system = 3
-            info.compress_type = zipfile.ZIP_STORED
+            info.compress_type = zipfile.ZIP_STORED if directory else zipfile.ZIP_DEFLATED
             info.external_attr = ((0o40755 if directory else (0o100755 if path.stat().st_mode & 0o111 else 0o100644)) << 16)
             if directory:
-                bundle.writestr(info, b"")
+                bundle.writestr(info, b"", compress_type=zipfile.ZIP_STORED)
             else:
-                bundle.writestr(info, path.read_bytes())
+                bundle.writestr(info, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED,
+                                compresslevel=ZIP_LEVEL)
 
 
 def write_archive(
