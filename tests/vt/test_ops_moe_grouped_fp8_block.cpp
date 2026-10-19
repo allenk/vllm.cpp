@@ -25,6 +25,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "support/test_env.h"  // SetEnv/UnsetEnv — MSVC has no setenv (#603)
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/fp8_kv.h"
@@ -533,6 +534,41 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu is correct above the warp
   Case c;
   c.e_count = 7; c.t_rows = 20; c.top_k = 8; c.k_dim = 256; c.n_cols = 192; c.seed = 800;
   RunGateUpCase(c, /*expect_bit_identical=*/false);
+}
+
+// The warp kernels batch their weight loads (several output columns per warp,
+// several chunks in flight per lane) without touching the order of any sum, so
+// every layout must give the bits of the one-column, one-load layout that
+// VT_MOE_FP8_BLOCK_WARP_LOADS=0 selects. K = 2048 runs one column with four
+// loads, 1024 two columns with two, 512 and 256 four columns with one; N = 100
+// leaves a short last column group.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block warp layouts are bit-identical to one load per lane") {
+  if (!HasCuda()) {
+    MESSAGE("CUDA backend unavailable; skipping");
+    return;
+  }
+  constexpr const char* kKnob = "VT_MOE_FP8_BLOCK_WARP_LOADS";
+  for (const int64_t k : {2048, 1024, 512, 256}) {
+    CAPTURE(k);
+    Case c;
+    c.e_count = 5; c.t_rows = 2; c.top_k = 8; c.k_dim = k; c.n_cols = 100; c.block_n = 32;
+    c.seed = 1000 + static_cast<uint32_t>(k);
+    const Fixture f = Build(c);
+    const Fixture u = BuildUp(c);
+    Case cb = c;
+    cb.bf16_out = true;
+    const Fixture fb = Build(cb);
+    vllm_test::SetEnv(kKnob, "0");
+    const std::vector<float> one = Run(f);
+    const std::vector<float> one_bf16 = Run(fb);
+    const std::vector<uint16_t> one_fused = RunGateUp(f, u).fused;
+    vllm_test::UnsetEnv(kKnob);
+    const std::vector<float> batched = Run(f);
+    CheckAgainstReference(f, batched);
+    CHECK(batched == one);
+    CHECK(Run(fb) == one_bf16);
+    CHECK(RunGateUp(f, u).fused == one_fused);
+  }
 }
 
 TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu is bit-reproducible run to run") {

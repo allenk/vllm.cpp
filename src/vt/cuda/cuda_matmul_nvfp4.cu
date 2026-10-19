@@ -1543,38 +1543,86 @@ __global__ void MoeGroupedGemmFp8BlockNaive(Tout* out, const __nv_bfloat16* act,
   }
 }
 
-// Decode: one warp per output column n of one pair row, the block's WARPS warps
-// on consecutive columns. Lanes stride K in 16-element chunks, so a warp reads
-// 512 contiguous weight bytes per step. Needs K % 16 == 0 and block_k % 16 == 0
-// (no chunk straddles a scale block); the launcher checks both. The lane order
-// and the butterfly reduction are fixed, so the result is reproducible.
-template <typename Tout, int WARPS>
+// Decode: one warp per NPW consecutive output columns of one pair row, the
+// block's WARPS warps on consecutive column groups. Lanes stride K in 16-element
+// chunks, so a warp reads 512 contiguous weight bytes per row and step, and a
+// lane loads up to LOADS chunks of each of its NPW rows before it consumes any:
+// one load in flight per lane left these kernels near 1 TB/s at decode sizes.
+// Each output still adds its chunks in ascending order and reduces with the same
+// butterfly, so NPW and LOADS change when the bytes arrive and never the sum:
+// every instantiation is the NPW = LOADS = 1 kernel bit for bit. Needs
+// K % 16 == 0 and block_k % 16 == 0 (no chunk straddles a scale block); the
+// launcher checks both. The result is reproducible.
+template <typename Tout, int WARPS, int NPW, int LOADS>
 __global__ __launch_bounds__(WARPS * 32) void MoeGroupedGemmFp8BlockWarp(
     Tout* out, const __nv_bfloat16* act, const int32_t* expert_ids, const int32_t* row_map,
     const int64_t* weight_ptrs, const int64_t* scale_ptrs, int64_t p_rows, int64_t n_cols,
     int64_t k_dim, int64_t block_n, int64_t block_k) {
   const int lane = static_cast<int>(threadIdx.x) & 31;
-  const int64_t n =
-      static_cast<int64_t>(blockIdx.x) * WARPS + (static_cast<int>(threadIdx.x) >> 5);
-  if (n >= n_cols) return;  // n is warp-uniform, so whole warps leave together
+  const int64_t n0 =
+      (static_cast<int64_t>(blockIdx.x) * WARPS + (static_cast<int>(threadIdx.x) >> 5)) * NPW;
+  if (n0 >= n_cols) return;  // n0 is warp-uniform, so whole warps leave together
   const int64_t chunks = k_dim / 16;
   const int64_t k_blocks = (k_dim + block_k - 1) / block_k;
   const int64_t chunks_per_block = block_k / 16;
   for (int64_t p = blockIdx.y; p < p_rows; p += gridDim.y) {
     const int64_t e = expert_ids[p];
     const int64_t r = row_map != nullptr ? row_map[p] : p;
-    const auto* w =
-        reinterpret_cast<const uint4*>(static_cast<uintptr_t>(weight_ptrs[e])) + n * chunks;
-    const auto* s = reinterpret_cast<const float*>(static_cast<uintptr_t>(scale_ptrs[e])) +
-                    (n / block_n) * k_blocks;
+    const auto* w = reinterpret_cast<const uint4*>(static_cast<uintptr_t>(weight_ptrs[e]));
+    const auto* s = reinterpret_cast<const float*>(static_cast<uintptr_t>(scale_ptrs[e]));
     const auto* a = reinterpret_cast<const uint4*>(act + r * k_dim);
-    float acc = 0.0f;
-    for (int64_t c = lane; c < chunks; c += 32)
-      acc = fmaf(s[c / chunks_per_block], Fp8x16DotBf16(w[c], a[2 * c], a[2 * c + 1]), acc);
+    float acc[NPW];
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
-    if (lane == 0) Store(out, p * n_cols + n, acc);
+    for (int j = 0; j < NPW; ++j) acc[j] = 0.0f;
+    for (int64_t c0 = lane; c0 < chunks; c0 += 32 * LOADS) {
+      uint4 wv[NPW][LOADS];
+#pragma unroll
+      for (int j = 0; j < NPW; ++j)
+#pragma unroll
+        for (int l = 0; l < LOADS; ++l)
+          if (n0 + j < n_cols && c0 + 32 * l < chunks) wv[j][l] = w[(n0 + j) * chunks + c0 + 32 * l];
+#pragma unroll
+      for (int l = 0; l < LOADS; ++l) {
+        const int64_t c = c0 + 32 * l;
+        if (c >= chunks) break;
+        const uint4 a_lo = a[2 * c], a_hi = a[2 * c + 1];
+        const int64_t kb = c / chunks_per_block;
+#pragma unroll
+        for (int j = 0; j < NPW; ++j)
+          if (n0 + j < n_cols)
+            acc[j] = fmaf(s[((n0 + j) / block_n) * k_blocks + kb],
+                          Fp8x16DotBf16(wv[j][l], a_lo, a_hi), acc[j]);
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < NPW; ++j) {
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) acc[j] += __shfl_xor_sync(0xffffffffu, acc[j], off);
+      if (lane == 0 && n0 + j < n_cols) Store(out, p * n_cols + n0 + j, acc[j]);
+    }
   }
+}
+
+// VT_MOE_FP8_BLOCK_WARP_LOADS=0 runs the block-FP8 warp kernels with one output
+// column per warp and one chunk in flight per lane, the layout before the loads
+// were batched, for a same-binary A/B; the outputs are the same bits either way.
+// Read per launch (captured with the graph), so a test can flip it in-process.
+bool Fp8BlockWarpLoadsEnabled() {
+  const char* e = std::getenv("VT_MOE_FP8_BLOCK_WARP_LOADS");
+  return !(e != nullptr && e[0] == '0');
+}
+
+// Outputs per warp and chunks in flight per output for a K: four loads per lane
+// whenever K has them (2048 has four chunks per lane, 512 one).
+struct Fp8BlockWarpLayout {
+  int npw, loads;
+};
+Fp8BlockWarpLayout Fp8BlockWarpLayoutFor(int64_t k) {
+  if (!Fp8BlockWarpLoadsEnabled()) return {1, 1};
+  const int64_t per_lane = k / 16 / 32;
+  if (per_lane >= 4) return {1, 4};
+  if (per_lane >= 2) return {2, 2};
+  return {4, 1};
 }
 
 // Prefill: the bf16 path's expert-grouped WMMA tile (counting-sorted pair rows,
@@ -1775,10 +1823,21 @@ void LaunchGroupedFp8Block(cudaStream_t s, Tensor& out, const Tensor& act,
   const unsigned y = static_cast<unsigned>(p < 65535 ? p : 65535);
   if (vec) {
     constexpr int kWarps = 8;
-    const dim3 grid(static_cast<unsigned>((n + kWarps - 1) / kWarps), y);
-    MoeGroupedGemmFp8BlockWarp<Tout, kWarps><<<grid, kWarps * 32, 0, s>>>(
-        out.Ptr<Tout>(), act.Ptr<__nv_bfloat16>(), eids, rmap, weight_ptrs.Ptr<int64_t>(),
-        scale_ptrs.Ptr<int64_t>(), p, n, k, bn, bk);
+    const Fp8BlockWarpLayout lay = Fp8BlockWarpLayoutFor(k);
+    const dim3 grid(static_cast<unsigned>((n + kWarps * lay.npw - 1) / (kWarps * lay.npw)), y);
+    auto go = [&](auto kernel) {
+      kernel<<<grid, kWarps * 32, 0, s>>>(out.Ptr<Tout>(), act.Ptr<__nv_bfloat16>(), eids, rmap,
+                                          weight_ptrs.Ptr<int64_t>(), scale_ptrs.Ptr<int64_t>(), p,
+                                          n, k, bn, bk);
+    };
+    if (lay.npw == 1 && lay.loads == 4)
+      go(MoeGroupedGemmFp8BlockWarp<Tout, kWarps, 1, 4>);
+    else if (lay.npw == 2)
+      go(MoeGroupedGemmFp8BlockWarp<Tout, kWarps, 2, 2>);
+    else if (lay.npw == 4)
+      go(MoeGroupedGemmFp8BlockWarp<Tout, kWarps, 4, 1>);
+    else
+      go(MoeGroupedGemmFp8BlockWarp<Tout, kWarps, 1, 1>);
     Check(cudaGetLastError(), "moe_grouped_gemm_fp8_block kernel launch (warp)");
     return;
   }
@@ -1868,47 +1927,69 @@ __global__ void MoeGroupedGemmFp8BlockGateUpSiluNaive(
   }
 }
 
-// MoeGroupedGemmFp8BlockWarp for two tables: one warp per output column n of one
-// pair row; K % 16 == 0 and block_k % 16 == 0.
-template <int WARPS>
+// MoeGroupedGemmFp8BlockWarp for two tables: one warp per NPW output columns of
+// one pair row, LOADS chunks of each row and table in flight per lane, each sum in
+// that kernel's order; K % 16 == 0 and block_k % 16 == 0.
+template <int WARPS, int NPW, int LOADS>
 __global__ __launch_bounds__(WARPS * 32) void MoeGroupedGemmFp8BlockGateUpSiluWarp(
     __nv_bfloat16* out, const __nv_bfloat16* act, const int32_t* expert_ids,
     const int32_t* row_map, const int64_t* gate_ptrs, const int64_t* gate_scale_ptrs,
     const int64_t* up_ptrs, const int64_t* up_scale_ptrs, int64_t p_rows, int64_t n_cols,
     int64_t k_dim, int64_t block_n, int64_t block_k) {
   const int lane = static_cast<int>(threadIdx.x) & 31;
-  const int64_t n =
-      static_cast<int64_t>(blockIdx.x) * WARPS + (static_cast<int>(threadIdx.x) >> 5);
-  if (n >= n_cols) return;  // n is warp-uniform, so whole warps leave together
+  const int64_t n0 =
+      (static_cast<int64_t>(blockIdx.x) * WARPS + (static_cast<int>(threadIdx.x) >> 5)) * NPW;
+  if (n0 >= n_cols) return;  // n0 is warp-uniform, so whole warps leave together
   const int64_t chunks = k_dim / 16;
   const int64_t k_blocks = (k_dim + block_k - 1) / block_k;
   const int64_t chunks_per_block = block_k / 16;
   for (int64_t p = blockIdx.y; p < p_rows; p += gridDim.y) {
     const int64_t e = expert_ids[p];
     const int64_t r = row_map != nullptr ? row_map[p] : p;
-    const auto* wg =
-        reinterpret_cast<const uint4*>(static_cast<uintptr_t>(gate_ptrs[e])) + n * chunks;
-    const auto* wu =
-        reinterpret_cast<const uint4*>(static_cast<uintptr_t>(up_ptrs[e])) + n * chunks;
-    const int64_t srow = (n / block_n) * k_blocks;
-    const auto* sg =
-        reinterpret_cast<const float*>(static_cast<uintptr_t>(gate_scale_ptrs[e])) + srow;
-    const auto* su =
-        reinterpret_cast<const float*>(static_cast<uintptr_t>(up_scale_ptrs[e])) + srow;
+    const auto* wg = reinterpret_cast<const uint4*>(static_cast<uintptr_t>(gate_ptrs[e]));
+    const auto* wu = reinterpret_cast<const uint4*>(static_cast<uintptr_t>(up_ptrs[e]));
+    const auto* sg = reinterpret_cast<const float*>(static_cast<uintptr_t>(gate_scale_ptrs[e]));
+    const auto* su = reinterpret_cast<const float*>(static_cast<uintptr_t>(up_scale_ptrs[e]));
     const auto* a = reinterpret_cast<const uint4*>(act + r * k_dim);
-    float g = 0.0f, u = 0.0f;
-    for (int64_t c = lane; c < chunks; c += 32) {
-      const uint4 a_lo = a[2 * c], a_hi = a[2 * c + 1];
-      const int64_t kb = c / chunks_per_block;
-      g = fmaf(sg[kb], Fp8x16DotBf16(wg[c], a_lo, a_hi), g);
-      u = fmaf(su[kb], Fp8x16DotBf16(wu[c], a_lo, a_hi), u);
+    float g[NPW], u[NPW];
+#pragma unroll
+    for (int j = 0; j < NPW; ++j) g[j] = u[j] = 0.0f;
+    for (int64_t c0 = lane; c0 < chunks; c0 += 32 * LOADS) {
+      uint4 wgv[NPW][LOADS], wuv[NPW][LOADS];
+#pragma unroll
+      for (int j = 0; j < NPW; ++j)
+#pragma unroll
+        for (int l = 0; l < LOADS; ++l)
+          if (n0 + j < n_cols && c0 + 32 * l < chunks) {
+            wgv[j][l] = wg[(n0 + j) * chunks + c0 + 32 * l];
+            wuv[j][l] = wu[(n0 + j) * chunks + c0 + 32 * l];
+          }
+#pragma unroll
+      for (int l = 0; l < LOADS; ++l) {
+        const int64_t c = c0 + 32 * l;
+        if (c >= chunks) break;
+        const uint4 a_lo = a[2 * c], a_hi = a[2 * c + 1];
+        const int64_t kb = c / chunks_per_block;
+#pragma unroll
+        for (int j = 0; j < NPW; ++j) {
+          if (n0 + j < n_cols) {
+            const int64_t si = ((n0 + j) / block_n) * k_blocks + kb;
+            g[j] = fmaf(sg[si], Fp8x16DotBf16(wgv[j][l], a_lo, a_hi), g[j]);
+            u[j] = fmaf(su[si], Fp8x16DotBf16(wuv[j][l], a_lo, a_hi), u[j]);
+          }
+        }
+      }
     }
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-      g += __shfl_xor_sync(0xffffffffu, g, off);
-      u += __shfl_xor_sync(0xffffffffu, u, off);
+    for (int j = 0; j < NPW; ++j) {
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) {
+        g[j] += __shfl_xor_sync(0xffffffffu, g[j], off);
+        u[j] += __shfl_xor_sync(0xffffffffu, u[j], off);
+      }
+      if (lane == 0 && n0 + j < n_cols)
+        Store(out, p * n_cols + n0 + j, SiluMulOfBf16Sums(g[j], u[j]));
     }
-    if (lane == 0) Store(out, p * n_cols + n, SiluMulOfBf16Sums(g, u));
   }
 }
 
@@ -1927,11 +2008,22 @@ void MoeGroupedGemmFp8BlockGateUpSiluCuda(Queue& q, Tensor& out, const Tensor& a
   const unsigned y = static_cast<unsigned>(p < 65535 ? p : 65535);
   if ((k % 16 == 0) && (block_k % 16 == 0)) {
     constexpr int kWarps = 8;
-    const dim3 grid(static_cast<unsigned>((n + kWarps - 1) / kWarps), y);
-    MoeGroupedGemmFp8BlockGateUpSiluWarp<kWarps><<<grid, kWarps * 32, 0, s>>>(
-        out.Ptr<__nv_bfloat16>(), act.Ptr<__nv_bfloat16>(), eids, rmap,
-        gate_ptrs.Ptr<int64_t>(), gate_scale_ptrs.Ptr<int64_t>(), up_ptrs.Ptr<int64_t>(),
-        up_scale_ptrs.Ptr<int64_t>(), p, n, k, block_n, block_k);
+    const Fp8BlockWarpLayout lay = Fp8BlockWarpLayoutFor(k);
+    const dim3 grid(static_cast<unsigned>((n + kWarps * lay.npw - 1) / (kWarps * lay.npw)), y);
+    auto go = [&](auto kernel) {
+      kernel<<<grid, kWarps * 32, 0, s>>>(
+          out.Ptr<__nv_bfloat16>(), act.Ptr<__nv_bfloat16>(), eids, rmap,
+          gate_ptrs.Ptr<int64_t>(), gate_scale_ptrs.Ptr<int64_t>(), up_ptrs.Ptr<int64_t>(),
+          up_scale_ptrs.Ptr<int64_t>(), p, n, k, block_n, block_k);
+    };
+    if (lay.npw == 1 && lay.loads == 4)
+      go(MoeGroupedGemmFp8BlockGateUpSiluWarp<kWarps, 1, 4>);
+    else if (lay.npw == 2)
+      go(MoeGroupedGemmFp8BlockGateUpSiluWarp<kWarps, 2, 2>);
+    else if (lay.npw == 4)
+      go(MoeGroupedGemmFp8BlockGateUpSiluWarp<kWarps, 4, 1>);
+    else
+      go(MoeGroupedGemmFp8BlockGateUpSiluWarp<kWarps, 1, 1>);
     Check(cudaGetLastError(), "moe_grouped_gemm_fp8_block_gate_up_silu kernel launch (warp)");
     return;
   }
