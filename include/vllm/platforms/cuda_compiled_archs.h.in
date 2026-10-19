@@ -21,4 +21,14 @@
 
 #define VLLM_CPP_CUDA_FA2_COMPILED_ARCHS "@VLLM_CPP_CUDA_FA2_COMPILED_ARCHS@"
 
+// The head dims those kernels were instantiated for (VLLM_CPP_FA2_HEAD_DIMS,
+// all four by default), comma separated, and one 0/1 per dim. Rendered from the
+// same CMake block that picks the kernel sources, so a dim reads 1 exactly when
+// its instantiation was compiled; empty and all 0 when FA2 is not compiled.
+#define VLLM_CPP_CUDA_FA2_HEAD_DIMS "@VLLM_CPP_CUDA_FA2_HEAD_DIMS@"
+#define VLLM_CPP_CUDA_FA2_HEAD_DIM_64 @VLLM_CPP_CUDA_FA2_HEAD_DIM_64@
+#define VLLM_CPP_CUDA_FA2_HEAD_DIM_128 @VLLM_CPP_CUDA_FA2_HEAD_DIM_128@
+#define VLLM_CPP_CUDA_FA2_HEAD_DIM_192 @VLLM_CPP_CUDA_FA2_HEAD_DIM_192@
+#define VLLM_CPP_CUDA_FA2_HEAD_DIM_256 @VLLM_CPP_CUDA_FA2_HEAD_DIM_256@
+
 #endif  // VLLM_PLATFORMS_CUDA_COMPILED_ARCHS_H_

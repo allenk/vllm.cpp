@@ -254,6 +254,8 @@ defaults.
 | `VLLM_CPP_CUTLASS_DIR` | `third_party/cutlass` | CUTLASS source root (>= 4.5.0). Feeds the sm120a NVFP4 GEMM **and** FlashAttention-2 on `8.0/8.6/8.7/8.9/12.0a/12.1a`. Absent on an FA2-capable arch, configure warns and FA2 is not built |
 | `VLLM_CPP_CUTLASS_FETCH` | `OFF` | FetchContent CUTLASS 4.5.0 if not found locally (~200 MB, needs network) |
 | `VLLM_CPP_MARLIN` | `ON` | Build the vendored Marlin NVFP4 W4A16 MoE GEMM (sm_12xa) |
+| `VLLM_CPP_FLASH_ATTN` | `ON` | Build the vendored FlashAttention-2 prefill and decode kernels (needs the CUTLASS headers) |
+| `VLLM_CPP_FA2_HEAD_DIMS` | `64;128;192;256` | FlashAttention-2 head dims to compile. A build that serves one model family can leave the others out (the Qwen3.5 / 3.6 family uses 256 only), which removes their kernels from the binary. A model whose head dim is left out runs the attention a build without FlashAttention-2 runs; MLA prefill, which has no other kernel, pads to the next compiled dim or refuses |
 | `VLLM_CPP_BUILD_TESTS` | `ON` | Compile and register ctest targets |
 | `VLLM_CPP_BUILD_EXAMPLES` | `ON` | Build the example CLI, server, and bench binaries |
 | `VLLM_CPP_BENCH_PROFILE_CONTROL` | `OFF` | Trace-only profiler replay control (never for production timing builds) |

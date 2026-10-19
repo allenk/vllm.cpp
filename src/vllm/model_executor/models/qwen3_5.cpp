@@ -5989,8 +5989,11 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // (Hq/Hkv=16/2, VT_FA2_DECODE_35B — CLAIM-35B-FA2-DECODE-1). All windows /
   // non-causal / non-256 / other-ratio shapes stay f32 on the graph-captured
   // fallback.
+  // The head-dim term: a build profile may compile FA-2 for a subset of head
+  // dims (VLLM_CPP_FA2_HEAD_DIMS), and the dispatch then refuses this one.
+  const vllm::platforms::Platform& fa2_plat = vllm::platforms::GetPlatform(d.q.device.type);
   const bool fa2_platform =
-      vllm::platforms::GetPlatform(d.q.device.type).supports_fa2_attention();
+      fa2_plat.supports_fa2_attention() && fa2_plat.supports_fa2_head_dim(Dh);
   // W10 repair (#1865): the FA-2 dtype/lane class is a host-testable seam
   // (ClassifyDenseFa2, qwen3_5_internal.h) instead of an inline predicate the
   // CPU tier could never red. Same inputs, same conjuncts; the spec-as-decode

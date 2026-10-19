@@ -201,6 +201,9 @@ class StaticGraphCpuPlatform final : public vllm::platforms::Platform {
   bool is_integrated_gpu() const override { return inner_.is_integrated_gpu(); }
   bool needs_weight_staging() const override { return inner_.needs_weight_staging(); }
   bool supports_fa2_attention() const override { return inner_.supports_fa2_attention(); }
+  bool supports_fa2_head_dim(int64_t head_dim) const override {
+    return inner_.supports_fa2_head_dim(head_dim);
+  }
   std::vector<vt::DType> supported_dtypes() const override {
     return inner_.supported_dtypes();
   }

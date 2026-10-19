@@ -56,6 +56,7 @@
 #include <stdlib.h>  // setenv/unsetenv (POSIX; not in <cstdlib>'s guaranteed set)
 
 #include "vt/backend.h"
+#include "vt/cuda/fa2_head_dims.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -689,5 +690,11 @@ TEST_CASE("attention-dense-fa2 VT_FA2_DENSE=0 restores the scalar kernel at hd-1
   // And the ON arm must NOT be that same scalar answer, or the knob is measuring
   // one kernel twice at this head dim whatever it does at the other.
   MESSAGE("hd-128 knob: ON-vs-flash mismatching elements = ", Mismatches(on, ref));
-  CHECK(Mismatches(on, ref) > 0);
+  // A build without the hd-128 kernel (VLLM_CPP_FA2_HEAD_DIMS) runs the scalar
+  // kernel on both arms, and then they must agree instead.
+  if (vt::cuda::Fa2HeadDimBuilt(128)) {
+    CHECK(Mismatches(on, ref) > 0);
+  } else {
+    CHECK(Mismatches(on, ref) == 0);
+  }
 }

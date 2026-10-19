@@ -107,6 +107,15 @@ class CudaPlatform final : public Platform {
                           cap_.minor);
   }
 
+  // The same manifest's head dims: a build profile may compile a subset
+  // (VLLM_CPP_FA2_HEAD_DIMS), and a dim it left out has no kernel on any arch.
+  bool supports_fa2_head_dim(int64_t head_dim) const override {
+    return (head_dim == 64 && VLLM_CPP_CUDA_FA2_HEAD_DIM_64 != 0) ||
+           (head_dim == 128 && VLLM_CPP_CUDA_FA2_HEAD_DIM_128 != 0) ||
+           (head_dim == 192 && VLLM_CPP_CUDA_FA2_HEAD_DIM_192 != 0) ||
+           (head_dim == 256 && VLLM_CPP_CUDA_FA2_HEAD_DIM_256 != 0);
+  }
+
   // interface.py:181-187 supported_dtypes order (bf16 default fallback).
   std::vector<DType> supported_dtypes() const override {
     return {DType::kBF16, DType::kF16, DType::kF32};

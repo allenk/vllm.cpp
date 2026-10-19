@@ -11,10 +11,14 @@
 // host. See `## Owed` in .agents/specs/cuda-compiled-arch-manifest.md.
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 #include "vllm/platforms/cuda_arch_manifest.h"
+#include "vllm/platforms/cuda_compiled_archs.h"
+#include "vllm/platforms/interface.h"
+#include "vt/cuda/fa2_head_dims.h"  // tests/CMakeLists.txt adds src/ for this one
 
 using vllm::platforms::ArchIsCompiled;
 using vllm::platforms::CompiledArch;
@@ -117,4 +121,35 @@ TEST_CASE("parsing accepts the generated forms and DROPS what it cannot read") {
   CHECK(mixed[0].major == 12);
   CHECK(mixed[0].suffix == 'a');
   CHECK_FALSE(ArchIsCompiled("garbage", 12, 1));
+}
+
+// VLLM_CPP_FA2_HEAD_DIMS reaches its readers by two channels from one CMake
+// list: the generated manifest, which Platform::supports_fa2_head_dim reads to
+// decide the model-side bf16 presentation, and the VT_FA2_HDIM_<d> definitions,
+// which the vt lane gates and launchers read. If the two disagree, the model
+// presents operands the dispatch then refuses, or a gate admits a call whose
+// launcher has no kernel. Unlike the cases above this one reads the BUILD's own
+// values, so it holds for whatever head-dim set the build was configured with.
+TEST_CASE("the FA2 head-dim manifest and the vt lane gates name the same dims") {
+  const auto manifest = [](int64_t d) {
+    return (d == 64 && VLLM_CPP_CUDA_FA2_HEAD_DIM_64 != 0) ||
+           (d == 128 && VLLM_CPP_CUDA_FA2_HEAD_DIM_128 != 0) ||
+           (d == 192 && VLLM_CPP_CUDA_FA2_HEAD_DIM_192 != 0) ||
+           (d == 256 && VLLM_CPP_CUDA_FA2_HEAD_DIM_256 != 0);
+  };
+  std::string listed;
+  for (const int64_t d : {int64_t{32}, int64_t{64}, int64_t{96}, int64_t{128}, int64_t{192},
+                          int64_t{256}, int64_t{512}}) {
+    CAPTURE(d);
+    CHECK(vt::cuda::Fa2HeadDimBuilt(d) == manifest(d));
+    if (vllm::platforms::HasPlatform(vt::DeviceType::kCUDA))
+      CHECK(vllm::platforms::GetPlatform(vt::DeviceType::kCUDA).supports_fa2_head_dim(d) ==
+            manifest(d));
+    if (manifest(d)) listed += (listed.empty() ? "" : ",") + std::to_string(d);
+  }
+  // The dims string lists exactly the built dims, in order.
+  CHECK(listed == std::string(VLLM_CPP_CUDA_FA2_HEAD_DIMS));
+  // And a dim is built only where FA2 itself is: the dims are empty exactly
+  // when the compiled-arch manifest is.
+  CHECK(listed.empty() == std::string(VLLM_CPP_CUDA_FA2_COMPILED_ARCHS).empty());
 }

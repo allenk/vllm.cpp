@@ -73,6 +73,7 @@
 #include "flash.h"
 
 #include "vt/cuda/cuda_flash_attn_fa2_internal.h"
+#include "vt/cuda/fa2_head_dims.h"
 #include "vt/ops.h"
 
 namespace vt::cuda {
@@ -86,6 +87,39 @@ void Check(cudaError_t err, const char* what) {
 }
 
 inline int RoundMultiple(int x, int m) { return (x + m - 1) / m * m; }
+
+// One head dim's launch, or a refusal when this build did not compile that
+// dim (VLLM_CPP_FA2_HEAD_DIMS). Every FA-2 lane gate asks Fa2HeadDimBuilt
+// first, so the refusal marks a gate that forgot to. `if constexpr` keeps an
+// absent dim's instantiation from being referenced at all, which is what lets
+// the build leave its kernel source out.
+template <int D, bool Causal>
+void Fa2SplitKv(FLASH_NAMESPACE::Flash_fwd_params& p, cudaStream_t s) {
+  if constexpr (Fa2HeadDimBuilt(D)) {
+    FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, D, Causal>(p, s);
+  } else {
+    (void)p;
+    (void)s;
+    throw std::runtime_error(
+        "cuda flash-attn-2: this build compiled no split-KV kernel for head_dim " +
+        std::to_string(D) + " (VLLM_CPP_FA2_HEAD_DIMS); the FA-2 lane gate that sent "
+        "this call should have refused it");
+  }
+}
+
+template <int D>
+void Fa2Dense(FLASH_NAMESPACE::Flash_fwd_params& p, cudaStream_t s) {
+  if constexpr (Fa2HeadDimBuilt(D)) {
+    FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, D, false>(p, s);
+  } else {
+    (void)p;
+    (void)s;
+    throw std::runtime_error(
+        "cuda flash-attn-2 dense: this build compiled no kernel for head_dim " +
+        std::to_string(D) + " (VLLM_CPP_FA2_HEAD_DIMS); the FA-2 lane gate that sent "
+        "this call should have refused it");
+  }
+}
 
 // Exact port of flash_api.cpp::num_splits_heuristic @ FA2 2c839c33. Upstream
 // passes 2*numSM because this kernel uses 128 threads per CTA.
@@ -500,15 +534,15 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   const bool run_causal = args.causal && !is_local;
   if (d == 128) {
     if (run_causal) {
-      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(p, s);
+      Fa2SplitKv<128, true>(p, s);
     } else {
-      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(p, s);
+      Fa2SplitKv<128, false>(p, s);
     }
   } else {
     if (run_causal) {
-      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(p, s);
+      Fa2SplitKv<256, true>(p, s);
     } else {
-      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p, s);
+      Fa2SplitKv<256, false>(p, s);
     }
   }
   Check(cudaGetLastError(), "splitkv dispatch launch");
@@ -683,9 +717,9 @@ void LaunchDenseFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   //
   // Behaviour for d in {64, 128} is unchanged: same kernel, same arguments.
   if (d == 64) {
-    FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 64, false>(p, s);
+    Fa2Dense<64>(p, s);
   } else if (d == 128) {
-    FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 128, false>(p, s);
+    Fa2Dense<128>(p, s);
   } else {
     throw std::runtime_error(
         "cuda flash-attn-2 dense: no compiled kernel for head_dim " + std::to_string(d) +
@@ -925,20 +959,20 @@ void LaunchMlaPrefillFA2Bf16(cudaStream_t s, Tensor& out, float* lse_out,
   const bool run_causal = args.causal && !is_local;
   if (d == 256) {
     if (run_causal) {
-      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(p, s);
+      Fa2SplitKv<256, true>(p, s);
     } else {
-      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p, s);
+      Fa2SplitKv<256, false>(p, s);
     }
   } else if (d == 128) {
     if (run_causal) {
-      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(p, s);
+      Fa2SplitKv<128, true>(p, s);
     } else {
-      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(p, s);
+      Fa2SplitKv<128, false>(p, s);
     }
   } else if (run_causal) {
-    FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 192, true>(p, s);
+    Fa2SplitKv<192, true>(p, s);
   } else {
-    FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 192, false>(p, s);
+    Fa2SplitKv<192, false>(p, s);
   }
   Check(cudaGetLastError(), "mla prefill splitkv dispatch launch");
 
@@ -1130,8 +1164,7 @@ void LaunchDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& query,
   p.num_splits = num_splits;
 
   RecordDecodeLaunch(num_splits > 1, inserted, /*swapped=*/true);
-  FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p,
-                                                                                stream);
+  Fa2SplitKv<256, false>(p, stream);
   Check(cudaGetLastError(), "decode splitkv dispatch launch");
 }
 
@@ -1392,14 +1425,14 @@ void LaunchSpecDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& que
   // the shipped W10 dispatch, unchanged.
   if (head_dim == 256) {
     if (p.is_causal)
-      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(p, stream);
+      Fa2SplitKv<256, true>(p, stream);
     else
-      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p, stream);
+      Fa2SplitKv<256, false>(p, stream);
   } else {
     if (p.is_causal)
-      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(p, stream);
+      Fa2SplitKv<128, true>(p, stream);
     else
-      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(p, stream);
+      Fa2SplitKv<128, false>(p, stream);
   }
   Check(cudaGetLastError(), "spec decode splitkv dispatch launch");
 }
@@ -1673,11 +1706,11 @@ void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
 
   RecordDecodeLaunch(num_splits > 1, inserted, do_swap);
   if (!do_swap && args.causal) {
-    FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(p, s);
+    Fa2SplitKv<128, true>(p, s);
   } else {
     // Swap decode is normalized non-causal (like the d256 arm); a plain non-causal
     // caller also lands here.
-    FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(p, s);
+    Fa2SplitKv<128, false>(p, s);
   }
   Check(cudaGetLastError(), "varlen decode splitkv dispatch launch");
 }

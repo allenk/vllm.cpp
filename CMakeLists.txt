@@ -763,6 +763,12 @@ configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 # its chance to run. Derived, never hand-written: a parallel architecture list is
 # CUDA_SUPPORTED_ARCHS, and a list that goes stale is precisely the defect.
 set(VLLM_CPP_CUDA_FA2_COMPILED_ARCHS "")
+# The head dims those kernels were instantiated for (VLLM_CPP_FA2_HEAD_DIMS), set
+# by the same block: empty and all zero when FA2 is not compiled.
+set(VLLM_CPP_CUDA_FA2_HEAD_DIMS "")
+foreach(_fa2_dim 64 128 192 256)
+  set(VLLM_CPP_CUDA_FA2_HEAD_DIM_${_fa2_dim} 0)
+endforeach()
 
 add_library(vllm STATIC
   src/vllm/version.cpp
@@ -2585,6 +2591,47 @@ if(VLLM_CPP_CUDA)
       # 48 KiB default cap that bounds AttentionDenseFlash (#1544) does not bound
       # this path.
       src/vt/cuda/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu)
+    # Which head dims get kernels (build profiles: a deployment that serves one
+    # model family compiles only its dims). Each source above instantiates the
+    # one head dim its file name carries, so the selection is a filter on that
+    # name. A dim left out loses only its FA-2 lanes: every gate asks
+    # vt::cuda::Fa2HeadDimBuilt (src/vt/cuda/fa2_head_dims.h) and the model side
+    # asks Platform::supports_fa2_head_dim, and both fall back to the attention a
+    # build without FA-2 runs. MLA prefill has no such fallback, so it pads to
+    # the next built dim and refuses when there is none. The default is all four.
+    set(VLLM_CPP_FA2_HEAD_DIMS "64;128;192;256" CACHE STRING
+      "FlashAttention-2 head dims to compile, a non-empty subset of 64;128;192;256")
+    set(_FA2_DIMS_KNOWN 64 128 192 256)
+    if(NOT VLLM_CPP_FA2_HEAD_DIMS)
+      message(FATAL_ERROR
+        "VLLM_CPP_FA2_HEAD_DIMS is empty. To build without FlashAttention-2, "
+        "configure -DVLLM_CPP_FLASH_ATTN=OFF.")
+    endif()
+    foreach(_fa2_dim IN LISTS VLLM_CPP_FA2_HEAD_DIMS)
+      if(NOT _fa2_dim IN_LIST _FA2_DIMS_KNOWN)
+        message(FATAL_ERROR
+          "VLLM_CPP_FA2_HEAD_DIMS: ${_fa2_dim} is not one of 64;128;192;256, the "
+          "head dims the vendored FlashAttention-2 sources instantiate.")
+      endif()
+    endforeach()
+    set(_FA2_SELECTED_SRCS "")
+    foreach(_fa2_src IN LISTS _FA2_KERNEL_SRCS)
+      string(REGEX MATCH "hdim([0-9]+)_" _fa2_match "${_fa2_src}")
+      if(CMAKE_MATCH_1 IN_LIST VLLM_CPP_FA2_HEAD_DIMS)
+        list(APPEND _FA2_SELECTED_SRCS "${_fa2_src}")
+      endif()
+    endforeach()
+    set(_FA2_KERNEL_SRCS ${_FA2_SELECTED_SRCS})
+    foreach(_fa2_dim IN LISTS _FA2_DIMS_KNOWN)
+      if(_fa2_dim IN_LIST VLLM_CPP_FA2_HEAD_DIMS)
+        target_compile_definitions(vllm PUBLIC VT_FA2_HDIM_${_fa2_dim}=1)
+        set(VLLM_CPP_CUDA_FA2_HEAD_DIM_${_fa2_dim} 1)
+      endif()
+    endforeach()
+    set(_fa2_dims_sorted ${VLLM_CPP_FA2_HEAD_DIMS})
+    list(SORT _fa2_dims_sorted COMPARE NATURAL)
+    list(REMOVE_DUPLICATES _fa2_dims_sorted)
+    string(REPLACE ";" "," VLLM_CPP_CUDA_FA2_HEAD_DIMS "${_fa2_dims_sorted}")
     target_sources(vllm PRIVATE
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS})
@@ -3198,3 +3245,5 @@ configure_file(include/vllm/platforms/cuda_compiled_archs.h.in
   include/vllm/platforms/cuda_compiled_archs.h @ONLY)
 message(STATUS
   "CUDA FA2 compiled-arch manifest: [${VLLM_CPP_CUDA_FA2_COMPILED_ARCHS}]")
+message(STATUS
+  "CUDA FA2 compiled head dims: [${VLLM_CPP_CUDA_FA2_HEAD_DIMS}]")
