@@ -684,6 +684,92 @@ __global__ void MoeTileMapKernel(const int32_t* count, const int32_t* offset, in
   for (; t < max_tiles; ++t) tile_rows[t] = 0;
 }
 
+// MoeOffsetsKernel and MoeTileMapKernel in one block: a scan of count[E] gives
+// every expert its row offset and its first tile, then each expert writes its
+// own tiles. Same arrays, in the same order. The serial pair is one thread over
+// E and every tile, which on Qwen3.6-35B-A3B's 256 experts was 8.5 and 22 us per
+// grouped GEMM, three times a layer.
+constexpr int kMoeMapThreads = 1024;
+
+__global__ void MoeOffsetsTileMapKernel(const int32_t* count, int32_t* offset, int32_t* tile_expert,
+                                        int32_t* tile_row0, int32_t* tile_rows, int e_count,
+                                        int bm, int max_tiles) {
+  __shared__ int32_t warp_rows[kMoeMapThreads / 32];
+  __shared__ int32_t warp_tiles[kMoeMapThreads / 32];
+  __shared__ int32_t carry_rows, carry_tiles;
+  const int t = static_cast<int>(threadIdx.x), lane = t & 31, warp = t >> 5;
+  if (t == 0) {
+    carry_rows = 0;
+    carry_tiles = 0;
+  }
+  __syncthreads();
+  for (int base = 0; base < e_count; base += kMoeMapThreads) {
+    const int e = base + t;
+    const int32_t c = e < e_count ? count[e] : 0;
+    const int32_t nt = (c + bm - 1) / bm;
+    int32_t ic = c, it = nt;
+    for (int o = 1; o < 32; o <<= 1) {
+      const int32_t yc = __shfl_up_sync(0xffffffffu, ic, o);
+      const int32_t yt = __shfl_up_sync(0xffffffffu, it, o);
+      if (lane >= o) {
+        ic += yc;
+        it += yt;
+      }
+    }
+    if (lane == 31) {
+      warp_rows[warp] = ic;
+      warp_tiles[warp] = it;
+    }
+    __syncthreads();
+    int32_t row_base = carry_rows, tile_base = carry_tiles;
+    for (int w = 0; w < warp; ++w) {
+      row_base += warp_rows[w];
+      tile_base += warp_tiles[w];
+    }
+    const int32_t off = row_base + ic - c;
+    const int32_t tile0 = tile_base + it - nt;
+    if (e < e_count) {
+      offset[e] = off;
+      for (int32_t i = 0; i < nt; ++i) {
+        tile_expert[tile0 + i] = e;
+        tile_row0[tile0 + i] = off + i * bm;
+        tile_rows[tile0 + i] = (c - i * bm < bm) ? (c - i * bm) : bm;
+      }
+    }
+    __syncthreads();
+    if (t == kMoeMapThreads - 1) {
+      carry_rows = off + c;
+      carry_tiles = tile0 + nt;
+    }
+    __syncthreads();
+  }
+  for (int i = carry_tiles + t; i < max_tiles; i += kMoeMapThreads) tile_rows[i] = 0;
+}
+
+// VT_MOE_MAP_SERIAL=1 runs the serial pair for a same-binary A/B; the arrays are
+// the same either way.
+bool MoeMapSerial() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MOE_MAP_SERIAL");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+void LaunchMoeOffsetsTileMap(cudaStream_t s, const int32_t* count, int32_t* offset,
+                             int32_t* tile_expert, int32_t* tile_row0, int32_t* tile_rows,
+                             int64_t e_count, int bm, int max_tiles) {
+  if (MoeMapSerial()) {
+    MoeOffsetsKernel<<<1, 1, 0, s>>>(count, offset, static_cast<int>(e_count));
+    MoeTileMapKernel<<<1, 1, 0, s>>>(count, offset, tile_expert, tile_row0, tile_rows,
+                                     static_cast<int>(e_count), bm, max_tiles);
+    return;
+  }
+  MoeOffsetsTileMapKernel<<<1, kMoeMapThreads, 0, s>>>(count, offset, tile_expert, tile_row0,
+                                                       tile_rows, static_cast<int>(e_count), bm,
+                                                       max_tiles);
+}
+
 template <typename Tin, typename Tout, int BM, int BN, int BK, int WARPS_M, int WARPS_N>
 __global__ void MoeGroupedGemmNvfp4Wmma(Tout* out, const Tin* act, const int32_t* sp,
                                         const int32_t* sr, const int64_t* packed_ptrs,
@@ -854,11 +940,10 @@ void LaunchGroupedWmma(cudaStream_t s, Tensor& out, const Tensor& act, const Ten
   const int32_t* rmap = row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr;
   const int hb = 256;
   MoeHistKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, count, p);
-  MoeOffsetsKernel<<<1, 1, 0, s>>>(count, offset, static_cast<int>(e_count));
+  LaunchMoeOffsetsTileMap(s, count, offset, tile_expert, tile_row0, tile_rows, e_count, BM,
+                          max_tiles);
   MoeScatterKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, rmap, offset,
                                                                           cursor, sp, sr, p);
-  MoeTileMapKernel<<<1, 1, 0, s>>>(count, offset, tile_expert, tile_row0, tile_rows,
-                                   static_cast<int>(e_count), BM, max_tiles);
 
   constexpr int kThreads = WARPS_M * WARPS_N * 32;
   const dim3 grid(static_cast<unsigned>((n + BN - 1) / BN), static_cast<unsigned>(max_tiles));
@@ -1384,11 +1469,10 @@ void LaunchGroupedBf16Wmma(cudaStream_t s, Tensor& out, const Tensor& act,
   const int32_t* rmap = row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr;
   const int hb = 256;
   MoeHistKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, count, p);
-  MoeOffsetsKernel<<<1, 1, 0, s>>>(count, offset, static_cast<int>(e_count));
+  LaunchMoeOffsetsTileMap(s, count, offset, tile_expert, tile_row0, tile_rows, e_count, BM,
+                          max_tiles);
   MoeScatterKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, rmap, offset,
                                                                           cursor, sp, sr, p);
-  MoeTileMapKernel<<<1, 1, 0, s>>>(count, offset, tile_expert, tile_row0, tile_rows,
-                                   static_cast<int>(e_count), BM, max_tiles);
 
   if (Bf16PipeEnabled() && Bf16PipeShapeOk(n, k)) {
     constexpr int kPipeThreads = PIPE_WM * PIPE_WN * 32;
@@ -1781,11 +1865,10 @@ void LaunchGroupedFp8BlockWmma(cudaStream_t s, Tensor& out, const Tensor& act,
   const int32_t* rmap = row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr;
   const int hb = 256;
   MoeHistKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, count, p);
-  MoeOffsetsKernel<<<1, 1, 0, s>>>(count, offset, static_cast<int>(e_count));
+  LaunchMoeOffsetsTileMap(s, count, offset, tile_expert, tile_row0, tile_rows, e_count, BM,
+                          max_tiles);
   MoeScatterKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, rmap, offset,
                                                                           cursor, sp, sr, p);
-  MoeTileMapKernel<<<1, 1, 0, s>>>(count, offset, tile_expert, tile_row0, tile_rows,
-                                   static_cast<int>(e_count), BM, max_tiles);
   const dim3 grid(static_cast<unsigned>((n + BN - 1) / BN), static_cast<unsigned>(max_tiles));
   MoeGroupedGemmFp8BlockWmma<Tout, BM, BN, BK, WARPS_M, WARPS_N>
       <<<grid, WARPS_M * WARPS_N * 32, 0, s>>>(
@@ -1800,6 +1883,17 @@ void LaunchGroupedFp8BlockWmma(cudaStream_t s, Tensor& out, const Tensor& act,
 // per BM rows.
 constexpr int64_t kFp8BlockWarpMaxP = 64;
 
+// Above kFp8BlockWarpMaxP pairs, up to this many run the BM=16 tile and more run
+// BM=64. VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P sets it (tuning); 512 is the bf16
+// path's kMoeDecodeMaxP.
+int64_t Fp8BlockSmallTileMaxP() {
+  static const int64_t v = [] {
+    const char* e = std::getenv("VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P");
+    return e != nullptr ? static_cast<int64_t>(std::atoll(e)) : kMoeDecodeMaxP;
+  }();
+  return v;
+}
+
 template <typename Tout>
 void LaunchGroupedFp8Block(cudaStream_t s, Tensor& out, const Tensor& act,
                            const Tensor& expert_ids, const Tensor* row_map,
@@ -1808,7 +1902,7 @@ void LaunchGroupedFp8Block(cudaStream_t s, Tensor& out, const Tensor& act,
   const bool vec = (k % 16 == 0) && (bk % 16 == 0);
   const bool tile = vec && (bn % 64 == 0) && (bk % 32 == 0) && WmmaEnabled();
   if (tile && p > kFp8BlockWarpMaxP) {
-    if (MoeDecodeEnabled() && p <= kMoeDecodeMaxP)
+    if (MoeDecodeEnabled() && p <= Fp8BlockSmallTileMaxP())
       LaunchGroupedFp8BlockWmma<Tout, kMoeDecodeBM, 1, 2>(s, out, act, expert_ids, row_map,
                                                           weight_ptrs, scale_ptrs, p, n, k,
                                                           e_count, bn, bk);
