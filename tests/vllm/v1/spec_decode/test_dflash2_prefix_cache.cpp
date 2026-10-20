@@ -38,7 +38,24 @@
 // and the target running alone (`vllm/v1/spec_decode/ngram_proposer.py:150-159`,
 // `vllm/v1/spec_decode/suffix_decoding.py:55-62`), which is #1919's fallback
 // reached from a second place.
+//
+// WHAT THIS TREE DOES SINCE KV-MAMBA-ALIGN PHASE 1. Prefix caching on a hybrid
+// runs the recurrent layers in Mamba "align" mode
+// (`.agents/specs/mamba-align-retention.md`), and our align state copy does not
+// handle draft tokens yet, so the loader refuses prefix caching together with
+// any speculative config on a hybrid (`LoadedEngine::UsesMambaAlign`). vLLM
+// 0.28.0 serves the pair: its Mamba spec carries `num_speculative_blocks`
+// (`model_executor/layers/mamba/abstract.py:74`) and the align allocator
+// reserves them (`v1/core/single_type_kv_cache_manager.py:1488-1622`). Every
+// DFlash target this tree serves (Qwen3.5 dense and MoE) is a hybrid, so
+// #2042's state -- a DFlash2 request admitted on a cache hit -- can no longer
+// be built: G1 gates the refusal on the production constructor, G2 keeps the
+// caching-off control, and the runner's fallback stays as written. #2042's
+// original cases return when align learns draft tokens (that spec's phase 2).
 #include <doctest/doctest.h>
+
+#include <stdexcept>
+#include <string>
 
 #include "dflash2_runner_fixture.h"
 
@@ -207,98 +224,49 @@ TwoRequestRun RunTwoConcurrent(bool enable_prefix_caching) {
 
 }  // namespace
 
-// ─── G1: #2042's repro — the engine survives a prefix-cache hit ─────────────
-TEST_CASE("dflash2 prefix cache (#2042): a cache hit does NOT kill the engine") {
-  const TwoRequestRun on = RunSamePromptTwice(/*enable_prefix_caching=*/true);
+// ─── G1: the pair #2042 crashed in is refused at load ──────────────────────
+TEST_CASE("dflash2 prefix cache (#2042): prefix caching with a DFlash2 draft on a hybrid is refused") {
+  const HfConfig target = MakeDenseConfig(kModelLen);
+  const ScratchDraftDir dir;
+  EngineParams params = DflashSpecParams(dir, kModelLen, /*max_num_seqs=*/1,
+                                         /*max_num_batched_tokens=*/8192,
+                                         /*num_blocks=*/512);
+  params.enable_prefix_caching = true;
 
-  // THE ASSERTION. Pre-fix the second request never completes at all: the
-  // position invariant takes EngineCore down mid-step and this request's
-  // collector waits for a terminal frame nothing will ever write.
-  INFO("second request: ", Describe(on.second));
-  CHECK(on.second.finished);
-  CHECK(on.second.threw.empty());
-  CHECK_FALSE(on.second.timed_out);
-  CHECK_FALSE(on.second.tokens.empty());
-
-  INFO("first request: ", Describe(on.first));
-  CHECK(on.first.finished);
-  CHECK_FALSE(on.first.tokens.empty());
-
-  // And nothing anywhere in the run is still refusing by that name.
-  CHECK(on.stderr_text.find("context position discontinuity") == std::string::npos);
+  // Refused before an engine exists, so no request can reach the propose with
+  // an empty draft context. Before the refusal this pair loaded in mode "none",
+  // and a cache hit resumed the recurrent layers from another request's state.
+  std::string refusal;
+  try {
+    LoadedEngine eng(target, MakeDenseWeights(target), BuildFixture(), params,
+                     MakeDflash2Draft(target, /*muse_glimmer_scalars=*/false));
+  } catch (const std::invalid_argument& e) {
+    refusal = e.what();
+  }
+  INFO("refusal: ", refusal);
+  REQUIRE_FALSE(refusal.empty());
+  // It names the conflict and the flag to drop, so an operator can act on it.
+  CHECK(refusal.find("speculative decoding") != std::string::npos);
+  CHECK(refusal.find("--enable-prefix-caching") != std::string::npos);
 }
 
-// ─── G2: the tokens do not move ─────────────────────────────────────────────
-TEST_CASE("dflash2 prefix cache (#2042): dropping the draft changes drafts, not output") {
-  const TwoRequestRun on = RunSamePromptTwice(/*enable_prefix_caching=*/true);
+// ─── G2: the CONTROL — caching off, a repeated prompt still speculates ─────
+TEST_CASE("dflash2 prefix cache (#2042): with prefix caching off a repeated prompt speculates") {
   const TwoRequestRun off = RunSamePromptTwice(/*enable_prefix_caching=*/false);
 
-  REQUIRE(on.first.finished);
-  REQUIRE(on.second.finished);
+  INFO("first request: ", Describe(off.first));
+  INFO("second request: ", Describe(off.second));
   REQUIRE(off.first.finished);
   REQUIRE(off.second.finished);
+  // Greedy, the same prompt, nothing reused: the same tokens.
+  CHECK_FALSE(off.first.tokens.empty());
+  CHECK(off.first.tokens == off.second.tokens);
 
-  // The verify is lossless, so a request that stops speculating changes what was
-  // DRAFTED and not what was EMITTED. This is the half a liveness check cannot
-  // see: a fallback that also moved the output would be a correctness bug
-  // wearing a throughput cost.
-  CHECK(on.first.tokens == off.first.tokens);
-  CHECK(on.second.tokens == off.second.tokens);
-
-  // And prefix caching's own contract: the same prompt under greedy sampling
-  // emits the same tokens whether its prefix was computed or reused.
-  CHECK(on.first.tokens == on.second.tokens);
-}
-
-// ─── G3: the fallback is SCOPED to the request that hit the cache ───────────
-TEST_CASE("dflash2 prefix cache (#2042): the cache MISS still speculates") {
-  const TwoRequestRun on = RunSamePromptTwice(/*enable_prefix_caching=*/true);
-  const TwoRequestRun off = RunSamePromptTwice(/*enable_prefix_caching=*/false);
-
-  // MEASURED, not asserted about. A fix that simply stopped speculating whenever
-  // prefix caching is on would pass G1 and G2 and be invisible to a token gate,
-  // because the verify is lossless and only acceptance falls. The prefix-caching
-  // arm must propose STRICTLY FEWER blocks than the control and still propose
-  // some: the first request is a cache MISS and speculates the whole way.
-  INFO("blocks on: ", on.blocks.size(), " blocks off: ", off.blocks.size());
+  // Both requests start at position 0, so neither is classified as a cache hit
+  // and the fixture speculates.
   CHECK_FALSE(off.blocks.empty());
-  CHECK_FALSE(on.blocks.empty());
-  CHECK(on.blocks.size() < off.blocks.size());
-
-  // And the control speculates for both requests, so nothing about the fixture
-  // itself is suppressing the second one.
   CHECK(off.stderr_text.find("was admitted with") == std::string::npos);
-}
-
-// ─── G4: the notice names the request, prefix caching, and fires ONCE ───────
-TEST_CASE("dflash2 prefix cache (#2042): the dropped speculation is announced") {
-  const TwoRequestRun on = RunSamePromptTwice(/*enable_prefix_caching=*/true);
-
-  INFO("stderr: ", on.stderr_text);
-  const size_t at = on.stderr_text.find("was admitted with");
-  REQUIRE(at != std::string::npos);
-  // Once. A per-step message would drown a decode loop.
-  CHECK(on.stderr_text.find("was admitted with", at + 1) == std::string::npos);
-
-  // It names the request that hit the cache, and not the one that missed.
-  const size_t prev_nl = on.stderr_text.rfind('\n', at);
-  const size_t line_start = (prev_nl == std::string::npos) ? 0 : prev_nl + 1;
-  const size_t line_end = on.stderr_text.find('\n', at);
-  const std::string line = on.stderr_text.substr(
-      line_start, (line_end == std::string::npos) ? std::string::npos
-                                                  : line_end - line_start);
-  CHECK(line.find("req-second") != std::string::npos);
-  CHECK(line.find("req-first") == std::string::npos);
-
-  // It names the cause and the consequence, so an operator reading a server log
-  // can tell this apart from #1919's capacity fallback.
-  CHECK(line.find("prefix-cache") != std::string::npos);
-  CHECK(line.find("WITHOUT speculation") != std::string::npos);
-  CHECK(line.find("#2042") != std::string::npos);
-
-  // It is NOT the capacity fallback: nothing here outgrew anything.
-  CHECK(on.stderr_text.find("has outgrown the draft speculative context") ==
-        std::string::npos);
+  CHECK(off.stderr_text.find("context position discontinuity") == std::string::npos);
 }
 
 // ─── G5: the CONTROL — a moved request is not a cache hit ──────────────────

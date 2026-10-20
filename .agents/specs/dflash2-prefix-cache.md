@@ -218,6 +218,15 @@ classification does not claim:
 
 ## Tests and gates
 
+**Since KV-MAMBA-ALIGN phase 1 (2026-10-20, 0.0.4-vk.2).** The loader refuses
+prefix caching together with any speculative config on a hybrid
+([mamba-align-retention.md](mamba-align-retention.md) D3), and both DFlash
+targets (Qwen3.5 dense and MoE) are hybrids, so G1-G4 below can no longer be
+built. They were replaced by the refusal on the production constructor (G1) and
+the caching-off control (G2); G5 is unchanged and the runner's fallback stays as
+written. The cases below are the record of the wave; they return when align
+handles draft tokens.
+
 New binary `tests/vllm/v1/spec_decode/test_dflash2_prefix_cache.cpp`, driving
 the shared `dflash2_runner_fixture.h` engine through the production `AsyncLLM`
 front, on CPU. Target `max_model_len` 256, 64-token pre-tokenized prompts, so the

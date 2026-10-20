@@ -106,7 +106,10 @@ runner had no block-to-block state copy.
   fails it (the hit requests continue the English source).
 - Speed: a replica of the translation shape (1,172 prompt / 36 output tokens,
   c=8, temperature 0.2): 76.2 s without the cache, 44.6 s with it at a 90.1%
-  hit rate, vLLM 0.28.0 in the same session 41.6 s. Then the owner's book.
+  hit rate. CORRECTED 2026-10-20: the "vLLM 0.28.0 41.6 s" first written here
+  came from a stale launcher (vLLM 0.19.1-dev, no prefix caching). vLLM 0.28.0
+  with its default cache, in one session with the 0.0.4-vk.2 builds: 29.6 s,
+  against 45.1 s (Windows) and 47.1 s (Linux). Then the owner's book.
 
 ## Dependencies
 
@@ -146,7 +149,11 @@ Phase 2 (named, not here):
   the memory per block.
 - **D3, refuse instead of degrade.** Prefix caching on a hybrid without an align
   path, or with speculative decoding, throws at load. Before, both admitted cache
-  hits whose recurrent layers resumed from a state that was not theirs.
+  hits whose recurrent layers resumed from a state that was not theirs. Every
+  DFlash target here is a hybrid, so #2042's cases in
+  `tests/vllm/v1/spec_decode/test_dflash2_prefix_cache.cpp`, which drove that
+  admission, now gate the refusal and keep the caching-off control; vLLM 0.28.0
+  serves the pair, and phase 2 brings the cases back.
 - **R1, previous column derived, not tracked.** Without speculation the column
   the state was last written to is `(num_computed - 1) // B`, so the runner
   derives it each step instead of keeping upstream's `mamba_state_idx` map; a
