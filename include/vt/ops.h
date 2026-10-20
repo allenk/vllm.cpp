@@ -933,6 +933,11 @@ enum class OpId : uint8_t {
   // fused (MatmulFp8BlockScaledGemv). Appended before kCount so no existing op's
   // id shifts.
   kMatmulFp8BlockScaledGemv,
+  // ApplyTopKTopP + ComputeProbs + RandomSample in one op, for rows that all
+  // carry a top-k (vt::TopKTopPSample). CUDA only; the Sampler falls back to the
+  // three ops where it is not registered. Appended before kCount so no existing
+  // op's id shifts.
+  kTopKTopPSample,
   kCount
 };
 
@@ -2785,6 +2790,8 @@ using ApplyTopKTopPFn = void (*)(Queue&, Tensor&, const Tensor*, const Tensor*);
 using ComputeProbsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using ComputeLogprobsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using RandomSampleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+using TopKTopPSampleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*,
+                                  const Tensor&);
 // --- Greedy spec-decode rejection sampling (SPEC-REJECTION I3).
 using GreedyRejectionSampleFn = void (*)(Queue&, Tensor&, Tensor&, Tensor&, const Tensor&,
                                          const Tensor&, const Tensor&);
@@ -5839,6 +5846,20 @@ void ComputeLogprobs(Queue& q, Tensor& logprobs, const Tensor& logits);
 // M1.7 deferral. Greedy stays bit-exact; random is validated by algorithm +
 // determinism + distribution.
 void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor& seeds);
+
+// The token RandomSample draws from ComputeProbs of ApplyTopKTopP(logits, k, p),
+// in one op that reads the logits and leaves them unmasked. Every row needs a
+// top-k: k [num_reqs] i32 with 1 <= k <= kTopKTopPSampleMaxK; p [num_reqs] f32
+// or nullptr (no top-p); seeds [num_reqs] i64 as for RandomSample; logits
+// [num_reqs, vocab] f32 with vocab <= kTopKTopPSampleMaxVocab. The three ops
+// walk the whole vocabulary with one block per row; this op scans it once
+// across the GPU and finishes on the top-k candidates, with the same floats and
+// so the same token (src/vt/cuda/cuda_sample.cu, "top_k_top_p_sample"). CUDA
+// only: callers check OpRegistered(OpId::kTopKTopPSample, device).
+inline constexpr int32_t kTopKTopPSampleMaxK = 64;
+inline constexpr int64_t kTopKTopPSampleMaxVocab = 1048576;
+void TopKTopPSample(Queue& q, Tensor& token_ids, const Tensor& logits, const Tensor& k,
+                    const Tensor* p, const Tensor& seeds);
 
 // --- Greedy spec-decode rejection sampling (SPEC-REJECTION I3) --------------
 // Ported from vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py @ e24d1b24:

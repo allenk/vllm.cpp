@@ -5461,6 +5461,29 @@ void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor
                                                                               seeds);
 }
 
+void TopKTopPSample(Queue& q, Tensor& token_ids, const Tensor& logits, const Tensor& k,
+                    const Tensor* p, const Tensor& seeds) {
+  const int64_t n = CheckSamplingLogits(q, logits, "top_k_top_p_sample");
+  VT_CHECK(logits.shape[1] <= kTopKTopPSampleMaxVocab,
+           "top_k_top_p_sample: vocab exceeds kTopKTopPSampleMaxVocab");
+  VT_CHECK(k.rank == 1 && k.shape[0] == n && k.dtype == DType::kI32 && k.IsContiguous() &&
+               k.device == q.device,
+           "top_k_top_p_sample: k must be i32 [num_reqs] contiguous on the queue device");
+  if (p != nullptr) {
+    VT_CHECK(p->rank == 1 && p->shape[0] == n && p->dtype == DType::kF32 && p->IsContiguous() &&
+                 p->device == q.device,
+             "top_k_top_p_sample: p must be f32 [num_reqs] contiguous on the queue device");
+  }
+  VT_CHECK(token_ids.rank == 1 && token_ids.shape[0] == n && token_ids.dtype == DType::kI64 &&
+               token_ids.IsContiguous() && token_ids.device == q.device,
+           "top_k_top_p_sample: token_ids must be i64 [num_reqs] contiguous on the queue device");
+  VT_CHECK(seeds.rank == 1 && seeds.shape[0] == n && seeds.dtype == DType::kI64 &&
+               seeds.IsContiguous() && seeds.device == q.device,
+           "top_k_top_p_sample: seeds must be i64 [num_reqs] contiguous on the queue device");
+  reinterpret_cast<TopKTopPSampleFn>(GetOp(OpId::kTopKTopPSample, q.device.type))(
+      q, token_ids, logits, k, p, seeds);
+}
+
 void GreedyRejectionSample(Queue& q, Tensor& sampled, Tensor& num_sampled, Tensor& target_argmax,
                            const Tensor& logits, const Tensor& draft_sampled,
                            const Tensor& cu_num_logits) {
