@@ -6512,7 +6512,7 @@ bool MoeGlueFuseEnabled() {
 // point (T=C<=32 all win) while keeping large prefill/mixed steps (T>128, where
 // the routed GEMMs already saturate the GPU) on the serial path. 0 disables the
 // gate entirely (never overlap).
-#ifdef VT_MARLIN_NVFP4  // overlap is only wired into the Marlin MoE decode path
+// Wired into the Marlin MoE decode path and the block-FP8 MoE block.
 bool MoeSharedAuxStreamEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_MOE_SHARED_AUX_STREAM");
@@ -6554,7 +6554,6 @@ MoeAuxStream& MoeAuxStreamFor(Dev d) {
   }
   return a;
 }
-#endif  // VT_MARLIN_NVFP4
 
 // Shared-expert pre-gate parts: sd [T,H] f32 (down projection) and gl [T,1] f32
 // (gate logit), before the sigmoid gate + bf16 round. The unfused SharedExpert
@@ -7558,6 +7557,47 @@ DBuf MoeBlockFp8BlockCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   }();
   const bool fused_gate_up =
       fused_on && vt::OpRegistered(vt::OpId::kMoeGroupedGemmFp8BlockGateUpSilu, d.q.device.type);
+
+  const bool has_shared = cfg.shared_expert_intermediate_size > 0;
+  // The grouped shared expert serves decode-sized steps only: up to 64 rows the
+  // op runs its warp GEMV, and above that its bf16 WMMA tile, which the CUTLASS
+  // fp8 GEMM beats. Measured on the 4-layer checkpoint with a quiet host: c=1
+  // decode about 731 vs 718 tok/s for the grouped shared expert, a 1,160-token
+  // prefill about 67-74K vs 73-79K tok/s in CUTLASS's favour.
+  // VT_MOE_FP8_BLOCK_SHARED_GROUPED=0 keeps every step on SharedExpert's CUTLASS
+  // block arm for a same-binary A/B; default ON.
+  constexpr int64_t kSharedGroupedMaxRows = 64;
+  static const bool shared_grouped = [] {
+    const char* e = std::getenv("VT_MOE_FP8_BLOCK_SHARED_GROUPED");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  const bool shared_on_grouped = has_shared && shared_grouped && T <= kSharedGroupedMaxRows &&
+                                 !w.shared_gate_proj_fp8_block.Empty();
+
+  // Shared-expert overlap FORK, as MoeBlockFusedMarlinCuda forks it: the grouped
+  // shared expert reads dh/xh and writes its own buffers, so it runs on the aux
+  // stream while the routed GEMMs below run on the main stream, and the main
+  // stream waits for it before the combine. The same kernels on the same inputs,
+  // so the output is the serial order's byte for byte; only WHEN it runs changes.
+  // vLLM overlaps its shared expert the same way (aux stream, token threshold).
+  // VT_MOE_SHARED_AUX_STREAM=0 runs it inline after the routed path.
+  const bool aux_overlap = shared_on_grouped && MoeSharedAuxStreamEnabled() &&
+                           d.b.SupportsAuxStream() &&
+                           T <= static_cast<int64_t>(MoeSharedAuxThreshold());
+  std::optional<SharedExpertTerms> st_aux;
+  MoeAuxStream* ax = nullptr;
+  if (aux_overlap) {
+    ax = &MoeAuxStreamFor(d);
+    d.b.RecordEvent(ax->fork, d.q);  // dh and xh are ready on the main stream
+    d.b.QueueWaitEvent(ax->q, ax->fork);
+    Dev auxd{d.b, ax->q};
+    // The shared path's scratch comes from AuxPool, so the concurrent main-stream
+    // routed allocations never share a live block with it.
+    ActivePoolScope guard(&AuxPool(d.b));
+    st_aux.emplace(SharedExpertFp8BlockGrouped(auxd, w, cfg, dh, xh, T, mr, fused_gate_up));
+    d.b.RecordEvent(ax->done, ax->q);
+  }
+
   DBuf dact(d, DType::kBF16, {P, I});
   if (fused_gate_up) {
     // The load-time check above holds gate and up to g0's block geometry.
@@ -7577,24 +7617,15 @@ DBuf MoeBlockFp8BlockCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
                              d0.block_n, d0.block_k);
   Tensor expert_out = Reshape(ddown.t(), {T, top_k, H});
 
-  const bool has_shared = cfg.shared_expert_intermediate_size > 0;
   std::optional<DBuf> shared;
-  // The grouped shared expert serves decode-sized steps only: up to 64 rows the
-  // op runs its warp GEMV, and above that its bf16 WMMA tile, which the CUTLASS
-  // fp8 GEMM beats. Measured on the 4-layer checkpoint with a quiet host: c=1
-  // decode about 731 vs 718 tok/s for the grouped shared expert, a 1,160-token
-  // prefill about 67-74K vs 73-79K tok/s in CUTLASS's favour.
-  // VT_MOE_FP8_BLOCK_SHARED_GROUPED=0 keeps every step on SharedExpert's CUTLASS
-  // block arm for a same-binary A/B; default ON.
-  constexpr int64_t kSharedGroupedMaxRows = 64;
-  static const bool shared_grouped = [] {
-    const char* e = std::getenv("VT_MOE_FP8_BLOCK_SHARED_GROUPED");
-    return !(e != nullptr && e[0] == '0');
-  }();
+  // Shared-expert overlap JOIN: the combine reads the aux stream's terms.
+  if (aux_overlap) d.b.QueueWaitEvent(d.q, ax->done);
   DBuf dout(d, DType::kBF16, {T, H});
   if (has_shared) {
-    if (shared_grouped && T <= kSharedGroupedMaxRows && !w.shared_gate_proj_fp8_block.Empty()) {
-      SharedExpertTerms st = SharedExpertFp8BlockGrouped(d, w, cfg, dh, xh, T, mr, fused_gate_up);
+    if (shared_on_grouped) {
+      SharedExpertTerms st =
+          aux_overlap ? std::move(*st_aux)
+                      : SharedExpertFp8BlockGrouped(d, w, cfg, dh, xh, T, mr, fused_gate_up);
       if (fused_on && vt::OpRegistered(vt::OpId::kMoeCombineGate, d.q.device.type)) {
         vt::MoeCombineGate(d.q, dout.t(), expert_out, dtw.t(), st.sd.t(), st.gl.t());
         return dout;
