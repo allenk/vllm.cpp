@@ -11,23 +11,24 @@
 #include <optional>
 #include <vector>
 
-#include "vllm/v1/sample/device_scratch.h"
 #include "vllm/v1/sample/logits_processor/builtin.h"
 #include "vllm/v1/sample/ops/bad_words.h"
 #include "vllm/v1/sample/ops/penalties.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/sample_common.h"
 
 namespace vllm::v1 {
 
 namespace {
 
-// Batch-default RNG seed for rows without a per-request generator override.
-// Upstream uses a shared default torch.Generator; our RandomSample hashes
-// (seed, row, vocab_index) so a constant default still gives independent per-row
-// draws (the row index enters the hash). Exact torch-Philox parity is the
-// documented M1.7 T1 carry.
+// Batch-default RNG seed for rows without a per-request generator override, used
+// only when the metadata carries no rng_seeds (a hand-built one; InputBatch
+// always fills them). Upstream uses a shared default torch.Generator; our
+// RandomSample hashes (seed, row, vocab_index) so a constant default still gives
+// independent per-row draws (the row index enters the hash). Exact torch-Philox
+// parity is the documented M1.7 T1 carry.
 constexpr uint64_t kDefaultSeed = 0;
 
 // Owns a device-side output buffer of the given shape and downloads it to host.
@@ -64,33 +65,6 @@ class DeviceBuffer {
   size_t bytes_ = 0;
   vt::Tensor tensor_;
 };
-
-// Materialize the per-req top_k / top_p optionals (SamplingMetadata) into the
-// [num_reqs] tensors ApplyTopKTopP consumes; pass nullptr when a predicate says
-// none. The DeviceScratch objects are locals whose lifetime spans the op call.
-void ApplyTopKTopPFromMeta(vt::Queue& q, vt::Tensor& logits,
-                           const std::optional<std::vector<int32_t>>& top_k,
-                           const std::optional<std::vector<float>>& top_p) {
-  const int64_t n = logits.shape[0];
-  if (top_k.has_value())
-    VT_CHECK(static_cast<int64_t>(top_k->size()) == n,
-             "sampler: top_k must have num_reqs rows");
-  if (top_p.has_value())
-    VT_CHECK(static_cast<int64_t>(top_p->size()) == n,
-             "sampler: top_p must have num_reqs rows");
-
-  if (top_k.has_value() && top_p.has_value()) {
-    DeviceScratch k(logits.device, q, top_k->data(), vt::DType::kI32, {n});
-    DeviceScratch p(logits.device, q, top_p->data(), vt::DType::kF32, {n});
-    vt::ApplyTopKTopP(q, logits, &k.tensor(), &p.tensor());
-  } else if (top_k.has_value()) {
-    DeviceScratch k(logits.device, q, top_k->data(), vt::DType::kI32, {n});
-    vt::ApplyTopKTopP(q, logits, &k.tensor(), nullptr);
-  } else if (top_p.has_value()) {
-    DeviceScratch p(logits.device, q, top_p->data(), vt::DType::kF32, {n});
-    vt::ApplyTopKTopP(q, logits, nullptr, &p.tensor());
-  }
-}
 
 // gather_logprobs (sampler.py::Sampler.gather_logprobs). Over the raw (pre-
 // mutation) logprobs snapshot: top-k values+indices, the sampled token's
@@ -256,6 +230,63 @@ struct Sampler::GreedyArgmaxScratch {
   }
 };
 
+// PERSISTENT random-path scratch: the device copies of the per-row temperature,
+// top_k, top_p and seed vectors, the [n, vocab] probs, and the [n] ids the host
+// path downloads. Grow-only and reused across steps, like GreedyArgmaxScratch:
+// allocating them per step cost six cudaMalloc/cudaFree pairs per sampled
+// decode step, and each cudaFree waits for the whole device, so on a sampled
+// batch the host never got ahead of the forward. A buffer is refilled with an
+// ordinary queued Copy, which the queue orders after the kernels that read it
+// on the previous step.
+struct Sampler::RandomSampleScratch {
+  struct Buffer {
+    void* data = nullptr;
+    size_t capacity = 0;
+  };
+  vt::Backend* backend = nullptr;
+  vt::Device device{};
+  Buffer temperature, top_k, top_p, seeds, probs, ids;
+
+  ~RandomSampleScratch() { Release(); }
+
+  void Release() {
+    for (Buffer* b : {&temperature, &top_k, &top_p, &seeds, &probs, &ids}) {
+      if (b->data != nullptr) backend->Free(b->data);
+      *b = Buffer{};
+    }
+  }
+
+  // A contiguous [shape] tensor over `buf` on `dev`, grown (never shrunk) to fit.
+  vt::Tensor View(vt::Device dev, Buffer& buf, vt::DType dtype,
+                  std::initializer_list<int64_t> shape) {
+    if (backend == nullptr || !(device == dev)) {
+      if (backend != nullptr) Release();
+      backend = &vt::GetBackend(dev.type);
+      device = dev;
+    }
+    int64_t numel = 1;
+    for (int64_t s : shape) numel *= s;
+    const size_t bytes = static_cast<size_t>(numel) * vt::SizeOf(dtype);
+    if (buf.data == nullptr || bytes > buf.capacity) {
+      if (buf.data != nullptr) backend->Free(buf.data);
+      buf.capacity = bytes == 0 ? 1 : bytes;
+      buf.data = backend->Alloc(buf.capacity);
+    }
+    return vt::Tensor::Contiguous(buf.data, dtype, device, shape);
+  }
+
+  // The same, filled from the host buffer `src`. Every backend's Copy has read
+  // `src` by the time it returns (a pageable cudaMemcpyAsync stages it), so the
+  // caller may free `src` before the queue gets there.
+  vt::Tensor Upload(vt::Queue& q, Buffer& buf, const void* src, vt::DType dtype,
+                    std::initializer_list<int64_t> shape) {
+    vt::Tensor t = View(q.device, buf, dtype, shape);
+    const size_t bytes = static_cast<size_t>(t.Numel()) * vt::SizeOf(dtype);
+    if (bytes != 0) backend->Copy(q, buf.data, src, bytes);
+    return t;
+  }
+};
+
 Sampler::Sampler(LogprobsMode logprobs_mode) : logprobs_mode_(logprobs_mode) {}
 Sampler::~Sampler() = default;
 
@@ -281,31 +312,105 @@ std::vector<int64_t> Sampler::greedy_argmax_host(vt::Queue& q,
                               greedy_scratch_->pinned_host + n);
 }
 
+void Sampler::snapshot_processed(vt::Queue& q, const vt::Tensor& logits,
+                                 std::vector<float>* out) const {
+  const int64_t n = logits.shape[0];
+  const int64_t vocab = logits.shape[1];
+  out->resize(static_cast<size_t>(n) * static_cast<size_t>(vocab));
+  if (logprobs_mode_ == LogprobsMode::kProcessedLogits) {
+    // processed_logits: the mutated logits tensor itself (:267-268).
+    vt::Backend& b = vt::GetBackend(logits.device.type);
+    b.Copy(q, out->data(), logits.data, out->size() * sizeof(float));
+    { static const bool kSyncLog = std::getenv("VT_SYNC_LOG") != nullptr;
+      if (kSyncLog) { std::fprintf(stderr, "[vt sync] sampler-295-processed\n"); std::fflush(stderr); } }
+    b.Synchronize(q);
+  } else {
+    // processed_logprobs: compute_logprobs of it (:269-270).
+    DeviceBuffer plp(logits.device, q, vt::DType::kF32, {n, vocab});
+    vt::ComputeLogprobs(q, plp.tensor(), logits);
+    plp.download(out->data());
+  }
+}
+
+void Sampler::sample_random(vt::Queue& q, vt::Tensor& logits,
+                            const SamplingMetadata& sm, vt::Tensor& ids,
+                            std::vector<float>* processed_out) const {
+  const int64_t n = logits.shape[0];
+  const int64_t vocab = logits.shape[1];
+  VT_CHECK(sm.temperature.has_value(),
+           "sampler: temperature is required unless all_greedy");
+  const std::vector<float>& temp = *sm.temperature;
+  VT_CHECK(static_cast<int64_t>(temp.size()) == n,
+           "sampler: temperature must have num_reqs rows");
+  if (sm.top_k.has_value())
+    VT_CHECK(static_cast<int64_t>(sm.top_k->size()) == n,
+             "sampler: top_k must have num_reqs rows");
+  if (sm.top_p.has_value())
+    VT_CHECK(static_cast<int64_t>(sm.top_p->size()) == n,
+             "sampler: top_p must have num_reqs rows");
+  if (random_scratch_ == nullptr) {
+    random_scratch_ = std::make_unique<RandomSampleScratch>();
+  }
+  RandomSampleScratch& s = *random_scratch_;
+
+  // 7b. Temperature (temp<eps->1.0 guard applied inside when !all_random).
+  vt::ApplyTemperature(q, logits,
+                       s.Upload(q, s.temperature, temp.data(), vt::DType::kF32, {n}),
+                       sm.all_random);
+
+  // 7c. Argmax-invariant procs: min_p (kMinPArgmaxInvariant == true).
+  if (!sm.min_p.empty()) apply_min_p(q, logits, sm.min_p);
+
+  // 7d. top_k and/or top_p (an absent optional is a nullptr => skip).
+  vt::Tensor k, p;
+  if (sm.top_k.has_value()) {
+    k = s.Upload(q, s.top_k, sm.top_k->data(), vt::DType::kI32, {n});
+  }
+  if (sm.top_p.has_value()) {
+    p = s.Upload(q, s.top_p, sm.top_p->data(), vt::DType::kF32, {n});
+  }
+  vt::ApplyTopKTopP(q, logits, sm.top_k.has_value() ? &k : nullptr,
+                    sm.top_p.has_value() ? &p : nullptr);
+
+  // Upstream takes the processed snapshot inside topk_topp_sampler, i.e. right
+  // here: after temperature, min_p and top-k/top-p, before the sampling draw
+  // (:286-290). A token masked away by top-k/top-p therefore reads -inf.
+  if (processed_out != nullptr) snapshot_processed(q, logits, processed_out);
+
+  // 7e. probs = softmax(logits); random_sample (exponential-noise gumbel-max).
+  vt::Tensor probs = s.View(logits.device, s.probs, vt::DType::kF32, {n, vocab});
+  vt::ComputeProbs(q, probs, logits);
+
+  std::vector<int64_t> seeds(static_cast<size_t>(n), static_cast<int64_t>(kDefaultSeed));
+  if (!sm.rng_seeds.empty()) {
+    // Key each row's draws by its request's seed and the position being sampled
+    // (metadata.h), with the batch row that ExpNoise mixes in cancelled.
+    VT_CHECK(static_cast<int64_t>(sm.rng_seeds.size()) == n &&
+                 static_cast<int64_t>(sm.positions.size()) == n,
+             "sampler: rng_seeds and positions must have num_reqs rows");
+    for (int64_t i = 0; i < n; ++i) {
+      const uint64_t key = vt::sample::PositionKey(sm.rng_seeds[static_cast<size_t>(i)],
+                                                   sm.positions[static_cast<size_t>(i)]);
+      seeds[static_cast<size_t>(i)] = static_cast<int64_t>(vt::sample::StreamSeed(key, i));
+    }
+  } else {
+    for (const auto& [i, seed] : sm.generators) {
+      VT_CHECK(i >= 0 && static_cast<int64_t>(i) < n,
+               "sampler: generator request index out of range");
+      seeds[static_cast<size_t>(i)] = static_cast<int64_t>(seed);
+    }
+  }
+  vt::RandomSample(q, ids, probs,
+                   s.Upload(q, s.seeds, seeds.data(), vt::DType::kI64, {n}));
+}
+
 std::vector<int64_t> Sampler::sample(vt::Queue& q, vt::Tensor& logits,
                                      const SamplingMetadata& sm,
                                      std::vector<float>* processed_out) const {
   const int64_t n = logits.shape[0];
-  const int64_t vocab = logits.shape[1];
   // processed_* snapshot (sampler.py:262-271,286-302). Non-null only when the
   // caller is in one of those two modes AND a request asked for logprobs.
   const bool want_processed = processed_out != nullptr;
-  auto snapshot_processed = [&]() {
-    processed_out->resize(static_cast<size_t>(n) * static_cast<size_t>(vocab));
-    if (logprobs_mode_ == LogprobsMode::kProcessedLogits) {
-      // processed_logits: the mutated logits tensor itself (:267-268).
-      vt::Backend& b = vt::GetBackend(logits.device.type);
-      b.Copy(q, processed_out->data(), logits.data,
-             processed_out->size() * sizeof(float));
-      { static const bool kSyncLog = std::getenv("VT_SYNC_LOG") != nullptr;
-        if (kSyncLog) { std::fprintf(stderr, "[vt sync] sampler-295-processed\n"); std::fflush(stderr); } }
-      b.Synchronize(q);
-    } else {
-      // processed_logprobs: compute_logprobs of it (:269-270).
-      DeviceBuffer plp(logits.device, q, vt::DType::kF32, {n, vocab});
-      vt::ComputeLogprobs(q, plp.tensor(), logits);
-      plp.download(processed_out->data());
-    }
-  };
 
   VT_CHECK(!(sm.all_greedy && sm.all_random),
            "sampler: all_greedy and all_random are mutually exclusive");
@@ -318,54 +423,30 @@ std::vector<int64_t> Sampler::sample(vt::Queue& q, vt::Tensor& logits,
     if (sm.all_greedy) {
       // Upstream returns HERE, before temperature (:262-271), so an all-greedy
       // batch's "processed" tensor is the post-logits-processor one.
-      if (want_processed) snapshot_processed();
+      if (want_processed) snapshot_processed(q, logits, processed_out);
       return greedy_sampled;
     }
   }
 
-  VT_CHECK(sm.temperature.has_value(),
-           "sampler: temperature is required unless all_greedy");
-  const std::vector<float>& temp = *sm.temperature;
-  VT_CHECK(static_cast<int64_t>(temp.size()) == n,
-           "sampler: temperature must have num_reqs rows");
-
-  // 7b. Temperature (temp<eps->1.0 guard applied inside when !all_random).
-  {
-    DeviceScratch t(logits.device, q, temp.data(), vt::DType::kF32, {n});
-    vt::ApplyTemperature(q, logits, t.tensor(), sm.all_random);
+  // 7b-7e on the device, then the one download of the ids.
+  if (random_scratch_ == nullptr) {
+    random_scratch_ = std::make_unique<RandomSampleScratch>();
   }
-
-  // 7c. Argmax-invariant procs: min_p (kMinPArgmaxInvariant == true).
-  if (!sm.min_p.empty()) apply_min_p(q, logits, sm.min_p);
-
-  // 7d. top_k and/or top_p (materialize the per-req optionals; nullptr => skip).
-  ApplyTopKTopPFromMeta(q, logits, sm.top_k, sm.top_p);
-
-  // Upstream takes the processed snapshot inside topk_topp_sampler, i.e. right
-  // here: after temperature, min_p and top-k/top-p, before the sampling draw
-  // (:286-290). A token masked away by top-k/top-p therefore reads -inf.
-  if (want_processed) snapshot_processed();
-
-  // 7e. probs = softmax(logits); random_sample (exponential-noise gumbel-max).
-  DeviceBuffer probs(logits.device, q, vt::DType::kF32, {n, vocab});
-  vt::ComputeProbs(q, probs.tensor(), logits);
-
-  std::vector<int64_t> seeds(static_cast<size_t>(n), static_cast<int64_t>(kDefaultSeed));
-  for (const auto& [i, seed] : sm.generators) {
-    VT_CHECK(i >= 0 && static_cast<int64_t>(i) < n,
-             "sampler: generator request index out of range");
-    seeds[static_cast<size_t>(i)] = static_cast<int64_t>(seed);
-  }
+  vt::Tensor ids = random_scratch_->View(logits.device, random_scratch_->ids,
+                                         vt::DType::kI64, {n});
+  sample_random(q, logits, sm, ids, processed_out);
   std::vector<int64_t> random_sampled(static_cast<size_t>(n));
-  {
-    DeviceScratch s(logits.device, q, seeds.data(), vt::DType::kI64, {n});
-    DeviceBuffer rs(logits.device, q, vt::DType::kI64, {n});
-    vt::RandomSample(q, rs.tensor(), probs.tensor(), s.tensor());
-    rs.download(random_sampled.data());
+  vt::Backend& b = vt::GetBackend(logits.device.type);
+  if (n != 0) {
+    b.Copy(q, random_sampled.data(), ids.data, static_cast<size_t>(n) * sizeof(int64_t));
   }
+  { static const bool kSyncLog = std::getenv("VT_SYNC_LOG") != nullptr;
+    if (kSyncLog) { std::fprintf(stderr, "[vt sync] sampler-55-download\n"); std::fflush(stderr); } }
+  b.Synchronize(q);
 
   // 7f. Mixed batch: where(temp < eps, greedy, random) per row.
   if (!have_greedy) return random_sampled;
+  const std::vector<float>& temp = *sm.temperature;
   std::vector<int64_t> sampled(static_cast<size_t>(n));
   for (int64_t i = 0; i < n; ++i) {
     sampled[static_cast<size_t>(i)] = (temp[static_cast<size_t>(i)] < vt::kSamplingEps)
@@ -465,6 +546,17 @@ SamplerOutput Sampler::forward(vt::Queue& q, vt::Tensor& logits,
     out.sampled_on_device = true;  // host sampled_token_ids intentionally empty
     return out;
   }
+  // The same for an all-random batch: no greedy row to merge in, so
+  // RandomSample can write the ids straight into the caller's tensor. These are
+  // the ops sample() runs, on the same inputs, so the ids are the same; what is
+  // gone is the download and the Synchronize that held the host until the
+  // forward had finished.
+  if (sampled_ids_out != nullptr && sm.all_random && !want_logprobs) {
+    sample_random(q, logits, sm, *sampled_ids_out, nullptr);
+    SamplerOutput out;
+    out.sampled_on_device = true;  // host sampled_token_ids intentionally empty
+    return out;
+  }
   // processed_* modes take their snapshot INSIDE sample(), where the mutations
   // they are named for have happened; it then replaces the (empty) raw one, as
   // upstream's `if processed_logprobs is not None` does (:104-106).
@@ -472,10 +564,11 @@ SamplerOutput Sampler::forward(vt::Queue& q, vt::Tensor& logits,
   const std::vector<int64_t> sampled = sample(
       q, logits, sm, (want_logprobs && processed_mode) ? &processed : nullptr);
   if (!processed.empty()) raw_logprobs = std::move(processed);
-  // Async path fallback (random rows or logprobs requested): the host `sample()`
-  // above already materialized the ids, so mirror them into the device out-tensor
-  // for a uniform async-output D2H. Correct, but no zero-copy win (documented; the
-  // greedy gate is the overlap target).
+  // Async path fallback (a mixed greedy + random batch, or logprobs requested):
+  // the host `sample()` above already materialized the ids, so mirror them into
+  // the device out-tensor for a uniform async-output D2H. Correct, but no
+  // zero-copy win (the all-greedy and all-random paths above are the overlap
+  // targets).
   if (sampled_ids_out != nullptr) {
     vt::GetBackend(logits.device.type)
         .Copy(q, sampled_ids_out->data, sampled.data(),

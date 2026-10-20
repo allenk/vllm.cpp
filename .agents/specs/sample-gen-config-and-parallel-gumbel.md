@@ -186,6 +186,17 @@ request and the predicted values.
   and `sampler.cpp:358` `rs.download(...)` is a blocking `Synchronize` every
   step, because the zero-sync device-resident path at `sampler.cpp:456-461`
   requires `sm.all_greedy` and is structurally unreachable at temperature 1.0.
+  Both are now paid only by a mixed greedy + random batch and by a batch that
+  wants logprobs: the random path's six per-step buffers (temperature, top_k,
+  top_p, seeds, probs, ids) live in the persistent `RandomSampleScratch`, and
+  an all-random batch without logprobs samples straight into the async
+  output's device slot, the twin of the all-greedy gate (`Sampler::forward`).
+  What stays owed is the kernel time, one 256-thread block per row:
+  `ApplyTopKTopPRowKernel` 706 us and `SoftmaxKernel` 323 us per step at
+  248,320 vocab and four rows (nsys, RTX PRO 6000). On the same GPU vLLM
+  0.28.0, which samples with FlashInfer's `top_k_top_p_sampling_from_logits`,
+  decodes 0.16 / 0.30 / 0.42 ms per token slower sampled than greedy at
+  c=1 / 4 / 8; this tree after the change, 1.06 / 1.21 / 1.22 ms.
 - [#2002](https://github.com/mudler/vllm.cpp/issues/2002): the spec-decode
   routing above is also a correctness divergence in its own right. Upstream's
   `rejection_sample` carries both the greedy and the stochastic accept; ours

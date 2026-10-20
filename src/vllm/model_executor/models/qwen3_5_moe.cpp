@@ -134,6 +134,10 @@ ForwardLogits ForwardQwen3_5Moe(LoadedModel& model,
       platforms::GetPlatform(input.queue.device.type).cutlass_fp4_supported() &&
       !weights.layers.empty() &&
       !weights.layers.front().moe.expert_gate_fp4.empty();
+  // Block-FP8 experts on the grouped path keep the expert compute on the device
+  // as the fp4 blocks do, so the same decode graph serves them.
+  const bool moe_graph =
+      fp4_cuda || MoeFp8BlockGroupedActive(weights, input.queue.device.type);
   constexpr int kMaxDecodeGraphBatch = 64;
 
   // SPEC-DSPARK W8 (#442): mirror vLLM's UNIFORM-decode predicate instead of
@@ -184,7 +188,7 @@ ForwardLogits ForwardQwen3_5Moe(LoadedModel& model,
        (input.logits_indices.empty() ||
         static_cast<int64_t>(input.logits_indices.size()) ==
             input.attn_meta.num_actual_tokens));
-  if (uniform_decode && fp4_cuda &&
+  if (uniform_decode && moe_graph &&
       input.num_reqs <= kMaxDecodeGraphBatch) {
     if (!qwen.decode_graph()) {
       qwen.decode_graph() = std::make_unique<Qwen3_5DecodeGraph>(

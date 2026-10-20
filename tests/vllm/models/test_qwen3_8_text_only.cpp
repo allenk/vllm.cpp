@@ -41,6 +41,7 @@
 #include <doctest/doctest.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -60,11 +61,13 @@
 // Qwen/Qwen3.6-35B-A3B (issue #740). Names, dtypes and shapes only — no weight
 // bytes. Regenerate with fixtures/gen_qwen3_5_stacked_shapes.py.
 #include "fixtures/qwen3_5_stacked_shapes.inc"
+#include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vt/dtype.h"
 
 using vllm::HfConfig;
 using vllm::ModelRegistration;
@@ -353,6 +356,18 @@ void AppendNvfp4(std::vector<Spec>& out, const std::string& proj,
   out.push_back({proj + ".weight", {out_dim, in_dim / 2}, "U8"});
   out.push_back({proj + ".weight_scale", {out_dim, in_dim / 16}, "F8_E4M3"});
   out.push_back({proj + ".weight_scale_2", {1}, "F32"});
+}
+
+// Block-wise FP8 projection, as `Qwen/Qwen3.6-35B-A3B-FP8` ships every quantized
+// one: F8_E4M3 `[out, in]` beside a BF16 `.weight_scale_inv` grid of
+// `[cdiv(out, 128), cdiv(in, 128)]`, and no other scale.
+constexpr int64_t kFp8Block = 128;
+void AppendFp8Block(std::vector<Spec>& out, const std::string& proj,
+                    int64_t out_dim, int64_t in_dim) {
+  out.push_back({proj + ".weight", {out_dim, in_dim}, "F8_E4M3"});
+  out.push_back({proj + ".weight_scale_inv",
+                 {(out_dim + kFp8Block - 1) / kFp8Block,
+                  (in_dim + kFp8Block - 1) / kFp8Block}});
 }
 
 // The full tensor list of a ONE-layer, full-attention, two-expert Qwen3.5 MoE
@@ -970,6 +985,103 @@ HfConfig OneLayerGdnMoeConfig() {
   return config;
 }
 
+// The `quantization_config` `Qwen/Qwen3.6-35B-A3B-FP8` declares (read off its
+// config.json on 2026-10-18, minus the 648-entry modules_to_not_convert list).
+// The block geometry lives ONLY here; the tensor index cannot supply it.
+HfConfig WithFp8Blocks(HfConfig config) {
+  config.raw["quantization_config"] = {
+      {"quant_method", "fp8"},
+      {"fmt", "e4m3"},
+      {"activation_scheme", "dynamic"},
+      {"weight_block_size", nlohmann::json::array({kFp8Block, kFp8Block})}};
+  return config;
+}
+
+// A ONE-layer MoE checkpoint in the shape of `Qwen/Qwen3.6-35B-A3B-FP8`: the
+// attention or GDN tower, the shared expert and every per-expert routed expert
+// are block-wise FP8; the router, the shared-expert gate, the norms, the GDN
+// tail and `lm_head` stay BF16, as that release's modules_to_not_convert keeps
+// them.
+std::vector<Spec> Fp8BlockMoeSpecs(const std::string& p, bool gdn_layer) {
+  const std::string l = p + "layers.0.";
+  const std::string mlp = l + "mlp.";
+  std::vector<Spec> s{
+      {p + "embed_tokens.weight", {kMoeVocab, kMoeHidden}},
+      {p + "norm.weight", {kMoeHidden}},
+      {l + "input_layernorm.weight", {kMoeHidden}},
+      {l + "post_attention_layernorm.weight", {kMoeHidden}},
+  };
+  if (gdn_layer) {
+    const std::string la = l + "linear_attn.";
+    AppendFp8Block(s, la + "in_proj_qkv", kGdnQkv, kMoeHidden);
+    AppendFp8Block(s, la + "in_proj_z", kGdnVDim, kMoeHidden);
+    AppendFp8Block(s, la + "out_proj", kMoeHidden, kGdnVDim);
+    s.push_back({la + "in_proj_b.weight", {kGdnValueHeads, kMoeHidden}});
+    s.push_back({la + "in_proj_a.weight", {kGdnValueHeads, kMoeHidden}});
+    s.push_back({la + "conv1d.weight", {kGdnQkv, 1, kGdnConv}});
+    s.push_back({la + "A_log", {kGdnValueHeads}});
+    s.push_back({la + "dt_bias", {kGdnValueHeads}});
+    s.push_back({la + "norm.weight", {kGdnValueHeadDim}});
+  } else {
+    const std::string sa = l + "self_attn.";
+    AppendFp8Block(s, sa + "q_proj", kMoeQ, kMoeHidden);
+    AppendFp8Block(s, sa + "k_proj", kMoeKv, kMoeHidden);
+    AppendFp8Block(s, sa + "v_proj", kMoeKv, kMoeHidden);
+    AppendFp8Block(s, sa + "o_proj", kMoeHidden, kMoeQ);
+    s.push_back({sa + "q_norm.weight", {kMoeHeadDim}});
+    s.push_back({sa + "k_norm.weight", {kMoeHeadDim}});
+  }
+  s.push_back({mlp + "gate.weight", {kMoeExperts, kMoeHidden}});
+  s.push_back({mlp + "shared_expert_gate.weight", {1, kMoeHidden}});
+  for (int64_t e = 0; e < kMoeExperts; ++e) {
+    const std::string ex = mlp + "experts." + std::to_string(e) + ".";
+    AppendFp8Block(s, ex + "gate_proj", kMoeInter, kMoeHidden);
+    AppendFp8Block(s, ex + "up_proj", kMoeInter, kMoeHidden);
+    AppendFp8Block(s, ex + "down_proj", kMoeHidden, kMoeInter);
+  }
+  const std::string se = mlp + "shared_expert.";
+  AppendFp8Block(s, se + "gate_proj", kMoeInter, kMoeHidden);
+  AppendFp8Block(s, se + "up_proj", kMoeInter, kMoeHidden);
+  AppendFp8Block(s, se + "down_proj", kMoeHidden, kMoeInter);
+  AppendBf16Proj(s, "lm_head", kMoeVocab, kMoeHidden);
+  return s;
+}
+
+// A loaded block-wise FP8 projection, checked against the payload the fixture
+// declared: the fp8 bytes VERBATIM in the on-disk `[out, in]` orientation (no
+// dequant, no transpose -- the block GEMM reads that orientation), and the BF16
+// grid widened to f32 BY VALUE, as `dense_loaders::LoadFp8BlockRaw` does. A
+// grid read as raw bytes, a transposed weight, or a scale bound to the wrong
+// projection each loads cleanly and is visible only here.
+void CheckFp8BlockRaw(const vllm::Fp8BlockWeight& w,
+                      const std::vector<Spec>& specs, const std::string& proj,
+                      int64_t out_dim, int64_t in_dim, const char* what) {
+  CAPTURE(what);
+  CAPTURE(proj);
+  REQUIRE_FALSE(w.Empty());
+  CHECK(w.n == out_dim);
+  CHECK(w.k == in_dim);
+  CHECK(w.block_n == kFp8Block);
+  CHECK(w.block_k == kFp8Block);
+  const size_t wi = SpecIndex(specs, proj + ".weight");
+  REQUIRE(w.packed.bytes.size() == static_cast<size_t>(out_dim * in_dim));
+  size_t byte_mismatches = 0;
+  for (size_t e = 0; e < w.packed.bytes.size(); ++e) {
+    const auto want = static_cast<uint8_t>((wi * 37 + e * 7) & 0xff);
+    if (static_cast<uint8_t>(w.packed.bytes.data()[e]) != want) ++byte_mismatches;
+  }
+  CHECK(byte_mismatches == 0u);
+  const size_t si = SpecIndex(specs, proj + ".weight_scale_inv");
+  const int64_t cells = ((out_dim + kFp8Block - 1) / kFp8Block) *
+                        ((in_dim + kFp8Block - 1) / kFp8Block);
+  REQUIRE(w.scale.bytes.size() == static_cast<size_t>(cells) * sizeof(float));
+  for (int64_t c = 0; c < cells; ++c) {
+    float got = 0.0F;
+    std::memcpy(&got, w.scale.bytes.data() + c * sizeof(float), sizeof(float));
+    CHECK(got == vt::BF16ToF32(Bf16At(si, static_cast<size_t>(c))));
+  }
+}
+
 // Load one synthetic MoE checkpoint through the PRODUCTION entry point. The
 // backing file is kept alive for the process: a loaded weight may BORROW the
 // safetensors mmap (`BorrowStTensorBytes`), and while the borrow carries its own
@@ -1474,7 +1586,9 @@ TEST_CASE("qwen3_8: the published stacked/unquantized MoE arm is REFUSED, and th
     CHECK(Mentions(message, "attention tower"));
     CHECK(Mentions(message, "not implemented"));
     CHECK(Mentions(message, "NVFP4"));
-    CHECK(Mentions(message, "BF16 or per-tensor FP8"));
+    // The tower reads block-wise FP8 too since the Qwen FP8 release arm, and
+    // the refusal lists every form it does read.
+    CHECK(Mentions(message, "BF16, per-tensor FP8 or block-wise FP8"));
     CHECK_FALSE(Mentions(message, "tensor not found"));
   }
 
@@ -1893,6 +2007,172 @@ TEST_CASE("qwen3_8: the bf16 lm_head loads through the MoE arm") {
 }
 
 // ---------------------------------------------------------------------------
+// 4h2. QWEN'S OWN FP8 RELEASE (`Qwen/Qwen3.6-35B-A3B-FP8`). Block-wise FP8
+//      everywhere the release quantizes: both towers, the shared expert and
+//      every per-expert routed expert, each `.weight` F8_E4M3 beside a
+//      `.weight_scale_inv` grid and NO `.weight_scale`. Before this arm the
+//      loader read the towers' F8_E4M3 as per-tensor FP8 and asked for a
+//      `.weight_scale` the release does not have, and refused the experts as
+//      "unquantized" for the same missing name.
+// ---------------------------------------------------------------------------
+TEST_CASE("qwen3_8: a block-wise FP8 MoE index (the Qwen FP8 release) loads end to end") {
+  for (const char* p : {"model.", "model.language_model."}) {
+    for (const bool gdn_layer : {false, true}) {
+      CAPTURE(p);
+      CAPTURE(gdn_layer);
+      const std::vector<Spec> specs = Fp8BlockMoeSpecs(p, gdn_layer);
+      std::vector<std::string> names;
+      for (const Spec& s : specs) names.push_back(s.name);
+      CHECK(vllm::ResolveQwen3_5MoeExpertLayout(names, p) ==
+            vllm::MoeExpertLayout::kPerExpertFp8Block);
+
+      const HfConfig config = WithFp8Blocks(gdn_layer ? OneLayerGdnMoeConfig()
+                                                      : OneLayerMoeConfig());
+      const vllm::Qwen3_5MoeWeights w = LoadSpecs(specs, config, "fp8_block");
+      REQUIRE(w.layers.size() == 1u);
+      const vllm::Qwen3_5MoeLayerWeights& layer = w.layers[0];
+      const std::string l = std::string(p) + "layers.0.";
+
+      if (gdn_layer) {
+        REQUIRE(layer.is_linear_attention);
+        const vllm::GdnLayerWeights& g = layer.gdn;
+        const std::string la = l + "linear_attn.";
+        CheckFp8BlockRaw(g.in_proj_qkv_fp8_block, specs, la + "in_proj_qkv",
+                         kGdnQkv, kMoeHidden, "in_proj_qkv");
+        CheckFp8BlockRaw(g.in_proj_z_fp8_block, specs, la + "in_proj_z",
+                         kGdnVDim, kMoeHidden, "in_proj_z");
+        CheckFp8BlockRaw(g.out_proj_fp8_block, specs, la + "out_proj",
+                         kMoeHidden, kGdnVDim, "out_proj");
+        // ONE residency per projection: the per-tensor and bf16 slots stay
+        // empty, or the forward's preference order would pick one of them.
+        CHECK(g.in_proj_qkv_fp8.Empty());
+        CHECK(g.out_proj_fp8.Empty());
+        CHECK(g.in_proj_qkv.Empty());
+        CHECK(g.out_proj.Empty());
+        CHECK_FALSE(g.in_proj_ba.Empty());  // the bf16 tail is untouched
+      } else {
+        REQUIRE_FALSE(layer.is_linear_attention);
+        const vllm::FullAttnLayerWeights& a = layer.attn;
+        const std::string sa = l + "self_attn.";
+        CheckFp8BlockRaw(a.q_proj_fp8_block, specs, sa + "q_proj", kMoeQ,
+                         kMoeHidden, "q_proj");
+        CheckFp8BlockRaw(a.k_proj_fp8_block, specs, sa + "k_proj", kMoeKv,
+                         kMoeHidden, "k_proj");
+        CheckFp8BlockRaw(a.v_proj_fp8_block, specs, sa + "v_proj", kMoeKv,
+                         kMoeHidden, "v_proj");
+        CheckFp8BlockRaw(a.o_proj_fp8_block, specs, sa + "o_proj", kMoeHidden,
+                         kMoeQ, "o_proj");
+        CHECK(a.q_proj_fp8.Empty());
+        CHECK(a.q_proj.Empty());
+        CHECK(a.o_proj_fp8.Empty());
+        CHECK(a.o_proj.Empty());
+      }
+
+      const vllm::MoeBlockWeights& m = layer.moe;
+      const std::string mlp = l + "mlp.";
+      CheckFp8BlockRaw(m.shared_gate_proj_fp8_block, specs,
+                       mlp + "shared_expert.gate_proj", kMoeInter, kMoeHidden,
+                       "shared gate_proj");
+      CheckFp8BlockRaw(m.shared_up_proj_fp8_block, specs,
+                       mlp + "shared_expert.up_proj", kMoeInter, kMoeHidden,
+                       "shared up_proj");
+      CheckFp8BlockRaw(m.shared_down_proj_fp8_block, specs,
+                       mlp + "shared_expert.down_proj", kMoeHidden, kMoeInter,
+                       "shared down_proj");
+      CHECK(m.shared_gate_proj.Empty());
+      CHECK(m.shared_gate_proj_fp4.Empty());
+
+      REQUIRE(m.expert_gate_fp8_block.size() == static_cast<size_t>(kMoeExperts));
+      REQUIRE(m.expert_up_fp8_block.size() == m.expert_gate_fp8_block.size());
+      REQUIRE(m.expert_down_fp8_block.size() == m.expert_gate_fp8_block.size());
+      for (int64_t e = 0; e < kMoeExperts; ++e) {
+        CAPTURE(e);
+        const std::string ex = mlp + "experts." + std::to_string(e) + ".";
+        const auto i = static_cast<size_t>(e);
+        CheckFp8BlockRaw(m.expert_gate_fp8_block[i], specs, ex + "gate_proj",
+                         kMoeInter, kMoeHidden, "expert gate_proj");
+        CheckFp8BlockRaw(m.expert_up_fp8_block[i], specs, ex + "up_proj",
+                         kMoeInter, kMoeHidden, "expert up_proj");
+        CheckFp8BlockRaw(m.expert_down_fp8_block[i], specs, ex + "down_proj",
+                         kMoeHidden, kMoeInter, "expert down_proj");
+      }
+      CHECK(m.expert_gate.empty());
+      CHECK(m.expert_gate_fp4.empty());
+      CHECK(m.expert_gate_kq.Empty());
+
+      // The release keeps the head bf16; the router and the shared-expert gate
+      // are bf16 on every Qwen3.5 MoE checkpoint.
+      CheckBf16Transposed(w.lm_head, specs, "lm_head.weight", kMoeVocab,
+                          kMoeHidden, "lm_head");
+      CHECK(w.lm_head_fp4.Empty());
+      CHECK_FALSE(m.router_gate.Empty());
+      CHECK_FALSE(m.shared_gate.Empty());
+    }
+  }
+}
+
+TEST_CASE("qwen3_8: a block-wise FP8 MoE index is refused, by name, where it cannot load") {
+  auto load_message = [](const std::vector<Spec>& specs, const HfConfig& config,
+                         const char* tag) {
+    return CaptureThrow([&] { (void)LoadSpecs(specs, config, tag); });
+  };
+
+  SUBCASE("a config that declares no weight_block_size") {
+    // The grid is there and the geometry to read it with is not. Guessing
+    // 128x128 would read every scale with the wrong tiling and still load.
+    const std::string message = load_message(Fp8BlockMoeSpecs("model.", false),
+                                             OneLayerMoeConfig(), "fp8_no_block");
+    CAPTURE(message);
+    CHECK(Mentions(message, "weight_block_size"));
+    CHECK(Mentions(message, "weight_scale_inv"));
+  }
+
+  SUBCASE("a routed expert without its block grid") {
+    std::vector<Spec> specs = Fp8BlockMoeSpecs("model.", false);
+    const std::string missing =
+        "model.layers.0.mlp.experts.1.down_proj.weight_scale_inv";
+    specs.erase(std::remove_if(specs.begin(), specs.end(),
+                               [&](const Spec& s) { return s.name == missing; }),
+                specs.end());
+    const std::string message =
+        load_message(specs, WithFp8Blocks(OneLayerMoeConfig()), "fp8_no_grid");
+    CAPTURE(message);
+    CHECK(Mentions(message, missing.c_str()));
+  }
+
+  SUBCASE("a tower projection without its block grid is named, not called mixed") {
+    std::vector<Spec> specs = Fp8BlockMoeSpecs("model.", false);
+    const std::string missing = "model.layers.0.self_attn.k_proj.weight_scale_inv";
+    specs.erase(std::remove_if(specs.begin(), specs.end(),
+                               [&](const Spec& s) { return s.name == missing; }),
+                specs.end());
+    const std::string message =
+        load_message(specs, WithFp8Blocks(OneLayerMoeConfig()), "fp8_tower_grid");
+    CAPTURE(message);
+    CHECK(Mentions(message, missing.c_str()));
+  }
+
+  SUBCASE("per-expert NVFP4 and block-wise FP8 experts in one index") {
+    std::vector<Spec> specs = Fp8BlockMoeSpecs("model.", false);
+    // Expert 1 becomes an NVFP4 requant; expert 0 stays block-wise FP8.
+    const std::string ex1 = "model.layers.0.mlp.experts.1.";
+    specs.erase(std::remove_if(specs.begin(), specs.end(),
+                               [&](const Spec& s) {
+                                 return s.name.rfind(ex1, 0) == 0;
+                               }),
+                specs.end());
+    AppendNvfp4(specs, ex1 + "gate_proj", kMoeInter, kMoeHidden);
+    AppendNvfp4(specs, ex1 + "up_proj", kMoeInter, kMoeHidden);
+    AppendNvfp4(specs, ex1 + "down_proj", kMoeHidden, kMoeInter);
+    const std::string message =
+        load_message(specs, WithFp8Blocks(OneLayerMoeConfig()), "fp8_fp4_mix");
+    CAPTURE(message);
+    CHECK(Mentions(message, "weight_scale_inv"));
+    CHECK(Mentions(message, "weight_scale_2"));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 4i. A FULLY PUBLISHED BF16 INDEX, END TO END. All four arms plus #740's
 //     stacked routed experts, which is what `Qwen/Qwen3.6-35B-A3B` and
 //     `Qwen/Qwen3.8-2.4T-A95B` are. Case 4c used to pin this shape as a
@@ -2099,6 +2379,8 @@ TEST_CASE("qwen3_8: the MoE and dense probes classify a projection identically")
       AppendBf16Proj(s, sa + "q_proj", 8, 8);
     } else if (kind == "fp8") {
       AppendFp8(s, sa + "q_proj", 8, 8);
+    } else if (kind == "fp8_block") {
+      AppendFp8Block(s, sa + "q_proj", 8, 8);
     } else {
       // ModelOpt NVFP4: `.weight` U8 + `.weight_scale` F8 + `.weight_scale_2`.
       // K must be a multiple of 16, so this projection is widened to 16.
@@ -2107,7 +2389,7 @@ TEST_CASE("qwen3_8: the MoE and dense probes classify a projection identically")
     return s;
   };
 
-  for (const char* kind : {"bf16", "fp8", "nvfp4"}) {
+  for (const char* kind : {"bf16", "fp8", "fp8_block", "nvfp4"}) {
     CAPTURE(kind);
     const std::vector<Spec> specs = dense_specs(kind);
     const ShardBag bag(specs, "probe_agreement");
@@ -2123,17 +2405,29 @@ TEST_CASE("qwen3_8: the MoE and dense probes classify a projection identically")
         vllm::ClassifyQwen3_5Projection(dtype_of, q);
     CHECK(vllm::Qwen3_5ProjectionPresent(dtype_of, q));
 
-    // What the DENSE loader actually did with the very same tensors.
+    // What the DENSE loader actually did with the very same tensors. The
+    // block-wise rung needs the geometry a block checkpoint's config declares;
+    // every other kind is loaded exactly as before, with none.
+    vllm::Fp8BlockQuantConfig block;
+    if (std::string(kind) == "fp8_block") {
+      block.block_quant = true;
+      block.block_n = kFp8Block;
+      block.block_k = kFp8Block;
+      block.activation_scheme = "dynamic";
+    }
     const vllm::Qwen3_5DenseLayerWeights dense = vllm::LoadQwen3_5DenseLayer(
-        bag.Resolver(), bag.Has(), "full_attention", 0, "model.");
+        bag.Resolver(), bag.Has(), "full_attention", 0, "model.", block);
     const bool dense_fp4 = !dense.attn.q_proj_fp4.Empty();
     const bool dense_fp8 = !dense.attn.q_proj_fp8.Empty();
+    const bool dense_fp8_block = !dense.attn.q_proj_fp8_block.Empty();
     const bool dense_bf16 = !dense.attn.q_proj.Empty();
     // Exactly one slot, whichever it is.
     REQUIRE((static_cast<int>(dense_fp4) + static_cast<int>(dense_fp8) +
-             static_cast<int>(dense_bf16)) == 1);
+             static_cast<int>(dense_fp8_block) + static_cast<int>(dense_bf16)) ==
+            1);
     CHECK(dense_fp4 == (classified == vllm::MoeProjDtype::kNvfp4));
     CHECK(dense_fp8 == (classified == vllm::MoeProjDtype::kFp8));
+    CHECK(dense_fp8_block == (classified == vllm::MoeProjDtype::kFp8Block));
     CHECK(dense_bf16 == (classified == vllm::MoeProjDtype::kBf16));
   }
 
@@ -2456,7 +2750,16 @@ std::vector<Spec> SpecsFromPlan(const std::vector<vllm::PlannedTensor>& plan) {
   specs.reserve(plan.size());
   for (const vllm::PlannedTensor& t : plan) {
     std::vector<int64_t> shape = t.shape;
-    if (shape.empty()) {
+    const std::string grid = ".weight_scale_inv";
+    const bool is_grid =
+        t.name.size() > grid.size() &&
+        t.name.compare(t.name.size() - grid.size(), grid.size(), grid) == 0;
+    if (shape.empty() && is_grid) {
+      // A block grid the planner declined to size (its weight's dims are the
+      // attention projections' unstated ones, see `PlanAttn`). The weight below
+      // is `[kMoeQ, kMoeHidden]`, which ONE 128x128 block covers.
+      shape = {1, 1};
+    } else if (shape.empty()) {
       // Scalars (`weight_scale` / `input_scale` / `weight_scale_2`) are rank 1
       // here exactly as the NVFP4 and FP8 fixtures above emit them; the loader
       // reads them through ReadF32Scalar, which cares only about byte count.
@@ -2474,7 +2777,10 @@ std::vector<Spec> SpecsFromPlan(const std::vector<vllm::PlannedTensor>& plan) {
 // 5a. The plan IS the loader's request set — proven in both directions.
 // ---------------------------------------------------------------------------
 TEST_CASE("qwen3_8: the load plan is exactly what LoadQwen3_5Moe fetches") {
-  const HfConfig config = PlanMoeConfig();
+  // Not const: the block-wise FP8 subcase below declares the block geometry,
+  // which only a config can carry. doctest re-runs this body per subcase, so
+  // the change never leaks into another one.
+  HfConfig config = PlanMoeConfig();
 
   auto exercise = [&config](const std::string& prefix,
                             vllm::MoeExpertLayout layout,
@@ -2585,6 +2891,27 @@ TEST_CASE("qwen3_8: the load plan is exactly what LoadQwen3_5Moe fetches") {
     bf16.lm_head = vllm::MoeProjDtype::kBf16;
     exercise("model.", vllm::MoeExpertLayout::kStackedBf16, bf16);
     exercise("model.language_model.", vllm::MoeExpertLayout::kStackedBf16, bf16);
+  }
+
+  // ...and the shape of Qwen's own FP8 release: every quantized component and
+  // the per-expert routed experts block-wise FP8, `lm_head` BF16. The deletion
+  // sweep is what binds the block arm's request set: a block projection asks
+  // for `.weight` + `.weight_scale_inv` and nothing else, so a plan that kept
+  // the per-tensor triple fails direction 1, and one that forgot the grid fails
+  // direction 2 -- including the case where the missing grid makes ONE tower
+  // projection look per-tensor, which the loader must still name.
+  SUBCASE("Qwen3.6-35B-A3B-FP8 shape — block-wise FP8 towers, shared and experts") {
+    config = WithFp8Blocks(config);
+    vllm::Qwen3_5MoeTowerDtypes block;
+    block.gdn = vllm::MoeProjDtype::kFp8Block;
+    block.attn = vllm::MoeProjDtype::kFp8Block;
+    block.shared_expert = vllm::MoeProjDtype::kFp8Block;
+    block.lm_head = vllm::MoeProjDtype::kBf16;
+    block.fp8_block_n = kFp8Block;
+    block.fp8_block_k = kFp8Block;
+    exercise("model.", vllm::MoeExpertLayout::kPerExpertFp8Block, block);
+    exercise("model.language_model.", vllm::MoeExpertLayout::kPerExpertFp8Block,
+             block);
   }
 }
 

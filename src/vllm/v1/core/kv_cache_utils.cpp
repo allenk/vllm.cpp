@@ -974,6 +974,9 @@ int64_t recurrent_state_bytes(const KVCacheConfig& kv_cfg, int max_num_seqs) {
     if (group.kv_cache_spec == nullptr) continue;
     if (group.kv_cache_spec->kind() != KVCacheSpecKind::kMamba) continue;
     const auto* mamba = static_cast<const MambaSpec*>(group.kv_cache_spec.get());
+    // In mode "align" the state rows are KV blocks, counted by KVBytesPerBlock
+    // and bounded by the KV budget (KV-MAMBA-ALIGN).
+    if (mamba->mamba_cache_mode == "align") continue;
     const int64_t slots_per_seq =
         static_cast<int64_t>(1 + mamba->num_speculative_blocks);
     const int64_t layers = static_cast<int64_t>(group.layer_names.size());

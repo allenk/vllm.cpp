@@ -18,10 +18,13 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 #include "vllm/v1/sample/metadata.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/sample_common.h"
 #include "vt/tensor.h"
 
 using vllm::v1::MinTokensState;
@@ -716,4 +719,269 @@ TEST_CASE("Sampler: logprob_token_ids reads the PROCESSED snapshot under a proce
   const float raw_lse = 3.0f + std::log(std::exp(0.0f) + std::exp(-2.0f) +
                                         std::exp(-1.0f) + std::exp(-3.0f));
   CHECK(lt.logprobs[2] != doctest::Approx(1.0f - raw_lse));
+}
+
+// ---------------------------------------------------------------------------
+// An all-random batch without logprobs samples DEVICE-RESIDENT when the caller
+// passes sampled_ids_out (the async runner's leg): the ids land in that tensor,
+// sampled_on_device is set and the host list stays empty. The ops and inputs
+// are the host path's, so the ids must be the host path's exactly, also after
+// the persistent scratch grows (3 -> 5 rows) and is reused for fewer (2).
+namespace {
+
+std::vector<float> PseudoRandomLogits(size_t count, uint32_t seed) {
+  std::vector<float> v(count);
+  uint32_t s = seed ? seed : 1;
+  for (auto& x : v) {
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    x = (static_cast<float>(s) / static_cast<float>(UINT32_MAX)) * 10.0f - 5.0f;
+  }
+  return v;
+}
+
+// `n` random rows exercising every per-row vector the random path uploads:
+// temperature, top_k (some rows the whole vocab), top_p (some rows 1.0) and the
+// draw keys, as InputBatch fills them (a seed and a position per row).
+SamplingMetadata RandomBatch(int64_t n, int64_t vocab) {
+  SamplingMetadata sm;
+  sm.all_greedy = false;
+  sm.all_random = true;
+  std::vector<float> temp, top_p;
+  std::vector<int32_t> top_k;
+  for (int64_t i = 0; i < n; ++i) {
+    temp.push_back(0.3f + 0.25f * static_cast<float>(i % 4));
+    top_k.push_back(static_cast<int32_t>(i % 3 == 0 ? vocab : 5 + i));
+    top_p.push_back(i % 2 == 0 ? 0.9f : 1.0f);
+    if (i % 2 == 1) sm.generators[static_cast<int>(i)] = 1000 + static_cast<uint64_t>(i);
+    sm.rng_seeds.push_back(1000 + static_cast<uint64_t>(i));
+    sm.positions.push_back(17 + 3 * i);
+  }
+  sm.temperature = temp;
+  sm.top_k = top_k;
+  sm.top_p = top_p;
+  sm.max_num_logprobs = std::nullopt;
+  return sm;
+}
+
+bool HasCuda() {
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+}  // namespace
+
+TEST_CASE("Sampler: an all-random batch samples device-resident, same ids as the host path") {
+  const int64_t V = 64;
+  Sampler sampler;
+  Queue q = Q();
+  for (int64_t n : {3, 5, 2}) {
+    const SamplingMetadata sm = RandomBatch(n, V);
+    std::vector<float> a =
+        PseudoRandomLogits(static_cast<size_t>(n * V), 7 + static_cast<uint32_t>(n));
+    std::vector<float> b = a;
+    Tensor ta = Logits(a, n, V);
+    Tensor tb = Logits(b, n, V);
+    const auto host = sampler.forward(q, ta, sm);
+    REQUIRE(host.sampled_token_ids.size() == static_cast<size_t>(n));
+
+    std::vector<int64_t> ids(static_cast<size_t>(n), -1);
+    Tensor tids = Tensor::Contiguous(ids.data(), DType::kI64, Cpu(), {n});
+    const auto dev = sampler.forward(q, tb, sm, &tids);
+    CHECK(dev.sampled_on_device);
+    CHECK(dev.sampled_token_ids.empty());
+    for (int64_t i = 0; i < n; ++i) {
+      CHECK(ids[static_cast<size_t>(i)] == host.sampled_token_ids[static_cast<size_t>(i)][0]);
+    }
+  }
+}
+
+// Logprobs still need the host path: the ids are mirrored into the out-tensor,
+// and the host list and the logprobs are returned as before.
+TEST_CASE("Sampler: an all-random batch that wants logprobs keeps the host path") {
+  const int64_t V = 64;
+  const int64_t n = 3;
+  SamplingMetadata sm = RandomBatch(n, V);
+  sm.max_num_logprobs = 2;
+  std::vector<float> a = PseudoRandomLogits(static_cast<size_t>(n * V), 3);
+  Tensor ta = Logits(a, n, V);
+  std::vector<int64_t> ids(static_cast<size_t>(n), -1);
+  Tensor tids = Tensor::Contiguous(ids.data(), DType::kI64, Cpu(), {n});
+
+  Sampler sampler;
+  Queue q = Q();
+  const auto out = sampler.forward(q, ta, sm, &tids);
+  CHECK_FALSE(out.sampled_on_device);
+  REQUIRE(out.sampled_token_ids.size() == static_cast<size_t>(n));
+  REQUIRE(out.logprobs_tensors.has_value());
+  for (int64_t i = 0; i < n; ++i) {
+    CHECK(ids[static_cast<size_t>(i)] == out.sampled_token_ids[static_cast<size_t>(i)][0]);
+  }
+}
+
+// The same equality on CUDA at the vocabulary of the Qwen3.5 / 3.6 checkpoints
+// (248,320), where the device path is the one that removes the host waits.
+TEST_CASE("Sampler: CUDA all-random batch samples device-resident, same ids as the host path") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  vt::Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = gpu.CreateQueue();
+  const Device dev{DeviceType::kCUDA, 0};
+  const int64_t V = 248320;
+  Sampler sampler;
+  for (int64_t n : {4, 8, 1}) {
+    const SamplingMetadata sm = RandomBatch(n, V);
+    const std::vector<float> logits =
+        PseudoRandomLogits(static_cast<size_t>(n * V), 11 + static_cast<uint32_t>(n));
+    const size_t bytes = logits.size() * sizeof(float);
+    void* la = gpu.Alloc(bytes);
+    void* lb = gpu.Alloc(bytes);
+    void* ids = gpu.Alloc(static_cast<size_t>(n) * sizeof(int64_t));
+    gpu.Copy(q, la, logits.data(), bytes);
+    gpu.Copy(q, lb, logits.data(), bytes);
+    Tensor ta = Tensor::Contiguous(la, DType::kF32, dev, {n, V});
+    Tensor tb = Tensor::Contiguous(lb, DType::kF32, dev, {n, V});
+    Tensor tids = Tensor::Contiguous(ids, DType::kI64, dev, {n});
+
+    const auto host = sampler.forward(q, ta, sm);
+    const auto out = sampler.forward(q, tb, sm, &tids);
+    std::vector<int64_t> got(static_cast<size_t>(n), -1);
+    gpu.Copy(q, got.data(), ids, static_cast<size_t>(n) * sizeof(int64_t));
+    gpu.Synchronize(q);
+    CHECK(out.sampled_on_device);
+    REQUIRE(host.sampled_token_ids.size() == static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+      CHECK(got[static_cast<size_t>(i)] == host.sampled_token_ids[static_cast<size_t>(i)][0]);
+    }
+    gpu.Free(la);
+    gpu.Free(lb);
+    gpu.Free(ids);
+  }
+  gpu.DestroyQueue(q);
+}
+
+// ---------------------------------------------------------------------------
+// The random draws are keyed by the request's seed and the position being
+// sampled (SamplingMetadata.rng_seeds / positions), not by the step's batch
+// layout. Before, the key was (seed, batch row, token) with nothing that moves
+// between steps, and an unseeded row always took seed 0: a request drew the
+// same noise at every step, and so did every unseeded request in that row.
+TEST_CASE("Sampler: StreamSeed cancels the batch row that ExpNoise mixes in") {
+  for (uint64_t key : {0ULL, 1ULL, 0xDEADBEEFCAFEF00DULL, 0x9E3779B97F4A7C15ULL}) {
+    for (int64_t row : {0, 1, 7, 1000}) {
+      for (int64_t col : {0, 5, 248319}) {
+        CHECK(vt::sample::ExpNoise(vt::sample::StreamSeed(key, row), row, col) ==
+              vt::sample::ExpNoise(key, 0, col));
+      }
+    }
+  }
+}
+
+namespace {
+
+// Sample row `row_of_x` of `logits` ([n, vocab]) with request seed `seed` at
+// position `pos`; the other rows get seeds and positions of their own.
+int32_t DrawAt(std::vector<float> logits, int64_t n, int64_t vocab, int64_t row_of_x,
+               uint64_t seed, int64_t pos) {
+  SamplingMetadata sm;
+  sm.all_greedy = false;
+  sm.all_random = true;
+  sm.temperature = std::vector<float>(static_cast<size_t>(n), 1.0f);
+  sm.max_num_logprobs = std::nullopt;
+  for (int64_t i = 0; i < n; ++i) {
+    sm.rng_seeds.push_back(1000 + static_cast<uint64_t>(i));
+    sm.positions.push_back(3 + i);
+  }
+  sm.rng_seeds[static_cast<size_t>(row_of_x)] = seed;
+  sm.positions[static_cast<size_t>(row_of_x)] = pos;
+  Sampler sampler;
+  Queue q = Q();
+  Tensor t = Logits(logits, n, vocab);
+  return sampler.forward(q, t, sm).sampled_token_ids[static_cast<size_t>(row_of_x)][0];
+}
+
+}  // namespace
+
+// The same request (same logits, seed, position) alone in row 0 and third in a
+// three-row batch draws the same token. Sixteen requests, so a row-keyed draw
+// cannot pass by luck.
+TEST_CASE("Sampler: a request draws the same token wherever it sits in the batch") {
+  const int64_t V = 64;
+  for (uint32_t k = 0; k < 16; ++k) {
+    const std::vector<float> x = PseudoRandomLogits(static_cast<size_t>(V), 100 + k);
+    std::vector<float> third = PseudoRandomLogits(static_cast<size_t>(2 * V), 200 + k);
+    third.insert(third.end(), x.begin(), x.end());
+    CHECK(DrawAt(x, 1, V, 0, 77 + k, 12) == DrawAt(third, 3, V, 2, 77 + k, 12));
+  }
+}
+
+// Eight equal logits make every draw uniform over the eight tokens. Keyed by
+// position, 1,600 positions of one request spread evenly; keyed by seed and row
+// alone they all land on the same token. The hash is deterministic, so this
+// always passes or always fails.
+TEST_CASE("Sampler: successive positions of one request draw fresh noise") {
+  const int64_t V = 8;
+  const int64_t kDraws = 1600;
+  std::vector<int> count(static_cast<size_t>(V), 0);
+  for (int64_t pos = 0; pos < kDraws; ++pos) {
+    const int32_t tok = DrawAt(std::vector<float>(static_cast<size_t>(V), 0.0f), 1, V, 0, 5, pos);
+    REQUIRE(tok >= 0);
+    REQUIRE(tok < V);
+    ++count[static_cast<size_t>(tok)];
+  }
+  // Pearson chi-square against uniform, 7 degrees of freedom; 24.3 is the
+  // 0.001 tail.
+  const double expected = static_cast<double>(kDraws) / static_cast<double>(V);
+  double chi2 = 0.0;
+  for (int c : count) chi2 += (c - expected) * (c - expected) / expected;
+  CHECK(chi2 < 24.3);
+}
+
+// The same on CUDA at the Qwen3.5 / 3.6 vocabulary: a request alone and the
+// same request third in a batch of three draw the same token.
+TEST_CASE("Sampler: CUDA draws do not depend on the batch row either") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  vt::Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = gpu.CreateQueue();
+  const Device dev{DeviceType::kCUDA, 0};
+  const int64_t V = 248320;
+  Sampler sampler;
+  auto draw = [&](const std::vector<float>& logits, int64_t n, int64_t row_of_x, uint64_t seed) {
+    SamplingMetadata sm;
+    sm.all_greedy = false;
+    sm.all_random = true;
+    sm.temperature = std::vector<float>(static_cast<size_t>(n), 0.7f);
+    sm.max_num_logprobs = std::nullopt;
+    for (int64_t i = 0; i < n; ++i) {
+      sm.rng_seeds.push_back(500 + static_cast<uint64_t>(i));
+      sm.positions.push_back(40 + i);
+    }
+    sm.rng_seeds[static_cast<size_t>(row_of_x)] = seed;
+    sm.positions[static_cast<size_t>(row_of_x)] = 321;
+    const size_t bytes = logits.size() * sizeof(float);
+    void* d = gpu.Alloc(bytes);
+    gpu.Copy(q, d, logits.data(), bytes);
+    Tensor t = Tensor::Contiguous(d, DType::kF32, dev, {n, V});
+    const int32_t tok =
+        sampler.forward(q, t, sm).sampled_token_ids[static_cast<size_t>(row_of_x)][0];
+    gpu.Free(d);
+    return tok;
+  };
+  for (uint32_t k = 0; k < 4; ++k) {
+    const std::vector<float> x = PseudoRandomLogits(static_cast<size_t>(V), 300 + k);
+    std::vector<float> third = PseudoRandomLogits(static_cast<size_t>(2 * V), 400 + k);
+    third.insert(third.end(), x.begin(), x.end());
+    CHECK(draw(x, 1, 0, 9000 + k) == draw(third, 3, 2, 9000 + k));
+  }
+  gpu.DestroyQueue(q);
 }

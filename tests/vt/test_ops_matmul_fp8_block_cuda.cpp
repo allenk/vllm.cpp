@@ -758,3 +758,50 @@ TEST_CASE("G9 the CUDA arm refuses by name what cutlass cannot implement") {
     CHECK(what.find("block_n is 64") != std::string::npos);
   }
 }
+
+// ---------------------------------------------------------------------------
+// G10 — a merged operand gives each shard its split bytes
+// ---------------------------------------------------------------------------
+// The merged block-FP8 linears (vt::kFp8BlockQkv, kFp8BlockGateUpSwiGLU,
+// kFp8BlockGdnQkvz) run ONE GEMM over the N-concatenated shards and slice its
+// output. That reproduces the split GEMMs only if no output element depends on
+// the operand's total N; the tile config is chosen by M alone
+// (Fp8BlockScaledConfigFor), so it should hold by construction, and this pins
+// it on the device. The shape is Qwen3.8-27B-FP8's GDN input projection,
+// in_proj_qkv (10240) + in_proj_z (6144) at K = 5120, with one M per config.
+TEST_CASE("G10 an N-concatenated weight gives each shard its split bytes") {
+  if (!HasCuda()) {
+    MESSAGE("NO CUDA DEVICE: G10 did not run HERE, and a skip is not a pass.");
+    return;
+  }
+  const int64_t K = 5120, n0 = 10240, n1 = 6144, N = n0 + n1;
+  const int64_t kt = CDiv(K, 128);
+  const auto w = RandomFp8Bytes(static_cast<size_t>(N) * K, 21);
+  const auto ws = RandomScales(static_cast<size_t>(N / 128) * kt, 22);
+  const std::vector<uint8_t> w0(w.begin(), w.begin() + n0 * K);
+  const std::vector<uint8_t> w1(w.begin() + n0 * K, w.end());
+  const std::vector<float> ws0(ws.begin(), ws.begin() + (n0 / 128) * kt);
+  const std::vector<float> ws1(ws.begin() + (n0 / 128) * kt, ws.end());
+
+  for (const int64_t m : {int64_t{1}, int64_t{8}, int64_t{128}, int64_t{512}}) {
+    CAPTURE(m);
+    CAPTURE(vt::cuda::Fp8BlockScaledConfigName(Fp8BlockScaledConfigFor(m)));
+    const auto a = RandomFp8Bytes(static_cast<size_t>(m) * K, 23);
+    const auto as = RandomScales(static_cast<size_t>(m) * kt, 24);
+    const std::vector<float> merged = DeviceBf16(BlockCase{m, N, K, 128, 128}, a, as, w, ws);
+    const std::vector<float> s0 = DeviceBf16(BlockCase{m, n0, K, 128, 128}, a, as, w0, ws0);
+    const std::vector<float> s1 = DeviceBf16(BlockCase{m, n1, K, 128, 128}, a, as, w1, ws1);
+    CheckNonVacuous(merged);
+
+    // memcmp on the widened floats: bf16 -> f32 is a shift, so equal floats
+    // here are equal bf16 bits, signed zeros and NaN payloads included.
+    size_t rows_differ = 0;
+    for (int64_t r = 0; r < m; ++r) {
+      const float* row = merged.data() + r * N;
+      if (std::memcmp(row, s0.data() + r * n0, sizeof(float) * n0) != 0 ||
+          std::memcmp(row + n0, s1.data() + r * n1, sizeof(float) * n1) != 0)
+        ++rows_differ;
+    }
+    CHECK(rows_differ == 0);
+  }
+}

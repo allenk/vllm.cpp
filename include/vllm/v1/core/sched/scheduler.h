@@ -67,7 +67,7 @@
 //     prefill_capacity_bound), PAUSE state, streaming/resumable sessions,
 //     skipped_waiting, priority scheduling (SchedulingPolicy::kPriority throws).
 //   - Structured-output grammar, LoRA gating, KV-connector / EC-connector,
-//     mamba block-aligned split, defer_block_free / deferred_frees, kv-cache
+//     defer_block_free / deferred_frees, kv-cache
 //     metrics, MFU perf metrics, kv_cache_events. (log-stats events /
 //     take_events are un-deferred for SERVE-RESPONSE-METRICS: schedule() records
 //     QUEUED/SCHEDULED/PREEMPTED per request, drained onto EngineCoreOutput.)
@@ -182,6 +182,21 @@ class Scheduler {
 
   // schedule(): the core token-budget algorithm. See the file header.
   SchedulerOutput schedule();
+
+  // scheduler.py::_mamba_block_aligned_split @ 0.28.0: clip a prefill chunk
+  // so it ends where the Mamba state must be cached. Block p of a request's
+  // Mamba block table holds the state after exactly (p + 1) * block_size
+  // tokens, and the state is written at chunk ends, so a chunk that does not
+  // finish the prefill ends on a block boundary, a chunk that starts mid-block
+  // stops at the next boundary, and no chunk runs past the last cacheable
+  // boundary. Decode is untouched. Not ported: EAGLE's block drop (this
+  // scheduler runs use_eagle false), partial hits (hash block == block) and
+  // shared-prefix junctions. schedule() applies it when
+  // need_mamba_block_aligned_split_; public because the tests drive it with
+  // hand-worked cases, as upstream's tests call the Python method.
+  int mamba_block_aligned_split(const Request& request, int num_new_tokens,
+                                int num_new_local_computed_tokens = 0,
+                                int num_external_computed_tokens = 0) const;
 
   // get_grammar_bitmask (scheduler.py:1477-1499): collect the scheduled
   // structured-output request ids (skipping requests still in a prefill chunk),
@@ -362,6 +377,11 @@ class Scheduler {
   // deferred with their config-gated metric families (see loggers.h).
   SchedulerStats make_stats() const;
 
+  // log_stats (scheduler.py: `self.log_stats`): upstream's make_stats() returns
+  // None when it is off, and only then does a step with no request outputs
+  // return nothing to the frontend. The engine core reads it for that choice.
+  bool log_stats() const { return log_stats_; }
+
   // Emit the chunked-prefill progress lines for the step just executed
   // (VT_SERVER_PREFILL_PROGRESS / VT_SERVER_VERBOSE). Called by EngineCore
   // AFTER execute_model, because schedule() advances num_computed_tokens before
@@ -413,12 +433,18 @@ class Scheduler {
   // Backing store for prefix_cache_metrics(); written only by schedule().
   CachingMetrics prefix_cache_metrics_;
 
-  // This step's take-and-swap prefix-cache delta, stashed by schedule() when it
-  // drains make_prefix_cache_stats() (the SAME observation fed to CachingMetrics
-  // and, via make_stats(), to SchedulerStats.prefix_cache_stats). Reset to empty
-  // on a step that produced no observation so make_stats() never re-reports a
-  // stale delta.
-  PrefixCacheStats last_prefix_cache_stats_;
+  // The prefix-cache deltas schedule() drained from make_prefix_cache_stats()
+  // (the SAME observations fed to CachingMetrics) since make_stats() last
+  // published them as SchedulerStats.prefix_cache_stats. ACCUMULATED and
+  // cleared on publish, not overwritten: under async scheduling EngineCore's
+  // batch queue runs a schedule() it does not follow with a make_stats()
+  // (step_with_batch_queue returns before popping while the queue has room),
+  // so an overwrite dropped the lookups of every step that admitted a
+  // request and /metrics read 0 queries with prefix caching on. Upstream
+  // takes the delta inside make_stats (scheduler.py:2399-2436), which
+  // accumulates across schedules the same way. Mutable because make_stats()
+  // is const and publishing is what consumes it.
+  mutable PrefixCacheStats last_prefix_cache_stats_;
 
   // This step's speculative-decoding aggregate, stashed by update_from_output
   // for make_stats() (#2770). Same arrangement, and the same reason, as
@@ -555,6 +581,10 @@ class Scheduler {
   // check can convert its block-granular match into tokens for the threshold
   // comparison (see maybe_reorder_waiting_for_lpm).
   int block_size_ = 0;
+  // KV-MAMBA-ALIGN (scheduler.py:316-318 @ 0.28.0): a Mamba group in "align"
+  // mode keeps its state at block boundaries, so prefill chunks must end on
+  // them (mamba_block_aligned_split).
+  bool need_mamba_block_aligned_split_ = false;
   // max_num_encoder_input_tokens (scheduler.py:226-228): the PER-STEP encoder
   // compute budget in encoder tokens, reset at the top of every schedule().
   int max_num_encoder_input_tokens_ = 0;

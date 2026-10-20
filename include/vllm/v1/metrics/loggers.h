@@ -13,12 +13,16 @@
 // #2770): the four spec-decoding families, when and only when a speculative
 // config resolved a non-zero k. See vllm/v1/spec_decode/metrics.h.
 //
+// ALSO REGISTERED, always-on in vLLM 0.28.0 and fed by the scheduler's
+// PrefillStats: vllm:prompt_tokens_by_source (loggers.py:680-693) and
+// vllm:request_prefill_kv_computed_tokens (loggers.py:962-973).
+//
 // DEFERRED (config-gated in vLLM, so NOT part of the always-on core): the
 // kv-connector prefix-cache counters, mm-cache counters, LoRA info gauge,
 // kv-block-lifetime histograms, corrupted-request counter,
-// prompt_tokens_by_source, engine_sleep_state, and per-reason waiting
-// breakdown values. vllm:num_requests_waiting_by_reason IS registered (name
-// parity) but recorded at the aggregate only.
+// engine_sleep_state, and per-reason waiting breakdown values.
+// vllm:num_requests_waiting_by_reason IS registered (name parity) but recorded
+// at the aggregate only.
 #ifndef VLLM_V1_METRICS_LOGGERS_H_
 #define VLLM_V1_METRICS_LOGGERS_H_
 
@@ -59,9 +63,11 @@ class PrometheusStatLogger {
                        int engine_index = 0, int num_speculative_tokens = 0);
 
   // record() (loggers.py:1100-1257): fold one step's scheduler + iteration
-  // stats into the registry. Either argument may be default-constructed.
+  // stats into the registry. `iteration_stats` is null for a step that had no
+  // request outputs (upstream passes None); only the scheduler state is then
+  // recorded.
   void Record(const SchedulerStats& scheduler_stats,
-              const IterationStats& iteration_stats);
+              const IterationStats* iteration_stats);
 
   // cache_config_info (loggers.py) — the Info metric carrying static KV-cache
   // configuration. Both labels are asserted non-empty by the scrape spec.

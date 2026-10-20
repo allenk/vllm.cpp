@@ -714,6 +714,19 @@ class GPUModelRunner final : public ModelRunnerBase {
                              const std::vector<std::optional<std::string>>&
                                  req_ids);
 
+  // KV-MAMBA-ALIGN: align mode's stand-in for remap_gdn_state_slots. The
+  // state of a request is the row of its GDN block at column
+  // (seq_len - 1) / block_size (v1/attention/backends/utils.py::
+  // mamba_get_block_table_tensor), written into column 0, the one the GDN
+  // builder reads. When that column moved since the previous step, the
+  // previous column's state is copied into it first
+  // (v1/worker/mamba_utils.py::preprocess_mamba). Without speculation the
+  // previous column is (num_computed - 1) / block_size, -1 for a fresh
+  // request (no copy, zero state) and k - 1 after a k-block cache hit, so it
+  // is derived rather than tracked.
+  void select_gdn_align_state_blocks(std::vector<int32_t>& gdn_bt, int gdn_cols,
+                                     const StepInputs& step);
+
   const HfConfig& config_;
   // Production: model_ borrows LoadedEngine::model_. Direct runner tests use a
   // small owned adapter that in turn borrows their concrete weights.
@@ -881,6 +894,14 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Flattened-token bound for one step; sizes the W4 device input_ids mirror.
   int max_num_batched_tokens_ = 0;
   int64_t gdn_state_slots_ = 0;
+  // KV-MAMBA-ALIGN: the GDN group's MambaSpec is in mode "align" (prefix
+  // caching on a hybrid). The state pool then has one row per KV block id,
+  // and select_gdn_align_state_blocks replaces the per-request slot remap.
+  bool gdn_align_ = false;
+  int gdn_align_block_size_ = 0;
+  // Bytes of one state row, per published state in spec order (the copies
+  // between blocks move whole rows).
+  std::vector<size_t> gdn_state_row_bytes_;
   // Compact GDN state-slot allocator: request identity (req_id) -> slot in
   // [0, gdn_state_slots_); free list of unused slots. Keyed on the sequence, not
   // the mamba pool block-id (see remap_gdn_state_slots for why block-id keying

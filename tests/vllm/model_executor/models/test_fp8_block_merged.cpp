@@ -188,6 +188,43 @@ TEST_CASE("fp8 block merged: qkv is BYTE-IDENTICAL to the three split GEMMs") {
   CHECK(CountNonZero(ToF32(merged.t(), M * N)) == M * N);
 }
 
+// The GDN input projection's arity-2 group. ProjectGdnQkvz takes it only on a
+// weight-staging device, so this pins the descriptor and the merge on the CPU
+// reference: qkv rows first, then z, each byte-identical to its split GEMM.
+TEST_CASE("fp8 block merged: gdn qkvz is BYTE-IDENTICAL to the two split GEMMs") {
+  const int64_t M = 3, K = 256;
+  const int64_t qkvn = 384, zn = 256;
+  vt::Queue q = Q();
+  vt::Backend& b = vt::GetBackend(vt::DeviceType::kCPU);
+  Dev d{b, q};
+
+  vllm::Fp8BlockWeight wqkv = MakeFp8Block(qkvn, K, kBlock, kBlock, 5101);
+  vllm::Fp8BlockWeight wz = MakeFp8Block(zn, K, kBlock, kBlock, 5102);
+  VaryScale(wqkv, 5101);
+  VaryScale(wz, 5102);
+  OwnedTensor xw = MakeOwned(DType::kBF16, {M, K}, 5103);
+  DBuf x(d, DType::kBF16, {M, K}, xw.bytes.data());
+
+  DBuf sqkv = vllm::dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+      d, x.t(), wqkv, DType::kBF16);
+  DBuf sz = vllm::dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, x.t(), wz,
+                                                               DType::kBF16);
+
+  const Fp8BlockShard shards[2] = {{&wqkv, "in_proj_qkv"}, {&wz, "in_proj_z"}};
+  Fp8BlockMergedResident resident;
+  const Fp8BlockMergedView view = vllm::dense_fp8_block::ResidentFp8BlockMerged(
+      d, vt::kFp8BlockGdnQkvz, "in_proj_qkvz", shards, 2, resident);
+  REQUIRE(view.n_total == qkvn + zn);
+  DBuf merged = vllm::dense_fp8_block::MatmulFp8BlockMergedD<DBuf>(
+      d, x.t(), view, DType::kBF16, vt::kFp8BlockGdnQkvz);
+  const int64_t N = qkvn + zn;
+  REQUIRE(merged.t().shape[1] == N);
+
+  CHECK(ColumnBytes(merged.t(), M, N, 0, qkvn) == Bytes(sqkv.t(), M * qkvn));
+  CHECK(ColumnBytes(merged.t(), M, N, qkvn, N) == Bytes(sz.t(), M * zn));
+  CHECK(CountNonZero(ToF32(merged.t(), M * N)) == M * N);
+}
+
 // G3 -----------------------------------------------------------------------
 TEST_CASE("fp8 block merged: a ragged NON-final shard is refused by name") {
   // Upstream's `validate_fp8_block_shape` (`fp8_utils.py:1229-1244`) exempts

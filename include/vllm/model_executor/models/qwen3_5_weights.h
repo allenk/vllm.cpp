@@ -902,6 +902,11 @@ struct GdnLayerWeights {
   Fp8BlockWeight in_proj_qkv_fp8_block;
   Fp8BlockWeight in_proj_z_fp8_block;
   Fp8BlockWeight out_proj_fp8_block;
+  // The two block shards above N-concatenated, qkv rows first: upstream's
+  // merged `in_proj_qkvz` (`vt::kFp8BlockGdnQkvz`). Built lazily-once by
+  // `dense_fp8_block::ResidentFp8BlockMerged` when `ProjectGdnQkvz` takes the
+  // merged arm, and the two shards' own residents are then never built.
+  Fp8BlockMergedResident in_proj_qkvz_fp8_block_merged;
 
   // 27B W4A4 fp4-resident variant of out_proj (compressed-tensors NVFP4, notes
   // §3.6). When populated (real 27B CUDA load) the forward calls vt::MatmulNvfp4
@@ -1104,12 +1109,27 @@ struct MoeBlockWeights {
   Nvfp4Weight shared_up_proj_fp4;    // [N=Is, K=H]
   Nvfp4Weight shared_down_proj_fp4;  // [N=H, K=Is]
 
+  // Block-wise FP8 variants: what Qwen's own FP8 releases ship
+  // (`Qwen/Qwen3.6-35B-A3B-FP8`: per-expert `.weight` F8_E4M3 [out, in] beside a
+  // `.weight_scale_inv` [cdiv(out, 128), cdiv(in, 128)], dynamic activation
+  // scales). The fp8 bytes stay raw in the on-disk orientation, as the dense
+  // block arm keeps them, and the forward multiplies through
+  // `dense_fp8_block::MatmulFp8BlockScaledD`. Populated instead of the bf16 and
+  // fp4 sets above, never beside them.
+  std::vector<Fp8BlockWeight> expert_gate_fp8_block;  // E * [N=I, K=H]
+  std::vector<Fp8BlockWeight> expert_up_fp8_block;    // E * [N=I, K=H]
+  std::vector<Fp8BlockWeight> expert_down_fp8_block;  // E * [N=H, K=I]
+  Fp8BlockWeight shared_gate_proj_fp8_block;  // [N=Is, K=H]
+  Fp8BlockWeight shared_up_proj_fp8_block;    // [N=Is, K=H]
+  Fp8BlockWeight shared_down_proj_fp8_block;  // [N=H, K=Is]
+
   // Resident MoE constants, one slot per forward path (issue #237; see
   // ResidentSlot). Exactly one is populated on a given engine — whichever path
-  // this block's experts route through — and all three die with the block.
-  ResidentSlot resident_fused;   // MoeFusedResident   (fp4 fused)
-  ResidentSlot resident_bf16;    // MoeBf16Resident    (bf16 fast)
-  ResidentSlot resident_marlin;  // MoeMarlinResident  (Marlin grouped)
+  // this block's experts route through — and all of them die with the block.
+  ResidentSlot resident_fused;      // MoeFusedResident     (fp4 fused)
+  ResidentSlot resident_bf16;       // MoeBf16Resident      (bf16 fast)
+  ResidentSlot resident_marlin;     // MoeMarlinResident    (Marlin grouped)
+  ResidentSlot resident_fp8_block;  // MoeFp8BlockResident  (block-FP8 grouped)
 };
 
 // One decoder layer: input/post norms + one attention variant + the MoE block.
@@ -1249,7 +1269,11 @@ void SetLoadDirectUploadOverrideForTesting(std::optional<bool> value);
 //                   tensor per projection holding every expert -- what the
 //                   PUBLISHED repos (Qwen/Qwen3.8-2.4T-A95B,
 //                   Qwen/Qwen3.6-35B-A3B) ship. Populates the bf16 `expert_*`.
-enum class MoeExpertLayout { kPerExpertNvfp4, kStackedBf16 };
+//  kPerExpertFp8Block `<layer>.mlp.experts.<e>.{gate,up,down}_proj.weight`
+//                   F8_E4M3 + `.weight_scale_inv` block scales -- what Qwen's
+//                   own FP8 release (Qwen/Qwen3.6-35B-A3B-FP8) ships. Populates
+//                   `expert_*_fp8_block`.
+enum class MoeExpertLayout { kPerExpertNvfp4, kStackedBf16, kPerExpertFp8Block };
 
 // Decides which of the two a checkpoint uses, ONCE, from its shard index —
 // the routed-expert sibling of `ResolveQwen3_5BackbonePrefix`, and public for
@@ -1285,6 +1309,7 @@ enum class MoeProjDtype {
   kBf16,   // `<proj>.weight` BF16, no scales -- what a published repo ships
   kFp8,    // `<proj>.weight` F8_E4M3 + `.weight_scale` (+ `.input_scale`)
   kNvfp4,  // ModelOpt `<proj>.weight` U8 + `.weight_scale` F8 + `.weight_scale_2`
+  kFp8Block,  // `<proj>.weight` F8_E4M3 + `.weight_scale_inv` block scales
 };
 
 const char* MoeProjDtypeName(MoeProjDtype dtype);
@@ -1304,8 +1329,13 @@ using TensorDtypeProbe = std::function<std::string(const std::string&)>;
 //      -- compressed-tensors spells the packed weight `weight_packed`; ModelOpt
 //      spells the global scale `weight_scale_2`. Probing only one missed
 //      `nvidia/Qwen3.6-27B-NVFP4` entirely (:342-356).
-//   2. `get(<proj>.weight).dtype == "F8_E4M3"` -- the `modelopt_mixed` tower.
-//   3. otherwise BF16.
+//   2. `has(<proj>.weight_scale_inv)` beside an F8_E4M3 weight -- block-wise
+//      FP8 (`IsFp8BlockProjection`, #1189 M3), asked BEFORE the per-tensor rung
+//      because a block-wise weight is also F8_E4M3 (#1166). The dense rung also
+//      consults `quantization_config`; an index-only probe cannot, so
+//      `LoadQwen3_5Moe` checks the block geometry against the config instead.
+//   3. `get(<proj>.weight).dtype == "F8_E4M3"` -- the `modelopt_mixed` tower.
+//   4. otherwise BF16.
 // This is that ladder and nothing else. If the two ever disagree about one
 // projection, a checkpoint could route differently through two loaders in the
 // same build, so `test_qwen3_8_text_only` binds them by loading the SAME
@@ -1343,6 +1373,12 @@ struct Qwen3_5MoeTowerDtypes {
   MoeProjDtype attn = MoeProjDtype::kFp8;    // self_attn q/k/v/o_proj
   MoeProjDtype shared_expert = MoeProjDtype::kNvfp4;  // mlp.shared_expert.*
   MoeProjDtype lm_head = MoeProjDtype::kNvfp4;
+  // The block shape every `kFp8Block` component (and a `kPerExpertFp8Block`
+  // expert layout) is read with: `quantization_config.weight_block_size`, filled
+  // by `LoadQwen3_5Moe` from the config. The tensor index cannot supply it, so
+  // `ResolveQwen3_5MoeTowerDtypes` leaves it 0 and a block arm refuses 0.
+  int64_t fp8_block_n = 0;
+  int64_t fp8_block_k = 0;
 };
 
 // Resolves all four from the checkpoint index, walking EVERY layer of

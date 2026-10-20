@@ -59,6 +59,17 @@ struct SamplingMetadata {
   // from the map (upstream NOTE at gpu_input_batch.py:251-252).
   std::map<int, uint64_t> generators;
 
+  // [num_reqs] each: what the random draws are keyed by, as vLLM V2 keys them
+  // (vllm/v1/worker/gpu/sample/states.py:54-58, gumbel.py:264-265).
+  // `rng_seeds[i]` is the request's seed -- its own, or one drawn when the
+  // request was added -- and `positions[i]` the position of the token being
+  // sampled, so every step draws fresh noise and a request draws the same
+  // wherever it sits in the batch. InputBatch fills both; when they are empty
+  // (a hand-built metadata) the sampler falls back to `generators` and keys the
+  // draws by batch row.
+  std::vector<uint64_t> rng_seeds;
+  std::vector<int64_t> positions;
+
   // None => no logprobs; 0 => sampled-token logprob only; k => top-k; -1 => all.
   std::optional<int> max_num_logprobs;
 

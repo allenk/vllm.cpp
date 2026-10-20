@@ -188,11 +188,13 @@ std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step() {
   // core.py:504-506 engine_core_outputs = scheduler.update_from_output(...).
   // Our update_from_output returns a single flat EngineCoreOutputs (T0 single
   // client); wrap it in the per-client map to keep the upstream return shape.
-  // Upstream builds dict[client_index, EngineCoreOutputs] only for clients that
-  // produced outputs this step (the dict comprehension over `outputs.items()`),
-  // so a 0-output step (e.g. a finished-req flush) yields an empty map. We drop
-  // the finished_requests-only entries (that DP-signalling field is deferred),
-  // so the entry is present iff there are token outputs.
+  // Upstream builds dict[client_index, EngineCoreOutputs] for the clients that
+  // produced outputs this step and, when stats are logged, adds client 0's
+  // entry for a step that produced none, because "We must return the stats
+  // even if there are no request outputs this step" (scheduler.py:2121-2134 @
+  // 0.28.0). We drop the finished_requests-only entries (that DP-signalling
+  // field is deferred), so the entry is present iff there are token outputs or
+  // stats to send.
   if (steps.enabled) steps.execute_us.push_back(UsSince(t_exec));
   const auto t_upd = StepClock::now();
   EngineCoreOutputs engine_core_outputs =
@@ -204,7 +206,7 @@ std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step() {
   engine_core_outputs.scheduler_stats = scheduler_.make_stats();
   engine_core_outputs.timestamp = MonotonicSeconds();
   std::map<int, EngineCoreOutputs> outputs_by_client;
-  if (!engine_core_outputs.outputs.empty()) {
+  if (!engine_core_outputs.outputs.empty() || scheduler_.log_stats()) {
     const int client_index = engine_core_outputs.engine_index;
     outputs_by_client.emplace(client_index, std::move(engine_core_outputs));
   }
@@ -376,8 +378,12 @@ EngineCore::step_with_batch_queue() {
   engine_core_outputs.scheduler_stats = scheduler_.make_stats();
   engine_core_outputs.timestamp = MonotonicSeconds();
 
+  // Same entry rule as step(): token outputs, or the stats of a step that had
+  // none. Here the lookups a schedule() makes are published by the update of
+  // the batch before it, so dropping a step without outputs (a batch of
+  // partial prefills, the flush after a finish) lost them.
   std::map<int, EngineCoreOutputs> outputs_by_client;
-  if (!engine_core_outputs.outputs.empty()) {
+  if (!engine_core_outputs.outputs.empty() || scheduler_.log_stats()) {
     const int client_index = engine_core_outputs.engine_index;
     outputs_by_client.emplace(client_index, std::move(engine_core_outputs));
   }

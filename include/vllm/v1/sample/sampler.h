@@ -86,13 +86,17 @@ class Sampler {
   // path): when non-null it must be a device-resident int64 [num_reqs] (or
   // [num_reqs,1]) tensor. The sampler writes the final sampled ids into it so the
   // async output D2H (AsyncGPUModelRunnerOutput) — not the sampler — owns the
-  // single host copy. On the all-greedy, no-logprobs gate path this stays FULLY
-  // device-resident (GreedyArgmax writes the tensor directly; no host download,
-  // no main-queue synchronize) and the returned SamplerOutput.sampled_on_device
-  // is true with an empty host `sampled_token_ids`. Any batch with random rows or
-  // logprobs falls back to the host `sample()` path and then copies the host ids
-  // into `sampled_ids_out` (correct, no zero-copy win — the greedy gate is the
-  // overlap target; mirrors async_utils.py keeping ids GPU-side at :31).
+  // single host copy. Two batch kinds stay FULLY device-resident (no host
+  // download, no main-queue synchronize) and return
+  // SamplerOutput.sampled_on_device == true with an empty host
+  // `sampled_token_ids`: an all-greedy batch without logprobs (GreedyArgmax
+  // writes the tensor directly) and an all-random batch without logprobs
+  // (RandomSample writes it, after the same temperature / min_p / top-k / top-p
+  // / softmax the host path runs, so the ids are the same). A mixed greedy +
+  // random batch, or any batch that wants logprobs, falls back to the host
+  // `sample()` path and then copies the host ids into `sampled_ids_out`
+  // (correct, no zero-copy win; mirrors async_utils.py keeping ids GPU-side at
+  // :31).
   SamplerOutput forward(vt::Queue& q, vt::Tensor& logits,
                         const SamplingMetadata& sampling_metadata,
                         vt::Tensor* sampled_ids_out = nullptr) const;
@@ -126,6 +130,20 @@ class Sampler {
                               const SamplingMetadata& sampling_metadata,
                               std::vector<float>* processed_out = nullptr) const;
 
+  // Steps 7b-7e for every row: temperature, min_p, top-k/top-p, the processed
+  // snapshot when `processed_out` is non-null, softmax, and RandomSample into
+  // `ids` (an i64 [num_reqs] tensor on the logits' device). Queues the work and
+  // returns without waiting for it; the per-row vectors and the probs live in
+  // the persistent RandomSampleScratch.
+  void sample_random(vt::Queue& q, vt::Tensor& logits,
+                     const SamplingMetadata& sampling_metadata, vt::Tensor& ids,
+                     std::vector<float>* processed_out) const;
+
+  // The processed_* snapshot of `logits` into the host vector `out`
+  // (sampler.py:267-270): the logits themselves or their logprobs, by mode.
+  void snapshot_processed(vt::Queue& q, const vt::Tensor& logits,
+                          std::vector<float>* out) const;
+
   // GreedyArgmax over `logits` -> [n] host int64 ids, reusing a PERSISTENT
   // device + pinned-host scratch (grow-only) so the greedy decode hot path does
   // NO per-step cudaMalloc/cudaFree/cudaHostAlloc (each device-syncs). Mirrors
@@ -139,6 +157,10 @@ class Sampler {
   // const and this is pure allocation state, not sampling semantics.
   struct GreedyArgmaxScratch;
   mutable std::unique_ptr<GreedyArgmaxScratch> greedy_scratch_;
+  // The random path's persistent device buffers (pimpl; sampler.cpp), created
+  // on the first random call for the same reason.
+  struct RandomSampleScratch;
+  mutable std::unique_ptr<RandomSampleScratch> random_scratch_;
 };
 
 }  // namespace vllm::v1

@@ -39,7 +39,7 @@
 //   streaming-input
 //   chunk queue (StreamingUpdate / apply_streaming_update / resumable),
 //   iteration + per-request stats (RequestStateStats / IterationStats /
-//   LoRARequestStates), tracing (do_tracing), num_cached_tokens / prefill_stats,
+//   LoRARequestStates), tracing (do_tracing), RequestOutput.num_cached_tokens,
 //   LoRA and prompt_embeds. The T0 client-initiated abort path is present;
 //   external/internal-id fan-out, pooling and parent-request breadth remain.
 #pragma once
@@ -162,7 +162,10 @@ class RequestState {
   std::optional<LogprobsProcessor> logprobs_processor;
   std::optional<int> max_tokens_param;
   bool is_prefilling = true;
-  int num_cached_tokens = 0;  // deferred (no prefill_stats at T0); stays 0.
+  // The prompt tokens served from cache, from the first output's PrefillStats
+  // (output_processor.py:651-659 @ 0.28.0). Feeds FinishedRequestStats; the
+  // RequestOutput field it also fills upstream is not ported.
+  int64_t num_cached_tokens = 0;
 
   // RequestStateStats (stats.py:218-236) — the per-request timing/token running
   // state IterationStats.update_from_output threads through. The event-derived

@@ -24,8 +24,11 @@
 //     prefix-cache extra-key path — KV-PREFIX-CACHE W2 / ROAD-V1-D4-APC; the
 //     full LoRARequest / LoRA runtime stays deferred to LORA-RUNTIME.)
 //     client_index, streaming / resumable
-//     state, prefill_stats, last_sched_seq (defer_block_free fence),
+//     state, last_sched_seq (defer_block_free fence),
 //     num_nans_in_logits.
+//     (prefill_stats is un-deferred below: the frontend's prompt-token
+//     counters read the cached/computed split from it —
+//     vllm/v1/request.py:204,330-335 @ 0.28.0.)
 //     (num_preemptions is un-deferred below: PrefixCacheStats.record needs it
 //     to route a lookup into the mutually-exclusive preempted_* counters —
 //     vllm/v1/metrics/stats.py:130-142, called at
@@ -63,6 +66,7 @@
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/kv_cache_utils.h"       // BlockHash, BlockHasher
 #include "vllm/v1/engine/event.h"              // EngineCoreEvent(Type)
+#include "vllm/v1/metrics/stats.h"             // PrefillStats
 #include "vllm/v1/structured_output/request.h"  // StructuredOutputRequest
 
 namespace vllm::v1 {
@@ -208,6 +212,12 @@ struct Request {
   // PrefixCacheStats' preempted_* counters, so a preempted request's
   // guaranteed second-pass hit cannot inflate the headline hit rate.
   int num_preemptions = 0;
+  // The breakdown of this request's first scheduled prefill (upstream
+  // Request.prefill_stats, request.py:204 @ 0.28.0). Set by the scheduler's
+  // waiting loop until the request is first preempted; moved onto the
+  // request's first EngineCoreOutput by take_prefill_stats(), after which it
+  // is nullopt and later outputs carry none.
+  std::optional<PrefillStats> prefill_stats = PrefillStats{};
   // Per-request engine-core events accumulated since the last take_events()
   // (upstream Request.events, request.py:98). The scheduler appends a QUEUED /
   // SCHEDULED / PREEMPTED event (gated on log_stats) at the matching lifecycle
@@ -342,6 +352,14 @@ struct Request {
     }
     std::vector<EngineCoreEvent> taken;
     taken.swap(events);
+    return taken;
+  }
+
+  // take_prefill_stats (request.py:330-335 @ 0.28.0): return the prefill
+  // breakdown once, then nullopt.
+  std::optional<PrefillStats> take_prefill_stats() {
+    std::optional<PrefillStats> taken = prefill_stats;
+    prefill_stats.reset();
     return taken;
   }
 

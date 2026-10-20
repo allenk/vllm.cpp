@@ -1,8 +1,10 @@
 // Ported from: vllm/v1/metrics/loggers.py (PrometheusStatLogger) @ 555967922.
 #include "vllm/v1/metrics/loggers.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vllm::v1::metrics {
@@ -93,6 +95,9 @@ PrometheusStatLogger::PrometheusStatLogger(std::string served_model_name,
                             labels);
   registry_.RegisterCounter("vllm:prompt_tokens",
                             "Number of prefill tokens processed.", labels);
+  registry_.RegisterCounter("vllm:prompt_tokens_by_source",
+                            "Number of prompt tokens by source.",
+                            {"model_name", "engine", "source"});
   registry_.RegisterCounter(
       "vllm:prompt_tokens_cached",
       "Number of cached prompt tokens (local + external).", labels);
@@ -154,6 +159,11 @@ PrometheusStatLogger::PrometheusStatLogger(std::string served_model_name,
       "vllm:request_decode_time_seconds",
       "Histogram of time spent in DECODE phase for request.", labels,
       RequestLatencyBuckets());
+  registry_.RegisterHistogram(
+      "vllm:request_prefill_kv_computed_tokens",
+      "Histogram of new KV tokens computed during prefill (excluding cached "
+      "tokens).",
+      labels, count_buckets);
 
   // ── Static config Info ────────────────────────────────────────────────────
   registry_.RegisterInfo("vllm:cache_config_info",
@@ -186,8 +196,13 @@ PrometheusStatLogger::PrometheusStatLogger(std::string served_model_name,
       "vllm:request_queue_time_seconds",
       "vllm:request_inference_time_seconds",
       "vllm:request_prefill_time_seconds",
-      "vllm:request_decode_time_seconds"};
+      "vllm:request_decode_time_seconds",
+      "vllm:request_prefill_kv_computed_tokens"};
   for (const std::string& name : single) registry_.Prime(name, labelvalues_);
+  for (std::string_view source : PromptTokenStats::kAllSources) {
+    registry_.Prime("vllm:prompt_tokens_by_source",
+                    {model_name_, engine_str_, std::string(source)});
+  }
   registry_.Prime("vllm:num_requests_waiting_by_reason",
                   {model_name_, engine_str_, "capacity"});
   // request_success is only emitted once a request finishes (labeled by
@@ -215,7 +230,7 @@ void PrometheusStatLogger::Obs(const std::string& name, double v) {
 }
 
 void PrometheusStatLogger::Record(const SchedulerStats& s,
-                                  const IterationStats& it) {
+                                  const IterationStats* iteration_stats) {
   // One recorder thread (the sync step site, or AsyncLLM's output handler)
   // against N scraping readers — see the header's THREAD SAFETY note.
   std::lock_guard<std::mutex> lock(mu_);
@@ -240,16 +255,27 @@ void PrometheusStatLogger::Record(const SchedulerStats& s,
     spec_decoding_prom_.Observe(*s.spec_decoding_stats);
   }
 
-  // Iteration counters (loggers.py:1191-1205).
-  Inc("vllm:num_preemptions", static_cast<double>(it.num_preempted_reqs));
-  Inc("vllm:prompt_tokens", static_cast<double>(it.num_prompt_tokens));
-  Inc("vllm:prompt_tokens_cached",
-      static_cast<double>(it.num_prompt_tokens_cached));
-  Inc("vllm:generation_tokens", static_cast<double>(it.num_generation_tokens));
-  if (it.iteration_tokens > 0) {
-    Obs("vllm:iteration_tokens_total",
-        static_cast<double>(it.iteration_tokens));
+  // loggers.py:1185-1186 @ 0.28.0: a step without request outputs stops here.
+  if (iteration_stats == nullptr) {
+    return;
   }
+  const IterationStats& it = *iteration_stats;
+
+  // Iteration counters (loggers.py:1191-1208 @ 0.28.0). The iteration-token
+  // histogram counts the prompt tokens this step computed, not the ones it
+  // served from cache.
+  Inc("vllm:num_preemptions", static_cast<double>(it.num_preempted_reqs));
+  Inc("vllm:prompt_tokens", static_cast<double>(it.num_prompt_tokens()));
+  const PromptTokenStats& pts = it.prompt_token_stats;
+  for (std::string_view source : PromptTokenStats::kAllSources) {
+    registry_.IncCounter("vllm:prompt_tokens_by_source",
+                         {model_name_, engine_str_, std::string(source)},
+                         static_cast<double>(pts.get_by_source(source)));
+  }
+  Inc("vllm:prompt_tokens_cached", static_cast<double>(pts.cached_tokens));
+  Inc("vllm:generation_tokens", static_cast<double>(it.num_generation_tokens));
+  Obs("vllm:iteration_tokens_total",
+      static_cast<double>(pts.computed + it.num_generation_tokens));
 
   // Per-request iteration samples (loggers.py:1205-1219).
   for (double ttft : it.time_to_first_tokens_iter) {
@@ -274,6 +300,10 @@ void PrometheusStatLogger::Record(const SchedulerStats& s,
     Obs("vllm:request_inference_time_seconds", f.inference_time);
     Obs("vllm:request_prefill_time_seconds", f.prefill_time);
     Obs("vllm:request_decode_time_seconds", f.decode_time);
+    // loggers.py:1240-1246 @ 0.28.0: the prompt tokens this request computed.
+    Obs("vllm:request_prefill_kv_computed_tokens",
+        static_cast<double>(f.num_prompt_tokens -
+                            std::max<int64_t>(f.num_cached_tokens, 0)));
     Obs("vllm:request_time_per_output_token_seconds",
         f.mean_time_per_output_token);
     Obs("vllm:request_prompt_tokens", static_cast<double>(f.num_prompt_tokens));

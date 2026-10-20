@@ -101,17 +101,22 @@ class RunnerStub : public ModelRunnerBase {
     }
     // Build the ModelRunnerOutput from the stashed step: one canned token per
     // scheduled request (the test keeps prefills single-step, so every
-    // scheduled request completes and samples this step).
+    // scheduled request completes and samples this step), or none when the
+    // test models a step of partial prefills.
     ModelRunnerOutput mro;
     int idx = 0;
     for (const auto& [req_id, n] : stashed_output_.num_scheduled_tokens) {
       mro.req_ids.push_back(req_id);
       mro.req_id_to_index[req_id] = idx++;
-      mro.sampled_token_ids.push_back({kCannedToken});
+      mro.sampled_token_ids.push_back(
+          sample_none ? std::vector<int32_t>{} : std::vector<int32_t>{kCannedToken});
     }
     return mro;
   }
 
+  // Return an empty token list for every scheduled request, as the runner does
+  // for a request still in chunked prefill.
+  bool sample_none = false;
   int execute_calls = 0;
   int sample_calls = 0;
   int execute_order = 0;
@@ -356,10 +361,13 @@ TEST_CASE("EngineCore.abort_requests: finishes the request; next step is empty")
   CHECK(scheduler->has_finished_requests());
 
   // Flush step: nothing to schedule (total 0), so model_executed is false and no
-  // token outputs are produced (empty map). schedule() flushes finished_req_ids.
+  // token outputs are produced. With log_stats on (the default) the step still
+  // returns client 0's stats-only entry (scheduler.py:2121-2134 @ 0.28.0).
+  // schedule() flushes finished_req_ids.
   auto [flush_outputs, flush_executed] = engine.step();
   CHECK_FALSE(flush_executed);
-  CHECK(flush_outputs.empty());
+  REQUIRE(flush_outputs.size() == 1);
+  CHECK(flush_outputs.at(0).outputs.empty());
   CHECK_FALSE(scheduler->has_finished_requests());
 
   // Engine is now quiesced: the next step early-returns without touching the
@@ -412,4 +420,32 @@ TEST_CASE("EngineCore.step: a plain request threads nullopt grammar_output") {
 
   CHECK_FALSE(runner.last_grammar_present);
   CHECK(runner.last_grammar_req_ids.empty());
+}
+
+// ---------------------------------------------------------------------------
+// (f) A step that produced no request outputs still returns its scheduler
+// stats ("We must return the stats even if there are no request outputs this
+// step", scheduler.py:2121-2134 @ 0.28.0). The prefix-cache lookup of a request
+// admitted for a partial prefill is published by that step's make_stats();
+// returning nothing dropped it, and /metrics lost the lookups of every step
+// that was all partial prefills.
+// ---------------------------------------------------------------------------
+TEST_CASE("EngineCore.step: a step without request outputs still returns its stats") {
+  auto scheduler = CreateScheduler(/*max_num_seqs=*/16,
+                                   /*max_num_batched_tokens=*/16);
+  RunnerStub runner;
+  runner.sample_none = true;  // the 40-token prompt is mid-prefill after 16
+  Executor executor(runner);
+  EngineCore engine(*scheduler, executor);
+
+  engine.add_request(MakeRequest("0", /*num_tokens=*/40));
+  auto [outputs, model_executed] = engine.step();
+
+  CHECK(model_executed);
+  REQUIRE(outputs.size() == 1);
+  const EngineCoreOutputs& eco = outputs.at(0);
+  CHECK(eco.outputs.empty());
+  CHECK(eco.scheduler_stats.num_running_reqs == 1);
+  CHECK(eco.scheduler_stats.prefix_cache_stats.requests == 1);
+  CHECK(eco.scheduler_stats.prefix_cache_stats.queries == 40);
 }

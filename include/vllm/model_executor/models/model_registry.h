@@ -67,6 +67,11 @@ struct ModelInfo {
   bool is_pooling_model = false;
   bool is_hybrid = false;
   bool has_inner_state = false;
+  // KV-MAMBA-ALIGN: the hybrid's recurrent layers keep their state at block
+  // boundaries under prefix caching (mamba_cache_mode "align"). Without it a
+  // hybrid refuses prefix caching rather than resuming its recurrent layers
+  // from a state that does not belong to the request.
+  bool supports_mamba_align = false;
   bool supports_multimodal = false;
   // Mirror of the SupportsTranscription protocol
   // (vllm/model_executor/models/interfaces.py:1110-1118):

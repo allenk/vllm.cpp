@@ -2351,6 +2351,10 @@ target_include_directories(test_loaded_engine_dense PRIVATE ${CMAKE_SOURCE_DIR}/
 # checkpoint k/v-scale path, entered through the LoadedEngine loader.
 vllm_cpp_add_test(test_kv_cache_fp8_wiring vllm/entrypoints/test_kv_cache_fp8_wiring.cpp)
 vllm_cpp_add_test(test_dspark_block_size_guard vllm/entrypoints/test_dspark_block_size_guard.cpp)
+# KV-MAMBA-ALIGN: when prefix caching puts a hybrid in Mamba align mode, and the
+# attention block it needs, checked on the shipped Qwen3.5 KV specs.
+vllm_cpp_add_test(test_mamba_align_config vllm/entrypoints/test_mamba_align_config.cpp)
+target_include_directories(test_mamba_align_config PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace cache walk entered through
 # the production loader, with a repository identifier rather than a path. The
 # transformers_utils suite calls the function directly and cannot see a deleted
@@ -3354,6 +3358,10 @@ target_include_directories(test_fp8_per_tensor_dispatch PRIVATE ${CMAKE_SOURCE_D
 # is not a pass and must not be reported as one.
 vllm_cpp_add_test(test_ops_matmul_fp8_block_cuda vt/test_ops_matmul_fp8_block_cuda.cpp)
 target_include_directories(test_ops_matmul_fp8_block_cuda PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The decode arm of the same linear: QuantFp8Group fused into a W8A8 GEMV
+# (vt::MatmulFp8BlockScaledGemv), against a double reference built on the CPU
+# QuantFp8Group's bytes. CUDA cases skip without a device.
+vllm_cpp_add_test(test_ops_matmul_fp8_block_gemv vt/test_ops_matmul_fp8_block_gemv.cpp)
 # fp8 plan-cache arms, re-pinned by FIX-FP8-PLAN-CAPTURE-1843: the cache is
 # DEFAULT ON (on CUDA 13.3 the uncached lane queries the cuBLASLt heuristic
 # inside CUDA-graph capture and dies — #1843), so the cache-ON arm of the
@@ -3396,6 +3404,7 @@ target_include_directories(test_ops_moe_grouped PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_moe_router_tie_stability vt/test_moe_router_tie_stability.cpp)
 target_include_directories(test_moe_router_tie_stability PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
+vllm_cpp_add_test(test_ops_moe_grouped_fp8_block vt/test_ops_moe_grouped_fp8_block.cpp)
 vllm_cpp_add_test(test_rocm_moe_grouped_bf16 vt/test_rocm_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_rocm_moe_upstream vt/test_rocm_moe_upstream.cpp)
 vllm_cpp_add_test(test_moe_bf16_native_contract vt/test_moe_bf16_native_contract.cpp)
@@ -4168,6 +4177,9 @@ set_tests_properties(test_qwen4_exp_moe_sel_fp PROPERTIES
 # (qwen3_5_moe_block.h) plus the one probe symbol `vllm::MoeKqDeviceCalls()`, so
 # it needs no src/ grant.
 vllm_cpp_add_test(test_qwen35_moe_kq_device vllm/models/test_qwen35_moe_kq_device.cpp)
+# Block-wise FP8 routed + shared experts (Qwen/Qwen3.6-35B-A3B-FP8) against an
+# exact bf16 twin of the same block; CPU always, CUDA when a backend exists.
+vllm_cpp_add_test(test_qwen35_moe_fp8_block vllm/models/test_qwen35_moe_fp8_block.cpp)
 # The same binary on the REFERENCE arm, so the fallback the row promises is a
 # gated route and not a claim. The suite forces the variable per case, so this
 # registration proves the process-level default does not change the verdict.

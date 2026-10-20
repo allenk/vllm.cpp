@@ -300,6 +300,12 @@ const char* OpNameImpl(OpId op) {
       return "SandwichRmsNorm";
     case OpId::kCompiledGeluErfMul:
       return "CompiledGeluErfMul";
+    case OpId::kMoeGroupedGemmFp8Block:
+      return "MoeGroupedGemmFp8Block";
+    case OpId::kMoeGroupedGemmFp8BlockGateUpSilu:
+      return "MoeGroupedGemmFp8BlockGateUpSilu";
+    case OpId::kMatmulFp8BlockScaledGemv:
+      return "MatmulFp8BlockScaledGemv";
     case OpId::kSiluAndMul:
       return "SiluAndMul";
     case OpId::kRopeNeox:

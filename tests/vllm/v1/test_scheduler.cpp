@@ -55,6 +55,7 @@ using vllm::v1::get_request_block_hasher;
 using vllm::v1::init_none_hash;
 using vllm::v1::KVCacheConfig;
 using vllm::v1::ModelRunnerOutput;
+using vllm::v1::PrefillStats;
 using vllm::v1::Request;
 using vllm::v1::RequestStatus;
 using vllm::v1::Scheduler;
@@ -1998,4 +1999,214 @@ TEST_CASE("Scheduler.schedule: preemption RELEASES the victim's encoder cache sl
   CHECK(scheduler->encoder_cache_manager->CanAllocate(
       /*num_embeds=*/4, /*encoder_compute_budget=*/64,
       /*num_embeds_to_schedule=*/0));
+}
+
+// ---------------------------------------------------------------------------
+// make_stats() publishes every prefix-cache lookup since its last call, even
+// when more than one schedule() ran in between -- which is what EngineCore's
+// batch queue does under async scheduling: it returns before popping while the
+// queue has room, so the step that admitted a request is followed by another
+// schedule() before any make_stats(). The delta used to be overwritten there,
+// and /metrics read 0 prefix-cache queries with caching on.
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.make_stats: prefix-cache lookups survive a second schedule()") {
+  auto scheduler = CreateScheduler();
+  auto requests = CreateRequests(/*num_requests=*/1, /*num_tokens=*/40, {"0"});
+  Request* req = AddRequest(*scheduler, std::move(requests[0]));
+
+  scheduler->schedule();  // admits "0": one lookup of 40 tokens
+  req->AppendOutputToken(0);
+  scheduler->schedule();  // decodes "0": no lookup
+
+  const auto stats = scheduler->make_stats();
+  CHECK(stats.prefix_cache_stats.requests == 1);
+  CHECK(stats.prefix_cache_stats.queries == 40);
+
+  // Published once: the next snapshot starts from zero.
+  CHECK(scheduler->make_stats().prefix_cache_stats.queries == 0);
+}
+
+// ---------------------------------------------------------------------------
+// prefill_stats (scheduler.py:898-905, 1962-1969 @ 0.28.0): the lookup that
+// admits a request is recorded on it, and the request's first output hands the
+// split to the frontend; later outputs carry none. vllm:prompt_tokens_cached
+// and the computed share of vllm:iteration_tokens_total are counted from it.
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.update_from_output: the first output carries the prefill split") {
+  auto scheduler = CreateScheduler();
+  // The same 40-token prompt twice: "b" finds the two full blocks "a" filled.
+  auto first = CreateRequests(/*num_requests=*/1, /*num_tokens=*/40, {"a"});
+  Request* a = AddRequest(*scheduler, std::move(first[0]));
+
+  auto out0 = scheduler->schedule();
+  auto eco0 = scheduler->update_from_output(out0, MakeRunnerOutput({{"a", {7}}}));
+  REQUIRE(eco0.outputs.size() == 1);
+  REQUIRE(eco0.outputs[0].prefill_stats.has_value());
+  CHECK(eco0.outputs[0].prefill_stats->num_prompt_tokens == 40);
+  CHECK(eco0.outputs[0].prefill_stats->num_computed_tokens == 40);
+  CHECK(eco0.outputs[0].prefill_stats->num_cached_tokens == 0);
+  CHECK_FALSE(a->prefill_stats.has_value());  // handed over once
+
+  auto second = CreateRequests(/*num_requests=*/1, /*num_tokens=*/40, {"b"});
+  AddRequest(*scheduler, std::move(second[0]));
+  auto out1 = scheduler->schedule();  // "a" decodes, "b" is admitted
+  REQUIRE(out1.num_scheduled_tokens.at("b") == 8);
+  auto eco1 = scheduler->update_from_output(
+      out1, MakeRunnerOutput({{"a", {7}}, {"b", {7}}}));
+  REQUIRE(eco1.outputs.size() == 2);
+  for (const auto& output : eco1.outputs) {
+    if (output.request_id == "a") {
+      CHECK_FALSE(output.prefill_stats.has_value());
+      continue;
+    }
+    REQUIRE(output.prefill_stats.has_value());
+    const PrefillStats& split = *output.prefill_stats;
+    CHECK(split.num_prompt_tokens == 40);
+    CHECK(split.num_computed_tokens == 8);
+    CHECK(split.num_cached_tokens == 32);
+    CHECK(split.num_local_cached_tokens == 32);
+    CHECK(split.num_external_cached_tokens == 0);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// KV-MAMBA-ALIGN: a hybrid scheduler whose Mamba group is in "align" mode
+// clips prefill chunks to block boundaries (scheduler.py::_mamba_block_aligned_split
+// @ 0.28.0), so the state each block holds is the state after exactly
+// (p + 1) * block_size tokens. 1056 is the block Qwen3.6-35B-A3B gets.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr int kAlignBlock = 1056;
+
+std::unique_ptr<Scheduler> CreateAlignScheduler(int max_num_batched_tokens = 8192,
+                                                int long_prefill_token_threshold = 0) {
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = 16;
+  cfg.max_num_batched_tokens = max_num_batched_tokens;
+  cfg.long_prefill_token_threshold = long_prefill_token_threshold;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = 16384;
+  cfg.watermark = 0.0;
+
+  KVCacheConfig kv_cfg;
+  kv_cfg.num_blocks = 1000;
+  kv_cfg.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"fa"},
+      std::make_shared<FullAttentionSpec>(kAlignBlock, /*num_kv_heads=*/1,
+                                          /*head_size=*/1, DType::kF32));
+  kv_cfg.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"gdn"},
+      std::make_shared<vllm::v1::MambaSpec>(
+          kAlignBlock, std::vector<std::vector<int64_t>>{{1, 1}},
+          std::vector<DType>{DType::kF32}, std::nullopt, "align"));
+  return std::make_unique<Scheduler>(cfg, kv_cfg, kAlignBlock,
+                                     /*enable_caching=*/true);
+}
+
+// A request whose prompt is `prompt`, hashed at the align block size.
+std::unique_ptr<Request> AlignRequest(const std::string& id,
+                                      std::vector<int32_t> prompt) {
+  static bool none_hash_initialized = false;
+  if (!none_hash_initialized) {
+    init_none_hash(sha256_cbor);
+    none_hash_initialized = true;
+  }
+  SamplingParams params;
+  params.max_tokens = 16;
+  return std::make_unique<Request>(id, std::move(prompt), params,
+                                   /*arrival_time=*/0.0,
+                                   get_request_block_hasher(kAlignBlock, sha256_cbor));
+}
+
+std::vector<int32_t> Tokens(int n, int salt) {
+  std::vector<int32_t> t(static_cast<size_t>(n));
+  for (int i = 0; i < n; ++i) t[static_cast<size_t>(i)] = (i * 7 + salt) % 1000 + 1;
+  return t;
+}
+
+}  // namespace
+
+TEST_CASE("mamba_block_aligned_split: hand-worked cases at block 1056") {
+  auto scheduler = CreateAlignScheduler();
+  auto split = [&](int prompt_len, int computed, int n) {
+    auto req = AlignRequest("r", Tokens(prompt_len, 3));
+    req->num_computed_tokens = computed;
+    return scheduler->mamba_block_aligned_split(*req, n);
+  };
+  // A 1,139-token prompt stops at its last cacheable boundary, then finishes.
+  CHECK(split(1139, 0, 1139) == 1056);
+  CHECK(split(1139, 1056, 83) == 83);
+  // 5,000 tokens on a 4,096 budget: 3,168 (aligned down), 1,056 (stop at 4,224),
+  // then the 776-token tail.
+  CHECK(split(5000, 0, 4096) == 3168);
+  CHECK(split(5000, 3168, 1832) == 1056);
+  CHECK(split(5000, 4224, 776) == 776);
+  // A leftover budget below a block cannot advance an aligned prefill when a
+  // whole block fits the chunk limit: the request waits for a later step.
+  CHECK(split(3000, 0, 300) == 0);
+  // A chunk resuming mid-block stops at the next boundary.
+  CHECK(split(3000, 1601, 1399) == 511);
+  // Decode is untouched.
+  auto decoding = AlignRequest("d", Tokens(1139, 3));
+  decoding->AppendOutputToken(5);
+  decoding->num_computed_tokens = 1139;
+  CHECK(scheduler->mamba_block_aligned_split(*decoding, 1) == 1);
+}
+
+TEST_CASE("mamba_block_aligned_split: a block wider than the chunk limit re-aligns") {
+  // max_num_batched_tokens 512 < 1056: chunks advance sub-block and stop at the
+  // next boundary, so the state at 1,056 is still written by a chunk end.
+  auto scheduler = CreateAlignScheduler(/*max_num_batched_tokens=*/512);
+  auto req = AlignRequest("r", Tokens(3000, 5));
+  std::vector<int> ends;
+  int pos = 0;
+  while (pos < 1600) {
+    req->num_computed_tokens = pos;
+    const int n = scheduler->mamba_block_aligned_split(*req, std::min(512, 3000 - pos));
+    REQUIRE(n > 0);
+    pos += n;
+    ends.push_back(pos);
+  }
+  CHECK(ends == std::vector<int>{512, 1024, 1056, 1568, 2080});
+}
+
+TEST_CASE("Scheduler.schedule: align mode splits a prompt at its last cacheable block") {
+  auto scheduler = CreateAlignScheduler();
+  Request* req = AddRequest(*scheduler, AlignRequest("0", Tokens(1139, 1)));
+
+  auto out0 = scheduler->schedule();
+  CHECK(out0.num_scheduled_tokens.at("0") == 1056);
+  CHECK(req->num_computed_tokens == 1056);
+
+  auto out1 = scheduler->schedule();
+  CHECK(out1.num_scheduled_tokens.at("0") == 83);
+  CHECK(req->num_computed_tokens == 1139);
+
+  req->AppendOutputToken(0);
+  auto out2 = scheduler->schedule();
+  CHECK(out2.num_scheduled_tokens.at("0") == 1);
+}
+
+TEST_CASE("Scheduler.schedule: align mode hits the cached block of a shared prefix") {
+  auto scheduler = CreateAlignScheduler();
+  // Two prompts that share their first 1,100 tokens and differ after.
+  std::vector<int32_t> a = Tokens(1100, 2);
+  std::vector<int32_t> b = a;
+  for (int32_t t : Tokens(39, 501)) a.push_back(t);
+  for (int32_t t : Tokens(50, 777)) b.push_back(t);
+
+  Request* first = AddRequest(*scheduler, AlignRequest("a", a));
+  scheduler->schedule();  // [0, 1056): the boundary state of block 0
+  scheduler->schedule();  // [1056, 1139)
+  REQUIRE(first->num_computed_tokens == 1139);
+
+  AddRequest(*scheduler, AlignRequest("b", b));
+  first->AppendOutputToken(0);
+  auto out = scheduler->schedule();
+  // "b" resumes at the 1,056-token boundary: only its last 94 tokens are run.
+  REQUIRE(out.scheduled_new_reqs.size() == 1);
+  CHECK(out.scheduled_new_reqs[0].req_id == "b");
+  CHECK(out.scheduled_new_reqs[0].num_computed_tokens == 1056);
+  CHECK(out.num_scheduled_tokens.at("b") == 94);
 }

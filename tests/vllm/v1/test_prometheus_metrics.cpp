@@ -20,6 +20,7 @@
 
 using vllm::v1::FinishedRequestStats;
 using vllm::v1::IterationStats;
+using vllm::v1::PrefillStats;
 using vllm::v1::SchedulerStats;
 using vllm::v1::metrics::Build1_2_5Buckets;
 using vllm::v1::metrics::PrometheusStatLogger;
@@ -138,6 +139,19 @@ TEST_CASE(
   CHECK(Contains(text,
                  "# TYPE vllm:time_to_first_token_seconds histogram"));
 
+  // The two always-on families vLLM 0.28.0 feeds from PrefillStats
+  // (loggers.py:680-693, 962-973), primed for each prompt-token source.
+  CHECK(Contains(text, "# TYPE vllm:prompt_tokens_by_source counter"));
+  for (const char* source :
+       {"local_compute", "local_cache_hit", "external_kv_transfer"}) {
+    CHECK(Contains(text,
+                   std::string("vllm:prompt_tokens_by_source_total{model_name="
+                               "\"test-model\",engine=\"0\",source=\"") +
+                       source + "\"} 0.0"));
+  }
+  CHECK(Contains(text,
+                 "# TYPE vllm:request_prefill_kv_computed_tokens histogram"));
+
   // Histogram bucket schedule parity (timing + 1-2-5 count buckets). Whole
   // bucket bounds render as "N.0" exactly like prometheus_client floatToGoString.
   CHECK(Contains(text, "le=\"0.001\""));    // TTFT first bucket
@@ -167,11 +181,14 @@ TEST_CASE(
   s.prefix_cache_stats.queries = 90;
   s.prefix_cache_stats.hits = 40;
 
+  // A 10-token prompt whose first 4 tokens came from the prefix cache.
   IterationStats it;
-  it.num_prompt_tokens = 10;
+  PrefillStats prefill;
+  prefill.set(/*prompt_tokens=*/10, /*local_cached_tokens=*/4,
+              /*external_cached_tokens=*/0);
+  it.prompt_token_stats.update_from_output(prefill);
   it.num_generation_tokens = 5;
   it.num_preempted_reqs = 1;
-  it.iteration_tokens = 15;
   it.time_to_first_tokens_iter = {0.02};
   it.inter_token_latencies_iter = {0.03, 0.03};
   FinishedRequestStats f;
@@ -185,9 +202,10 @@ TEST_CASE(
   f.inference_time = 0.9;
   f.decode_time = 0.7;
   f.mean_time_per_output_token = 0.14;
+  f.num_cached_tokens = 4;
   it.finished_requests.push_back(f);
 
-  logger.Record(s, it);
+  logger.Record(s, &it);
   const std::string text = logger.Expose();
 
   // Gauges reflect the latest scheduler state.
@@ -234,6 +252,58 @@ TEST_CASE(
   CHECK(SampleValue(text,
                     "vllm:e2e_request_latency_seconds_sum{model_name=\"m\","
                     "engine=\"0\"}") == " 1.25");
+
+  // The prompt split (loggers.py:1194-1208 @ 0.28.0): all 10 prompt tokens are
+  // counted, 4 of them as cached, and the iteration-token histogram observes
+  // the 6 computed ones plus the 5 generated.
+  CHECK(Contains(
+      text,
+      "vllm:prompt_tokens_cached_total{model_name=\"m\",engine=\"0\"} 4.0"));
+  CHECK(Contains(text,
+                 "vllm:prompt_tokens_by_source_total{model_name=\"m\",engine="
+                 "\"0\",source=\"local_compute\"} 6.0"));
+  CHECK(Contains(text,
+                 "vllm:prompt_tokens_by_source_total{model_name=\"m\",engine="
+                 "\"0\",source=\"local_cache_hit\"} 4.0"));
+  CHECK(Contains(text,
+                 "vllm:prompt_tokens_by_source_total{model_name=\"m\",engine="
+                 "\"0\",source=\"external_kv_transfer\"} 0.0"));
+  CHECK(SampleValue(text,
+                    "vllm:iteration_tokens_total_sum{model_name=\"m\","
+                    "engine=\"0\"}") == " 11.0");
+  // The finished request computed 10 - 4 prompt tokens (loggers.py:1240-1246).
+  CHECK(SampleValue(text,
+                    "vllm:request_prefill_kv_computed_tokens_sum{model_name="
+                    "\"m\",engine=\"0\"}") == " 6.0");
+}
+
+TEST_CASE(
+    "SERVE-METRICS: record() without IterationStats folds the scheduler state "
+    "only") {
+  // A step with no request outputs (loggers.py:1185-1186 @ 0.28.0): its
+  // prefix-cache lookups and gauges count, and no iteration family moves.
+  PrometheusStatLogger logger("m", /*max_model_len=*/1024);
+  SchedulerStats s;
+  s.num_running_reqs = 1;
+  s.prefix_cache_stats.requests = 1;
+  s.prefix_cache_stats.queries = 40;
+  s.prefix_cache_stats.hits = 32;
+
+  logger.Record(s, nullptr);
+  const std::string text = logger.Expose();
+
+  CHECK(Contains(
+      text, "vllm:num_requests_running{model_name=\"m\",engine=\"0\"} 1.0"));
+  CHECK(Contains(
+      text,
+      "vllm:prefix_cache_queries_total{model_name=\"m\",engine=\"0\"} 40.0"));
+  CHECK(Contains(
+      text, "vllm:prefix_cache_hits_total{model_name=\"m\",engine=\"0\"} 32.0"));
+  CHECK(Contains(
+      text, "vllm:prompt_tokens_total{model_name=\"m\",engine=\"0\"} 0.0"));
+  CHECK(SampleValue(text,
+                    "vllm:iteration_tokens_total_count{model_name=\"m\","
+                    "engine=\"0\"}") == " 0.0");
 }
 
 TEST_CASE("SERVE-METRICS: registry histogram cumulative buckets are monotone") {

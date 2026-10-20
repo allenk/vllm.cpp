@@ -53,6 +53,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <string>
@@ -238,15 +239,20 @@ inline Tensor ResidentFp8BlockPacked(DevT d, const Fp8BlockWeight& w) {
   // (`ResidentFp8BlockMerged`); the split arm did not, and the loader's own
   // check (`dense_weight_loaders.h::LoadFp8BlockRaw`) does not cover a weight
   // that reached this seam by another route.
-  VT_CHECK(w.packed.bytes.size() ==
-               static_cast<size_t>(w.n) * static_cast<size_t>(w.k),
-           "block-wise FP8: the packed weight carries " +
-               std::to_string(w.packed.bytes.size()) + " bytes where its [" +
-               std::to_string(w.n) + ", " + std::to_string(w.k) +
-               "] shape needs exactly one fp8-e4m3fn byte per element, " +
-               std::to_string(static_cast<size_t>(w.n) *
-                              static_cast<size_t>(w.k)));
+  //
+  // Asserted when the bytes are STAGED, before the first view exists. After
+  // that the device copy is the weight and the host mirror may have been
+  // released (the grouped block-FP8 MoE block frees the routed experts'), so
+  // the host byte count says nothing any more.
   if (!w.d_packed) {
+    VT_CHECK(w.packed.bytes.size() ==
+                 static_cast<size_t>(w.n) * static_cast<size_t>(w.k),
+             "block-wise FP8: the packed weight carries " +
+                 std::to_string(w.packed.bytes.size()) + " bytes where its [" +
+                 std::to_string(w.n) + ", " + std::to_string(w.k) +
+                 "] shape needs exactly one fp8-e4m3fn byte per element, " +
+                 std::to_string(static_cast<size_t>(w.n) *
+                                static_cast<size_t>(w.k)));
     const size_t pb = w.packed.bytes.size();
     void* p = d.b.Alloc(pb);
     d.b.Copy(d.q, p, w.packed.bytes.data(), pb);
@@ -303,6 +309,33 @@ inline Tensor ResidentFp8BlockScale(DevT d, const Fp8BlockWeight& w) {
                                 {w.scale.shape[0], w.scale.shape[1]});
 }
 
+// The decode arm of every block-wise FP8 linear in this file: for one row, one
+// launch that quantizes it in QuantFp8Group's exact math and runs a W8A8 GEMV
+// (vt::MatmulFp8BlockScaledGemv), in place of the quant, the activation-scale
+// transpose and the CUTLASS tile; Qwen3.6-35B-A3B-FP8's decode profile puts
+// 1.0 + 0.7 us of that glue around each GEMM. The same math, the f32 sums in
+// another order than the tile's. A GEMV output column reads only its own weight
+// row and scale row, so a merged group's columns equal its shards' bit for bit,
+// as the tile's do.
+//
+// ONE row, although the op takes up to eight: on the whole 35B FP8 model with
+// every decode GEMM of up to eight rows on the GEMV, c=1 decode ran 208 tok/s
+// against 197 on the tile and c=4 478 against 533 (two interleaved rounds each).
+// At four rows the GEMV converts and multiplies every weight chunk four times and
+// stops being bound by the weight bytes. VT_FP8_BLOCK_GEMV=0 keeps every row
+// count on the tile for a same-binary A/B.
+template <class DevT>
+inline bool Fp8BlockGemvTakes(DevT d, const Tensor& x, int64_t block_k) {
+  constexpr int64_t kMaxRows = 1;
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FP8_BLOCK_GEMV");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on && x.rank == 2 && x.shape[0] <= kMaxRows && x.IsContiguous() &&
+         vt::MatmulFp8BlockScaledGemvApplies(x.shape[0], x.shape[1], block_k) &&
+         vt::OpRegistered(vt::OpId::kMatmulFp8BlockScaledGemv, d.q.device.type);
+}
+
 // y[M,N] = x[M,K] @ dequant(w).T through the block-wise W8A8 fp8 path:
 // upstream's apply, in upstream's order.
 //
@@ -353,6 +386,15 @@ inline DBufT MatmulFp8BlockScaledD(DevT d, const Tensor& x,
                "'. The CPU reference arm is what exists today; the "
                "mainloop-scaled CUTLASS kernel is milestone M5 of "
                "https://github.com/mudler/vllm.cpp/issues/1189");
+
+  if (Fp8BlockGemvTakes(d, x, w.block_k)) {
+    const Tensor w_fp8 = ResidentFp8BlockPacked(d, w);
+    const Tensor w_scale = ResidentFp8BlockScale(d, w);
+    DBufT dout(d, out_dtype, {M, N});
+    vt::MatmulFp8BlockScaledGemv(d.q, dout.t(), x, w_fp8, w_scale, w.block_n, w.block_k);
+    BlockGemmCounter().fetch_add(1, std::memory_order_relaxed);
+    return dout;
+  }
 
   DBufT a_fp8(d, DType::kI8, {M, K});
   DBufT a_scale(d, DType::kF32, {M, K / w.block_k});
@@ -595,6 +637,12 @@ inline DBufT MatmulFp8BlockMergedD(DevT d, const Tensor& x,
                                    const vt::MergedGemmGroup& desc) {
   const int64_t M = x.shape[0], K = x.shape[1];
   CheckFp8BlockMergedActivation(d, desc.name, x, v);
+  if (Fp8BlockGemvTakes(d, x, v.block_k)) {
+    DBufT out(d, out_dtype, {M, v.n_total});
+    vt::MatmulFp8BlockScaledGemv(d.q, out.t(), x, v.packed, v.scale, v.block_n, v.block_k);
+    BlockGemmCounter().fetch_add(1, std::memory_order_relaxed);
+    return out;
+  }
   DBufT a_fp8(d, DType::kI8, {M, K});
   DBufT a_scale(d, DType::kF32, {M, K / v.block_k});
   vt::QuantFp8Group(d.q, a_fp8.t(), a_scale.t(), x,
@@ -620,6 +668,17 @@ inline DBufT Fp8BlockGateUpSwiGLUD(DevT d, const Tensor& x,
   VT_CHECK(v.n_total % 2 == 0,
            "block-wise FP8 merged 'gate_up_proj': the merged N must be even");
   CheckFp8BlockMergedActivation(d, "gate_up_proj", x, v);
+  if (Fp8BlockGemvTakes(d, x, v.block_k)) {
+    // MergedGemmFp8Block's tail on the GEMV's merged output: vt::SiluAndMul over
+    // the contiguous [M, 2I] buffer.
+    DBufT gate_up(d, out_dtype, {M, v.n_total});
+    vt::MatmulFp8BlockScaledGemv(d.q, gate_up.t(), x, v.packed, v.scale, v.block_n,
+                                 v.block_k);
+    DBufT act(d, out_dtype, {M, v.n_total / 2});
+    vt::SiluAndMul(d.q, act.t(), gate_up.t());
+    BlockGemmCounter().fetch_add(1, std::memory_order_relaxed);
+    return act;
+  }
   DBufT a_fp8(d, DType::kI8, {M, K});
   DBufT a_scale(d, DType::kF32, {M, K / v.block_k});
   vt::QuantFp8Group(d.q, a_fp8.t(), a_scale.t(), x,

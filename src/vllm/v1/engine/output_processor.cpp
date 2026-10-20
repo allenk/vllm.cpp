@@ -409,7 +409,7 @@ OutputProcessorOutput OutputProcessor::process_outputs(
     const std::vector<int32_t>& new_token_ids = eco.new_token_ids;
     std::optional<FinishReason> finish_reason = eco.finish_reason;
     std::optional<std::string> stop_reason = eco.stop_reason;
-    // routed_experts / prefill_stats deferred.
+    // routed_experts deferred.
 
     // 1) Compute stats for this iteration (IterationStats.update_from_output,
     // stats.py:377-449). Whether this output is a prefill step is read BEFORE
@@ -418,7 +418,6 @@ OutputProcessorOutput OutputProcessor::process_outputs(
     if (iteration_stats != nullptr) {
       const int64_t num_new = static_cast<int64_t>(new_token_ids.size());
       iteration_stats->num_generation_tokens += num_new;
-      iteration_stats->iteration_tokens += num_new;
 
       // update_from_events (stats.py:428-450): fold this output's engine-core
       // events into the request's timing endpoints. QUEUED / SCHEDULED mark the
@@ -445,12 +444,12 @@ OutputProcessorOutput OutputProcessor::process_outputs(
       }
 
       if (is_prefilling_output) {
-        // prompt_token_stats.update_from_output (stats.py:328-335). No
-        // prefill_stats at T0 → num_prompt_tokens_cached stays 0; the whole
-        // prompt is the prefill token count.
-        const int64_t num_prompt = static_cast<int64_t>(req_state.prompt_len);
-        iteration_stats->num_prompt_tokens += num_prompt;
-        iteration_stats->iteration_tokens += num_prompt;
+        // stats.py:389-391 @ 0.28.0: the first output's PrefillStats splits
+        // the prompt into computed and cached tokens.
+        if (eco.prefill_stats.has_value()) {
+          iteration_stats->prompt_token_stats.update_from_output(
+              *eco.prefill_stats);
+        }
         // TTFT = engine_core_timestamp - arrival_time (stats.py:441-443).
         iteration_stats->time_to_first_tokens_iter.push_back(
             engine_core_timestamp - req_state.arrival_time);
@@ -465,7 +464,10 @@ OutputProcessorOutput OutputProcessor::process_outputs(
     }
 
     if (req_state.is_prefilling) {
-      // num_cached_tokens from prefill_stats deferred.
+      // output_processor.py:651-659 @ 0.28.0.
+      if (eco.prefill_stats.has_value()) {
+        req_state.num_cached_tokens = eco.prefill_stats->num_cached_tokens;
+      }
       req_state.is_prefilling = false;
     }
 
@@ -539,7 +541,7 @@ OutputProcessorOutput OutputProcessor::process_outputs(
         f.queued_time = req_state.scheduled_ts - req_state.queued_ts;
         f.prefill_time = req_state.first_token_ts - req_state.scheduled_ts;
         f.inference_time = req_state.last_token_ts - req_state.scheduled_ts;
-        // num_cached_tokens deferred → 0.
+        f.num_cached_tokens = req_state.num_cached_tokens;
         iteration_stats->finished_requests.push_back(f);
       }
 

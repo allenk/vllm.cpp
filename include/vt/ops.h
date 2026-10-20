@@ -920,6 +920,19 @@ enum class OpId : uint8_t {
   kScaledRmsNorm,
   kSandwichRmsNorm,
   kCompiledGeluErfMul,
+  // Grouped MoE GEMM over block-wise FP8 experts (Qwen/Qwen3.6-35B-A3B-FP8):
+  // fp8-e4m3fn [N, K] bytes and an f32 [cdiv(N,bn), cdiv(K,bk)] scale grid per
+  // expert, bf16 activations. Appended before kCount so no existing op's id
+  // shifts.
+  kMoeGroupedGemmFp8Block,
+  // kMoeGroupedGemmFp8Block for a gate and an up table in one launch, with the
+  // SwiGLU between them fused (decode). Appended before kCount so no existing
+  // op's id shifts.
+  kMoeGroupedGemmFp8BlockGateUpSilu,
+  // The block-wise W8A8 FP8 linear at decode sizes, with its activation quant
+  // fused (MatmulFp8BlockScaledGemv). Appended before kCount so no existing op's
+  // id shifts.
+  kMatmulFp8BlockScaledGemv,
   kCount
 };
 
@@ -2338,6 +2351,18 @@ using MoeGroupedGemmNvfp4Fn =
              const Tensor&, const Tensor&);
 using MoeGroupedGemmBf16Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&);
+using MoeGroupedGemmFp8BlockFn =
+    void (*)(Queue&, Tensor& /*out*/, const Tensor& /*act*/, const Tensor& /*expert_ids*/,
+             const Tensor* /*row_map*/, const Tensor& /*weight_ptrs*/,
+             const Tensor& /*scale_ptrs*/, int64_t /*block_n*/, int64_t /*block_k*/);
+using MoeGroupedGemmFp8BlockGateUpSiluFn =
+    void (*)(Queue&, Tensor& /*out*/, const Tensor& /*act*/, const Tensor& /*expert_ids*/,
+             const Tensor* /*row_map*/, const Tensor& /*gate_ptrs*/,
+             const Tensor& /*gate_scale_ptrs*/, const Tensor& /*up_ptrs*/,
+             const Tensor& /*up_scale_ptrs*/, int64_t /*block_n*/, int64_t /*block_k*/);
+using MatmulFp8BlockScaledGemvFn =
+    void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*w_fp8*/,
+             const Tensor& /*w_scale*/, int64_t /*block_n*/, int64_t /*block_k*/);
 // kMoeGroupedGemmBf16GateUpSilu: out[P,N] bf16 = silu(gate)*up, gate/up = grouped
 // bf16 GEMM of act[T|P,K] against per-expert weight-pointer arrays gate_ptrs/
 // up_ptrs [E] i64, expert_ids[P] i32, optional row_map[P] i32. Same convention as
@@ -3448,6 +3473,67 @@ void MoeCombinePreweighted(Queue& q, Tensor& out, const Tensor& expert_out,
 
 // Select the complete native sequence through provider availability.
 bool MoeGroupedBf16NativeAvailable(DeviceType device);
+
+// vt::MoeGroupedGemmFp8Block — grouped MoE GEMM over BLOCK-WISE FP8 experts, the
+// layout Qwen's own FP8 releases ship (`Qwen/Qwen3.6-35B-A3B-FP8`):
+//   out[p, n] = sum_k act[row(p), k] * w_e[n, k] * s_e[n / block_n, k / block_k]
+// with e = expert_ids[p] and row(p) = row_map ? row_map[p] : p. The weight bytes
+// stay the checkpoint's fp8-e4m3fn [N, K] (out x in, K contiguous); the
+// activation stays bf16, so this is W8A16: every e4m3 value is exact in bf16 and
+// f32, products accumulate in f32 per K-block, and the block scale multiplies
+// that partial sum. Upstream's sm_120 path (the Triton fused_moe kernel,
+// fp8_w8a8) also quantizes the activation to fp8 per 128-group; this op does not.
+// Registered on kCUDA; the CPU path keeps the per-expert reference loop.
+//   out          [P, N] f32 or bf16
+//   act          [*, K] bf16
+//   expert_ids   [P] i32 (device) — per-pair expert id
+//   row_map      [P] i32 (device) or nullptr — pair p -> source act row
+//   weight_ptrs  [E] i64 (device) — (uintptr_t) of expert e's fp8 [N, K] bytes
+//   scale_ptrs   [E] i64 (device) — (uintptr_t) of expert e's f32
+//                [cdiv(N, block_n), cdiv(K, block_k)] scale grid
+// K = act.shape[1], N = out.shape[1], P = out.shape[0].
+void MoeGroupedGemmFp8Block(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
+                            const Tensor* row_map, const Tensor& weight_ptrs,
+                            const Tensor& scale_ptrs, int64_t block_n, int64_t block_k);
+
+// vt::MoeGroupedGemmFp8BlockGateUpSilu — MoeGroupedGemmFp8Block against a gate
+// and an up table of one block geometry, with the SwiGLU between them:
+//   out[p, n] = silu(bf16(gate[p, n])) * bf16(up[p, n])      (bf16 out)
+// where gate and up are MoeGroupedGemmFp8Block's sums over gate_ptrs /
+// gate_scale_ptrs and up_ptrs / up_scale_ptrs. Bit-identical to those two
+// grouped GEMMs into bf16 followed by MoeSiluMul; one launch reads both weights
+// against one activation load. Built for decode-sized P: any P is correct, but
+// every pair re-reads its expert's bytes, so large P belongs to
+// MoeGroupedGemmFp8Block's grouped tile. Registered on kCUDA.
+//   out          [P, N] bf16
+//   act          [*, K] bf16
+//   expert_ids   [P] i32 (device); row_map [P] i32 (device) or nullptr
+//   gate_ptrs, gate_scale_ptrs, up_ptrs, up_scale_ptrs   [E] i64 (device)
+void MoeGroupedGemmFp8BlockGateUpSilu(Queue& q, Tensor& out, const Tensor& act,
+                                      const Tensor& expert_ids, const Tensor* row_map,
+                                      const Tensor& gate_ptrs, const Tensor& gate_scale_ptrs,
+                                      const Tensor& up_ptrs, const Tensor& up_scale_ptrs,
+                                      int64_t block_n, int64_t block_k);
+
+// vt::MatmulFp8BlockScaledGemv — the block-wise W8A8 FP8 linear for a few rows
+// (decode), in one launch:
+//   (q, a_scale) = QuantFp8Group(x, block_k)      recomputed inside, same bytes
+//   out[m, n]    = sum_kb a_scale[m, kb] * w_scale[n / block_n, kb]
+//                         * sum_{k in kb} q[m, k] * w_fp8[n, k]
+// rounded through bf16 as MatmulFp8BlockScaled's store rounds it (an f32 out
+// holds the bf16 value). The same math as QuantFp8Group followed by
+// MatmulFp8BlockScaled, without the scale transpose and the tile: one warp per
+// output column reads its weight row once for every row of x. The f32 sums run in
+// another order than the tensor-core tile's, so the two agree to rounding, not
+// bit for bit. Any N. Use MatmulFp8BlockScaledGemvApplies for the shapes it takes.
+// Registered on kCUDA.
+//   out      [M, N] f32/bf16      x        [M, K] f32/bf16
+//   w_fp8    [N, K] i8 (e4m3fn)   w_scale  [cdiv(N, block_n), K / block_k] f32
+void MatmulFp8BlockScaledGemv(Queue& q, Tensor& out, const Tensor& x, const Tensor& w_fp8,
+                              const Tensor& w_scale, int64_t block_n, int64_t block_k);
+// M <= 8, block_k == 128 (every block-FP8 release so far), K % 128 == 0, and the
+// rows' quantized bytes and scales fit the launch's 48 KiB of shared memory.
+bool MatmulFp8BlockScaledGemvApplies(int64_t m, int64_t k, int64_t block_k);
 
 // MoeGroupedGemmNvfp4Marlin (lift of vLLM moe_wna16_marlin_gemm, ops.cu:543 —
 // the Marlin W4A16 kernel vLLM selects for the 35B's NVFP4 MoE experts). One
@@ -5737,10 +5823,12 @@ void ComputeLogprobs(Queue& q, Tensor& logprobs, const Tensor& logits);
 // random_sample (topk_topp_sampler.py::random_sample +
 // sample_with_exponential_noise): exponential-noise gumbel-max. For each element
 // draw q ~ Exponential(1); pick `argmax_j(probs[i,j] / q[i,j])`. Per-request
-// seeded RNG: `seeds[i]` is the resolved per-row seed (the Sampler picks the
-// per-request override from `SamplingMetadata.generators` or the batch default —
-// M1.7 Task 4). token_ids [num_reqs] i64; probs [num_reqs, vocab] f32;
-// seeds [num_reqs] i64.
+// seeded RNG: `seeds[i]` is the resolved per-row seed. The Sampler passes
+// StreamSeed(PositionKey(request seed, position), i) (vt/sample_common.h), so a
+// request's draws depend on its seed and the position being sampled and not on
+// its batch row; a hand-built SamplingMetadata without rng_seeds falls back to
+// `SamplingMetadata.generators` or the batch default (M1.7 Task 4).
+// token_ids [num_reqs] i64; probs [num_reqs, vocab] f32; seeds [num_reqs] i64.
 //
 // RNG DEVIATION (recorded, T1 carry): the Exponential(1) draws come from a
 // deterministic splitmix64 hash of (seed, row, vocab_index) mapped through the
