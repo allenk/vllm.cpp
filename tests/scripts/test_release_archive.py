@@ -265,10 +265,10 @@ class ReleaseArchiveContract(unittest.TestCase):
             server.parent.mkdir(parents=True)
             server.write_bytes(b"ELF fixture")
             (root / "VERSION").write_text(
-                "version=0.0.4-vk.1\nc_abi_version=17\n", encoding="utf-8"
+                "version=0.0.4-vk.2\nc_abi_version=17\n", encoding="utf-8"
             )
             manifest = self.manifest(Path("/bin/true"))
-            manifest["artifact"]["version"] = "0.0.4-vk.1"
+            manifest["artifact"]["version"] = "0.0.4-vk.2"
 
             def fake_run(command):
                 if command[0] == "file":

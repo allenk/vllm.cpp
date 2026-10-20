@@ -140,9 +140,9 @@ class PostPublishAuditContract(unittest.TestCase):
             handoff = {
                 "artifacts": self.matrix["artifacts"], "files": files,
                 "prerelease": True, "project_version": "0.0.4",
-                "release_tag": "v0.0.4-vk.1",
+                "release_tag": "v0.0.4-vk.2",
                 "retention": self.matrix["retention"], "source_sha": SHA,
-                "verified": True, "version": "0.0.4-vk.1",
+                "verified": True, "version": "0.0.4-vk.2",
             }
             index_path = root / "release-index.json"
             markdown_path = root / "RELEASE_INDEX.md"
@@ -171,7 +171,7 @@ class PostPublishAuditContract(unittest.TestCase):
             "release": {
                 "draft": False,
                 "prerelease": True,
-                "tag_name": "v0.0.4-vk.1",
+                "tag_name": "v0.0.4-vk.2",
                 "assets": assets,
             },
             "run": {
@@ -306,7 +306,7 @@ class PostPublishAuditContract(unittest.TestCase):
         canonical = remote_bytes["RELEASE_INDEX.md"].decode()
         rows = [line for line in canonical.splitlines() if line.startswith("| [")]
         malformed = (
-            f"v0.0.4-vk.1 {SHA}\n" + "\n".join(
+            f"v0.0.4-vk.2 {SHA}\n" + "\n".join(
                 self.audit.canonical_archive_name(
                     self.version["version"], item["id"], item["archive_format"]
                 )
@@ -347,18 +347,18 @@ class PostPublishAuditContract(unittest.TestCase):
 
         def json_side_effect(args):
             endpoint = args[-1]
-            if endpoint == f"repos/{REPO}/releases/tags/v0.0.4-vk.1":
+            if endpoint == f"repos/{REPO}/releases/tags/v0.0.4-vk.2":
                 return release
             if endpoint == f"repos/{REPO}/actions/runs/{RUN_ID}":
                 return snapshot["run"]
             if endpoint.endswith("/jobs?per_page=100"):
                 return [{"jobs": snapshot["jobs"]}]
-            if endpoint == f"repos/{REPO}/git/ref/tags/v0.0.4-vk.1":
+            if endpoint == f"repos/{REPO}/git/ref/tags/v0.0.4-vk.2":
                 return {"object": {"sha": SHA, "type": "commit"}}
             if args[:2] == ["attestation", "verify"]:
                 self.assertIn(f"{REPO}/.github/workflows/release.yml", args)
                 self.assertIn(SHA, args)
-                self.assertIn("refs/tags/v0.0.4-vk.1", args)
+                self.assertIn("refs/tags/v0.0.4-vk.2", args)
                 return [{"verificationResult": {"statement": {"subject": []}, "certificate": {
                     "sourceRepositoryURI": f"https://github.com/{REPO}",
                     "sourceRepositoryDigest": SHA,
@@ -374,7 +374,7 @@ class PostPublishAuditContract(unittest.TestCase):
             self.audit, "gh_bytes", side_effect=bytes_side_effect
         ):
             observed, downloads, attestations = self.audit.collect_remote(
-                REPO, "v0.0.4-vk.1", SHA, RUN_ID
+                REPO, "v0.0.4-vk.2", SHA, RUN_ID
             )
         self.assertEqual(downloads, remote_bytes)
         result = self.audit.validate_remote_release(
@@ -398,15 +398,15 @@ class PostPublishAuditContract(unittest.TestCase):
             self.audit, "gh_json", return_value={"object": dict(COMMIT_OBJECT)}
         ):
             self.assertEqual(
-                self.audit.resolve_tag(REPO, "v0.0.4-vk.1"), COMMIT_OBJECT
+                self.audit.resolve_tag(REPO, "v0.0.4-vk.2"), COMMIT_OBJECT
             )
         responses = iter((
             {"object": {"sha": "a" * 40, "type": "tag"}},
-            {"tag": "v0.0.4-vk.1", "object": dict(COMMIT_OBJECT)},
+            {"tag": "v0.0.4-vk.2", "object": dict(COMMIT_OBJECT)},
         ))
         with mock.patch.object(self.audit, "gh_json", side_effect=lambda args: next(responses)):
             self.assertEqual(
-                self.audit.resolve_tag(REPO, "v0.0.4-vk.1"), COMMIT_OBJECT
+                self.audit.resolve_tag(REPO, "v0.0.4-vk.2"), COMMIT_OBJECT
             )
 
 
