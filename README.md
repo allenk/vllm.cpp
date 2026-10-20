@@ -52,6 +52,95 @@ excluded because CCCL's tcgen05 PTX headers expand to an empty asm operand under
 and `/Zc:preprocessor` does not fix it (measured, not assumed). Upstream's own tree already
 carries the Windows CPU and Vulkan lanes.
 
+**Qwen3.6-35B-A3B-FP8 in `0.0.4-vk.2`.** Qwen's own FP8 release of Qwen3.6-35B-A3B
+(`Qwen/Qwen3.6-35B-A3B-FP8`, 128x128 block-FP8 weights) loads and serves on CUDA. `0.0.4-vk.1`
+refused it at load, as upstream does: the MoE loader read only per-tensor FP8 scales, and this
+checkpoint carries `.weight_scale_inv` block grids instead. The routed experts run through a grouped
+W8A16 kernel (FP8 weights, bf16 activations) that is captured in the decode CUDA graph. It is
+compiled for every SM target of the CUDA archives; only sm_120a has run it. The experts' host
+copies are released once they are on the device, and the server's private working set after
+loading is 3.2 GiB.
+
+Against vLLM 0.28.0 on one RTX PRO 6000 Blackwell (350 W power cap), in one session, one server at a
+time: this release's Windows zip and Linux tarball as CI built them, vLLM in WSL2. 887-token prompt,
+greedy, 512 tokens; the two archives ran two interleaved rounds, vLLM one. Three fixed prompts give
+the same tokens as vLLM on both archives (12/12, 12/12, 10/10).
+
+```
+                          Windows (MSVC)   Linux (GCC, WSL2)   vLLM 0.28.0 (WSL2)
+decode c=1                228.5 / 229.5    227.3 / 227.2       227.9 tok/s
+decode c=4, aggregate     571.0 / 576.8    569.1 / 568.2       566.8
+time to first token c=1   107 / 100 ms     102 / 102 ms        81 ms
+```
+
+Decode is level with vLLM; prefill is not (next paragraph's workload).
+
+**Prefix caching on Qwen3.5 and Qwen3.6.** `--enable-prefix-caching` now works on these hybrid
+models, in the mode vLLM 0.28.0 uses for them ("align"): the attention block is raised until one
+block holds one recurrent-state page (1,056 tokens on Qwen3.6-35B-A3B, 544 on Qwen3.5-2B), the
+linear-attention (GDN) state is kept at every block boundary, and a request whose prompt starts with
+cached blocks resumes from the state of the last one. A request that hits the cache produces the
+same greedy tokens as the same request on a miss, and the same text as with caching off, on
+Qwen3.5-2B and on Qwen3.6-35B-A3B-FP8. Before this release, forcing caching on resumed the GDN
+layers from another request's state; on Qwen3.5-2B a request that hit the cache continued the
+English source instead of translating it.
+
+vLLM turns prefix caching on by default for these models; here it stays off until asked for, and
+prefix caching together with speculative decoding (MTP or DFlash) is refused at load, which vLLM
+0.28.0 serves. A `0.0.4-vk.1` server started with both now stops at load with a message naming
+the two flags; in `0.0.4-vk.1` a request served from the cache dropped its DFlash draft and its
+GDN layers resumed from another request's state. Each block carries its own
+GDN state rows, where vLLM shares one page between an attention layer and three GDN layers: about
+86 MB per block on the 35B, so an 8 GiB pool (`--kv-cache-memory 8589934592`) holds 99 blocks of
+1,056 tokens.
+
+A translation-shaped workload (a system prompt of about 1,100 tokens shared by every request, a
+short source segment each, 36 output tokens, temperature 0.2, 8 concurrent clients, 480 requests),
+Qwen3.6-35B-A3B-FP8, the same session as the table above:
+
+```
+                              Windows   Linux    vLLM 0.28.0
+caching off                   74.9 s    -        -
+caching on                    44.0 s    45.1 s   27.7 s
+prompt tokens from cache      90.1%     90.1%    90.1%
+```
+
+The cache hits the same blocks as vLLM's (101,376 of 112,520 prompt tokens on 96 of these
+requests, in all three). vLLM still finishes this workload about 1.6 times faster. A profile of
+the Windows build on it shows where this build spends the time: the steps that carry a prefill
+chunk are 14% of the steps and 53% of the time, 67.6 ms each against 9.8 ms for a decode-only step.
+In such a step the routed-expert GEMM in its prefill shape takes 40.7 ms, and 13.3 ms is the GPU
+waiting for kernel launches, because those steps run outside the CUDA graph. vLLM was not
+profiled, so this says where the time goes here, not why vLLM needs less.
+
+**Sampled decoding.** The random draw for each sampled token was keyed by the request's row in the
+batch and did not change from one step to the next, so at temperature 1.0 a request could fall into
+a loop of one repeated token, and two requests without a seed drew the same text from the same row.
+Draws are now keyed by the request's seed and its position. Sampled output therefore differs from
+`0.0.4-vk.1` for the same seed, by design; greedy output is unchanged. A batch of sampled requests
+is also sampled on the device without a host round trip per step: 6.08 to 5.43 ms per token on the
+35B at one request.
+
+**`/metrics` counts the prompt the way vLLM 0.28.0 does.** `vllm:prompt_tokens_cached` was always
+0, and `vllm:iteration_tokens_total` counted cached prompt tokens as computed; both now come from
+the split the scheduler records when it admits a request. Under async scheduling the prefix-cache
+lookups published on a step without request outputs were dropped, about 430 requests' worth on one
+book translation; they are now reported. Two families vLLM always registers are added,
+`vllm:prompt_tokens_by_source` and `vllm:request_prefill_kv_computed_tokens`. On 96 requests of
+the workload above, `prefix_cache_queries` equals `prompt_tokens` and `prefix_cache_hits` equals
+`prompt_tokens_cached`.
+
+**Smaller Windows archives.** The zips are deflated. The CUDA archive's server is 486.8 MiB of
+kernel images for eight SM targets, which compress to about 124 MiB, so the archive is in the size
+class of the Linux CUDA tarball instead of 507 MiB. The links in the release notes now point at the
+downloads; in `v0.0.4-vk.1` they returned 404 until the notes were corrected by hand.
+
+**`VLLM_CPP_FA2_HEAD_DIMS`** builds FlashAttention-2 for a subset of head dims, since FA-2 is the
+largest part of a CUDA binary. `-DVLLM_CPP_FA2_HEAD_DIMS=256` (the Qwen3.5 / 3.6 / 3.8 family)
+takes a sm_120a `vllm-server` from 93.7 to 59.1 MB with the same greedy tokens on Qwen3.5-2B; a
+model whose head dim was left out takes the attention path of a build without FA-2. The release
+archives build all four (64, 128, 192, 256).
+
 **Windows CUDA in `0.0.4-vk.1`.** Three Windows-only defects are fixed in this release. Each was
 found by running a Windows build and the Linux build of the same commit on one GPU (RTX PRO 6000
 Blackwell, sm_120a) and comparing what ran:
@@ -121,7 +210,7 @@ memory: about 1.9 times a Q8_0 file, 3.3 to 3.6 times a 4-bit one. The expansion
 an idle RTX PRO 6000. Earlier builds transposed the weights to [K, N], which sent every decode matmul
 to the scalar kernel: about 4 tok/s for the same model. `VT_GGUF_EXPAND_NK=0` reproduces that load.
 
-**Known issue in `0.0.4-vk.1`: some mixed-precision GGUF files fail on CPU and CUDA.** A file that
+**Known issue since `0.0.4-vk.1`: some mixed-precision GGUF files fail on CPU and CUDA.** A file that
 stores some tensors as F16 beside block-quantized ones, such as Unsloth's Qwen3.5-2B-UD-Q8_K_XL,
 loads, and its first request then stops the engine with an error. Two checks fire. On CUDA an F16
 token embedding stays F16, and the CUDA embedding kernel takes only f32, bf16 or block-quantized

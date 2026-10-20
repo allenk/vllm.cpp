@@ -137,11 +137,14 @@ runs the whole chain including the registry writes. So before tagging:
 
 ```
 1. dispatch `release`        rehearses release.yml           (every lane green)
-2. wait for a nightly        rehearses containers.yml        (manifest/attest/
-   `containers` run on main                                   promote EXECUTED,
-                                                              not skipped)
-3. only then push the tag
+2. wait for a nightly        rehearses containers.yml        (manifest and attest
+   `containers` run on main                                   EXECUTED, not skipped)
+3. only then push the tag, on the commit both of them ran on
 ```
+
+`promote` is the one stage a nightly cannot rehearse: it is gated on `is_release`
+(`containers.yml`), so every nightly skips it, the one before `v0.0.4-vk.1` included,
+and the tag's own run is where it executes.
 
 ⚠ And note **why the nightly is the thing to wait for rather than a push**:
 `containers.yml`'s push trigger is deliberately narrow — `docker/**`, the

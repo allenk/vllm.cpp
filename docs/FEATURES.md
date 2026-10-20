@@ -70,7 +70,7 @@ by #2794 (goldens predate the pin) and #2817 (the advance).
 |---|---|---|---|---|
 | Continuous batching | ✅ | ✅ | ✅ | ◐ |
 | Chunked prefill | ✅ | ✅ | ✅ | ☐ |
-| Automatic prefix caching | ✅, and **mutually exclusive with DFlash speculative decode in effect**: a request served from the cache DROPS its draft and decodes on the target alone, because the draft keeps a private context store the target's skipped prefill never fills. It buys that request TTFT and costs it draft acceptance, so on a shared-system-prompt workload speculation is off for most requests and output throughput can fall. Tokens are unchanged (the verify is lossless). Moving the draft context into the paged allocator removes the trade, and is owed (#2042, #1919) | ✅ | ✅ (radix) | ◐ |
+| Automatic prefix caching | ✅ on attention-only models. On the Qwen3.5 / 3.6 hybrids it is off by default and `--enable-prefix-caching` runs vLLM's `align` mode; it cannot be combined with speculative decoding (MTP or DFlash) yet, and the loader refuses the pair because the recurrent-state copy does not handle draft tokens (vLLM 0.28.0 serves the pair). Every DFlash target is one of these hybrids. Until `0.0.4-vk.2` a request served from the cache dropped its DFlash draft (#2042) and its recurrent layers resumed from another request's state | ✅ | ✅ (radix) | ◐ |
 | Preemption and recompute | ✅ | ✅ | ✅ | ☐ |
 | Priority scheduling | ◐ gating (`--scheduling-policy priority` reaches the server; scheduler-unit tests only, no engine-level priority-vs-FCFS gate exists yet, #534) | ✅ | ✅ | ☐ |
 | LPM cache-aware admission | ✅ | ☐ | ✅ | ☐ |
