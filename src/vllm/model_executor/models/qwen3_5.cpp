@@ -7544,10 +7544,11 @@ DBuf MoeBlockFp8BlockCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   }
   const Tensor& xh = dh.dtype == DType::kBF16 ? dh : dh_bf16.t();
 
-  // Decode-sized steps fuse the glue around the grouped GEMMs, bit-identically:
-  // gate, up and the SiLU-mul run as one MoeGroupedGemmFp8BlockGateUpSilu launch
-  // (up to 64 pairs, where the grouped op runs its warp kernel and so does the
-  // fused one), and the shared expert's sigmoid gate folds into the combine
+  // The glue around the grouped GEMMs fuses, bit-identically: gate, up and the
+  // SiLU-mul run as one MoeGroupedGemmFp8BlockGateUpSilu launch (up to 64 pairs
+  // its warp kernel, as the grouped op's; above that its two-table tile, the
+  // grouped op's tile at the same height, with one counting sort for both
+  // tables), and the shared expert's sigmoid gate folds into the combine
   // (MoeCombineGate) instead of a SharedExpertGate launch before it.
   // VT_MOE_FP8_BLOCK_FUSED_GATEUP=0 keeps the separate launches for a same-binary
   // A/B; default ON.
@@ -7555,11 +7556,10 @@ DBuf MoeBlockFp8BlockCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
     const char* e = std::getenv("VT_MOE_FP8_BLOCK_FUSED_GATEUP");
     return !(e != nullptr && e[0] == '0');
   }();
-  constexpr int64_t kFusedGateUpMaxPairs = 64;
   const bool fused_gate_up =
       fused_on && vt::OpRegistered(vt::OpId::kMoeGroupedGemmFp8BlockGateUpSilu, d.q.device.type);
   DBuf dact(d, DType::kBF16, {P, I});
-  if (fused_gate_up && P <= kFusedGateUpMaxPairs) {
+  if (fused_gate_up) {
     // The load-time check above holds gate and up to g0's block geometry.
     vt::MoeGroupedGemmFp8BlockGateUpSilu(d.q, dact.t(), xh, eids, &dtok, gate_w, gate_s, up_w,
                                          up_s, g0.block_n, g0.block_k);

@@ -1877,6 +1877,279 @@ void LaunchGroupedFp8BlockWmma(cudaStream_t s, Tensor& out, const Tensor& act,
   Check(cudaGetLastError(), "moe_grouped_gemm_fp8_block kernel launch (wmma)");
 }
 
+// silu(bf16(g)) * bf16(u) in MoeSiluMulKernel's (cuda_moe.cu) f32 math: the epilogue
+// of the fused gate+up kernels, which round each sum through bf16 as the two GEMMs'
+// bf16 stores round them.
+__device__ __forceinline__ float SiluMulOfBf16Sums(float g, float u) {
+  const float gb = __bfloat162float(__float2bfloat16(g));
+  const float ub = __bfloat162float(__float2bfloat16(u));
+  const float sv = gb / (1.0f + expf(-gb));  // == MoeSiluMulKernel (cuda_moe.cu)
+  return sv * ub;
+}
+
+// The BM=16 tile with its loads in flight under the MMAs. MoeGroupedGemmFp8BlockWmma
+// waits on every 32-wide K-step's loads: an 8-row prefill chunk's expert tile then
+// sat at about a third of what the GPU reads. Here a K-step is BK = 128 (one scale
+// block on the Qwen checkpoints), the next step's activation and weight chunks are
+// loaded into registers before the current step's MMAs, activations move in 16-byte
+// chunks and the shared rows are padded against bank conflicts. NT = 1 is
+// MoeGroupedGemmFp8BlockWmma; NT = 2 runs a gate and an up table against the same
+// activation tile with SiluMulOfBf16Sums as the epilogue
+// (MoeGroupedGemmFp8BlockGateUpSiluWmma). A K-block's MMAs still run 16 k at a
+// time in ascending order into the same partial, folded at the same scale, so each
+// output is those kernels' bit for bit. Needs K % 128 == 0, block_k % 128 == 0 and
+// block_n % 64 == 0; the launchers check.
+constexpr int kFp8PipeBK = 128;
+
+template <int NT, typename Tout, int BM, int WARPS_M, int WARPS_N>
+__global__ __launch_bounds__(WARPS_M * WARPS_N * 32) void MoeGroupedGemmFp8BlockWmmaPipe(
+    Tout* out, const __nv_bfloat16* act, const int32_t* sp, const int32_t* sr,
+    const int64_t* w0_ptrs, const int64_t* s0_ptrs, const int64_t* w1_ptrs,
+    const int64_t* s1_ptrs, const int32_t* tile_expert, const int32_t* tile_row0,
+    const int32_t* tile_rows, int64_t n_cols, int64_t k_dim, int64_t block_n, int64_t block_k) {
+// bf16 WMMA fragments are Ampere+; see MoeGroupedGemmBf16Wmma.
+#if __CUDA_ARCH__ >= 800
+  constexpr int BN = 64, BK = kFp8PipeBK, LDS = BK + 8;
+  constexpr int kThreads = WARPS_M * WARPS_N * 32;
+  constexpr int WMPER = BM / WARPS_M, WNPER = BN / WARPS_N;
+  constexpr int MF = WMPER / 16, NF = WNPER / 16;
+  constexpr int kAChunks = BM * BK / 8;   // 16-byte chunks of 8 bf16
+  constexpr int kWChunks = BN * BK / 16;  // 16-byte chunks of 16 fp8, per table
+  static_assert(kAChunks % kThreads == 0 && kWChunks % kThreads == 0, "chunks split evenly");
+  constexpr int kAPer = kAChunks / kThreads, kWPer = kWChunks / kThreads;
+  const int rcount = tile_rows[blockIdx.y];
+  if (rcount == 0) return;
+  // load_matrix_sync wants 256-bit aligned tiles: every fragment offset below is a
+  // multiple of 32 bytes from these bases.
+  __shared__ __align__(32) __nv_bfloat16 As[BM * LDS];
+  __shared__ __align__(32) __nv_bfloat16 Ws[NT][BN * LDS];
+  __shared__ __align__(32) float Cs[BM * BN];
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, wm = warp / WARPS_N, wn = warp % WARPS_N;
+  const int e = tile_expert[blockIdx.y];
+  const int row0 = tile_row0[blockIdx.y];
+  const int64_t col0 = static_cast<int64_t>(blockIdx.x) * BN;
+  const int64_t k_blocks = (k_dim + block_k - 1) / block_k;
+  const uint8_t* wt[NT];
+  const float* st[NT];
+#pragma unroll
+  for (int tb = 0; tb < NT; ++tb) {
+    const int64_t* wp = tb == 0 ? w0_ptrs : w1_ptrs;
+    const int64_t* sp_ = tb == 0 ? s0_ptrs : s1_ptrs;
+    wt[tb] = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(wp[e]));
+    st[tb] = reinterpret_cast<const float*>(static_cast<uintptr_t>(sp_[e])) +
+             (col0 / block_n) * k_blocks;
+  }
+  const int64_t tiles_per_block = block_k / BK;
+
+  // The source row of each activation chunk this thread moves (-1: padding row).
+  int64_t a_base[kAPer];
+#pragma unroll
+  for (int i = 0; i < kAPer; ++i) {
+    const int r = (tid + i * kThreads) / (BK / 8);
+    a_base[i] = r < rcount ? static_cast<int64_t>(sr[row0 + r]) * k_dim : -1;
+  }
+  uint4 ra[kAPer], rw[NT][kWPer];
+  auto load = [&](int64_t kt) {
+#pragma unroll
+    for (int i = 0; i < kAPer; ++i) {
+      const int c8 = ((tid + i * kThreads) % (BK / 8)) * 8;
+      ra[i] = a_base[i] >= 0 ? *reinterpret_cast<const uint4*>(act + a_base[i] + kt + c8)
+                             : make_uint4(0u, 0u, 0u, 0u);
+    }
+#pragma unroll
+    for (int tb = 0; tb < NT; ++tb)
+#pragma unroll
+      for (int i = 0; i < kWPer; ++i) {
+        const int c = tid + i * kThreads;
+        const int64_t gn = col0 + c / (BK / 16);
+        const int64_t gk = kt + (c % (BK / 16)) * 16;
+        rw[tb][i] = gn < n_cols ? *reinterpret_cast<const uint4*>(wt[tb] + gn * k_dim + gk)
+                                : make_uint4(0u, 0u, 0u, 0u);
+      }
+  };
+  auto stage = [&]() {
+#pragma unroll
+    for (int i = 0; i < kAPer; ++i) {
+      const int c = tid + i * kThreads;
+      *reinterpret_cast<uint4*>(&As[(c / (BK / 8)) * LDS + (c % (BK / 8)) * 8]) = ra[i];
+    }
+#pragma unroll
+    for (int tb = 0; tb < NT; ++tb)
+#pragma unroll
+      for (int i = 0; i < kWPer; ++i) {
+        const int c = tid + i * kThreads;
+        const uint32_t vv[4] = {rw[tb][i].x, rw[tb][i].y, rw[tb][i].z, rw[tb][i].w};
+        uint32_t packed[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const float2 lo = Fp8x2E4m3ToFloat2(vv[j]);  // exact: e4m3 fits in bf16
+          const float2 hi = Fp8x2E4m3ToFloat2(vv[j] >> 16);
+          const __nv_bfloat162 l2 = __floats2bfloat162_rn(lo.x, lo.y);
+          const __nv_bfloat162 h2 = __floats2bfloat162_rn(hi.x, hi.y);
+          packed[2 * j] = *reinterpret_cast<const uint32_t*>(&l2);
+          packed[2 * j + 1] = *reinterpret_cast<const uint32_t*>(&h2);
+        }
+        uint4* dst = reinterpret_cast<uint4*>(
+            &Ws[tb][(c / (BK / 16)) * LDS + (c % (BK / 16)) * 16]);
+        dst[0] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+        dst[1] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+      }
+  };
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[NT][MF][NF], part[NT][MF][NF];
+#pragma unroll
+  for (int tb = 0; tb < NT; ++tb)
+#pragma unroll
+    for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+      for (int ni = 0; ni < NF; ++ni) {
+        wmma::fill_fragment(acc[tb][mi][ni], 0.0f);
+        wmma::fill_fragment(part[tb][mi][ni], 0.0f);
+      }
+
+  load(0);
+  int64_t t = 0;
+  for (int64_t kt = 0; kt < k_dim; kt += BK, ++t) {
+    stage();
+    __syncthreads();
+    if (kt + BK < k_dim) load(kt + BK);  // in flight under this step's MMAs
+#pragma unroll
+    for (int kk = 0; kk < BK / 16; ++kk) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af[MF];
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+        wmma::load_matrix_sync(af[mi], &As[(wm * WMPER + mi * 16) * LDS + kk * 16], LDS);
+#pragma unroll
+      for (int tb = 0; tb < NT; ++tb) {
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf[NF];
+#pragma unroll
+        for (int ni = 0; ni < NF; ++ni)
+          wmma::load_matrix_sync(bf[ni], &Ws[tb][(wn * WNPER + ni * 16) * LDS + kk * 16], LDS);
+#pragma unroll
+        for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+          for (int ni = 0; ni < NF; ++ni)
+            wmma::mma_sync(part[tb][mi][ni], af[mi], bf[ni], part[tb][mi][ni]);
+      }
+    }
+    __syncthreads();
+    if ((t + 1) % tiles_per_block == 0 || kt + BK >= k_dim) {
+#pragma unroll
+      for (int tb = 0; tb < NT; ++tb) {
+        const float scale = st[tb][t / tiles_per_block];
+#pragma unroll
+        for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+          for (int ni = 0; ni < NF; ++ni)
+#pragma unroll
+            for (int i = 0; i < acc[tb][mi][ni].num_elements; ++i) {
+              acc[tb][mi][ni].x[i] =
+                  fmaf(part[tb][mi][ni].x[i], scale, acc[tb][mi][ni].x[i]);
+              part[tb][mi][ni].x[i] = 0.0f;
+            }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < NF; ++ni) {
+      if constexpr (NT == 2) {
+        // Element i of the gate and of the up fragment is the same (row, column).
+#pragma unroll
+        for (int i = 0; i < acc[0][mi][ni].num_elements; ++i)
+          acc[0][mi][ni].x[i] = SiluMulOfBf16Sums(acc[0][mi][ni].x[i], acc[1][mi][ni].x[i]);
+      }
+      wmma::store_matrix_sync(&Cs[(wm * WMPER + mi * 16) * BN + (wn * WNPER + ni * 16)],
+                              acc[0][mi][ni], BN, wmma::mem_row_major);
+    }
+  __syncthreads();
+
+  for (int idx = tid; idx < BM * BN; idx += kThreads) {
+    const int r = idx / BN, c = idx % BN;
+    const int64_t gc = col0 + c;
+    if (r < rcount && gc < n_cols)
+      Store(out, static_cast<int64_t>(sp[row0 + r]) * n_cols + gc, Cs[idx]);
+  }
+#else
+  __trap();
+#endif
+}
+
+// VT_MOE_FP8_BLOCK_PIPE=0 keeps the BM=16 tile on MoeGroupedGemmFp8BlockWmma (and
+// its gate+up twin) for a same-binary A/B; the outputs are the same bits. Read per
+// launch, as VT_MOE_FP8_BLOCK_WARP_LOADS is, so a test can flip it in-process.
+bool Fp8BlockPipeEnabled() {
+  const char* e = std::getenv("VT_MOE_FP8_BLOCK_PIPE");
+  return !(e != nullptr && e[0] == '0');
+}
+
+bool Fp8BlockPipeShapeOk(int64_t k, int64_t bn, int64_t bk) {
+  return k % kFp8PipeBK == 0 && bk % kFp8PipeBK == 0 && bn % 64 == 0;
+}
+
+// The counting sort the grouped tiles share: pairs grouped by expert (sp, sr) and
+// the ragged per-tile expert map for tiles of `bm` rows, in the persistent scratch.
+struct MoeTileSort {
+  const int32_t* sp;
+  const int32_t* sr;
+  const int32_t* tile_expert;
+  const int32_t* tile_row0;
+  const int32_t* tile_rows;
+  int max_tiles;
+};
+
+MoeTileSort SortPairsIntoTiles(cudaStream_t s, const Tensor& expert_ids, const Tensor* row_map,
+                               int64_t p, int64_t e_count, int bm) {
+  const int max_tiles = static_cast<int>((p + bm - 1) / bm + e_count);
+  const int64_t n_i32 = 3 * e_count + 2 * p + 3 * max_tiles;
+  int32_t* scratch = EnsureMoeScratch(n_i32);
+  int32_t* count = scratch;
+  int32_t* offset = count + e_count;
+  int32_t* cursor = offset + e_count;
+  int32_t* sp = cursor + e_count;
+  int32_t* sr = sp + p;
+  int32_t* tile_expert = sr + p;
+  int32_t* tile_row0 = tile_expert + max_tiles;
+  int32_t* tile_rows = tile_row0 + max_tiles;
+  Check(cudaMemsetAsync(count, 0, static_cast<size_t>(e_count) * sizeof(int32_t), s),
+        "memset count");
+  Check(cudaMemsetAsync(cursor, 0, static_cast<size_t>(e_count) * sizeof(int32_t), s),
+        "memset cursor");
+  const int32_t* eids = expert_ids.Ptr<int32_t>();
+  const int32_t* rmap = row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr;
+  const int hb = 256;
+  MoeHistKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, count, p);
+  LaunchMoeOffsetsTileMap(s, count, offset, tile_expert, tile_row0, tile_rows, e_count, bm,
+                          max_tiles);
+  MoeScatterKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, rmap, offset,
+                                                                          cursor, sp, sr, p);
+  return {sp, sr, tile_expert, tile_row0, tile_rows, max_tiles};
+}
+
+// The BM=16 tile through MoeGroupedGemmFp8BlockWmmaPipe: one table (w1, s1 null)
+// or a gate and an up table.
+template <int NT, typename Tout>
+void LaunchGroupedFp8BlockPipe(cudaStream_t s, Tensor& out, const Tensor& act,
+                               const Tensor& expert_ids, const Tensor* row_map,
+                               const Tensor& w0_ptrs, const Tensor& s0_ptrs, const Tensor* w1_ptrs,
+                               const Tensor* s1_ptrs, int64_t p, int64_t n, int64_t k,
+                               int64_t e_count, int64_t bn, int64_t bk) {
+  constexpr int BM = 16, WARPS_M = 1, WARPS_N = 4;
+  const MoeTileSort ts = SortPairsIntoTiles(s, expert_ids, row_map, p, e_count, BM);
+  const dim3 grid(static_cast<unsigned>((n + 63) / 64), static_cast<unsigned>(ts.max_tiles));
+  MoeGroupedGemmFp8BlockWmmaPipe<NT, Tout, BM, WARPS_M, WARPS_N>
+      <<<grid, WARPS_M * WARPS_N * 32, 0, s>>>(
+          out.Ptr<Tout>(), act.Ptr<__nv_bfloat16>(), ts.sp, ts.sr, w0_ptrs.Ptr<int64_t>(),
+          s0_ptrs.Ptr<int64_t>(), w1_ptrs != nullptr ? w1_ptrs->Ptr<int64_t>() : nullptr,
+          s1_ptrs != nullptr ? s1_ptrs->Ptr<int64_t>() : nullptr, ts.tile_expert, ts.tile_row0,
+          ts.tile_rows, n, k, bn, bk);
+  Check(cudaGetLastError(), "moe_grouped_gemm_fp8_block kernel launch (pipe)");
+}
+
 // At or below this many (token, expert) pairs the warp kernel runs: c=8 decode is
 // P = 64, where an expert's bytes are re-read once per pair routed to it and the
 // repeats come back from L2. Above it the grouped tile reads each expert once
@@ -1884,14 +2157,16 @@ void LaunchGroupedFp8BlockWmma(cudaStream_t s, Tensor& out, const Tensor& act,
 constexpr int64_t kFp8BlockWarpMaxP = 64;
 
 // Above kFp8BlockWarpMaxP pairs, up to this many run the BM=16 tile and more run
-// BM=64. VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P sets it (tuning); 512 is the bf16
-// path's kMoeDecodeMaxP.
+// BM=64. A hybrid prefill chunk on a cached prompt is about 1,000 pairs over 256
+// experts, about 4 rows of a 64-row tile; a 2,048-token step is 16,384 pairs, 64
+// per expert. On Qwen3.6-35B-A3B's translation replica (480 requests, same binary)
+// means of two rounds: 512 took 46.6 s, 2,048 44.0 s and 16,384 44.1 s.
+// VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P sets it (tuning), read per launch so a test
+// can reach the BM=64 tile at a small P.
+constexpr int64_t kFp8BlockSmallTileMaxP = 16384;
 int64_t Fp8BlockSmallTileMaxP() {
-  static const int64_t v = [] {
-    const char* e = std::getenv("VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P");
-    return e != nullptr ? static_cast<int64_t>(std::atoll(e)) : kMoeDecodeMaxP;
-  }();
-  return v;
+  const char* e = std::getenv("VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P");
+  return e != nullptr ? static_cast<int64_t>(std::atoll(e)) : kFp8BlockSmallTileMaxP;
 }
 
 template <typename Tout>
@@ -1902,7 +2177,11 @@ void LaunchGroupedFp8Block(cudaStream_t s, Tensor& out, const Tensor& act,
   const bool vec = (k % 16 == 0) && (bk % 16 == 0);
   const bool tile = vec && (bn % 64 == 0) && (bk % 32 == 0) && WmmaEnabled();
   if (tile && p > kFp8BlockWarpMaxP) {
-    if (MoeDecodeEnabled() && p <= Fp8BlockSmallTileMaxP())
+    if (MoeDecodeEnabled() && p <= Fp8BlockSmallTileMaxP() && Fp8BlockPipeEnabled() &&
+        Fp8BlockPipeShapeOk(k, bn, bk))
+      LaunchGroupedFp8BlockPipe<1, Tout>(s, out, act, expert_ids, row_map, weight_ptrs,
+                                         scale_ptrs, nullptr, nullptr, p, n, k, e_count, bn, bk);
+    else if (MoeDecodeEnabled() && p <= Fp8BlockSmallTileMaxP())
       LaunchGroupedFp8BlockWmma<Tout, kMoeDecodeBM, 1, 2>(s, out, act, expert_ids, row_map,
                                                           weight_ptrs, scale_ptrs, p, n, k,
                                                           e_count, bn, bk);
@@ -1973,14 +2252,8 @@ void MoeGroupedGemmFp8BlockKernelCuda(Queue& q, Tensor& out, const Tensor& act,
 // triplet: each sum is accumulated exactly as the kernels above accumulate it
 // (lane chunk order, per-K-block scale fold, butterfly; the naive kernel's
 // sequential K), both are rounded through bf16 as the two GEMMs' bf16 stores round
-// them, and the epilogue is MoeSiluMulKernel's (cuda_moe.cu) f32 math.
-
-__device__ __forceinline__ float SiluMulOfBf16Sums(float g, float u) {
-  const float gb = __bfloat162float(__float2bfloat16(g));
-  const float ub = __bfloat162float(__float2bfloat16(u));
-  const float sv = gb / (1.0f + expf(-gb));  // == MoeSiluMulKernel (cuda_moe.cu)
-  return sv * ub;
-}
+// them, and the epilogue is MoeSiluMulKernel's (cuda_moe.cu) f32 math
+// (SiluMulOfBf16Sums, above).
 
 // MoeGroupedGemmFp8BlockNaive for two tables: any K and block_k.
 __global__ void MoeGroupedGemmFp8BlockGateUpSiluNaive(
@@ -2087,6 +2360,195 @@ __global__ __launch_bounds__(WARPS * 32) void MoeGroupedGemmFp8BlockGateUpSiluWa
   }
 }
 
+// Above the warp range: MoeGroupedGemmFp8BlockWmma for the gate and the up table
+// at once, sharing the activation tile and one counting sort, with
+// SiluMulOfBf16Sums as the epilogue. Each gate and up element is the sequence of
+// MMAs and scale folds the one-table kernel computes for it at the same tile, so
+// the output is the triplet {grouped GEMM(gate) -> bf16, grouped GEMM(up) -> bf16,
+// MoeSiluMul} bit for bit, with one sort and one launch where the triplet has two
+// and three.
+template <int BM, int BN, int BK, int WARPS_M, int WARPS_N>
+__global__ void MoeGroupedGemmFp8BlockGateUpSiluWmma(
+    __nv_bfloat16* out, const __nv_bfloat16* act, const int32_t* sp, const int32_t* sr,
+    const int64_t* gate_ptrs, const int64_t* gate_scale_ptrs, const int64_t* up_ptrs,
+    const int64_t* up_scale_ptrs, const int32_t* tile_expert, const int32_t* tile_row0,
+    const int32_t* tile_rows, int64_t n_cols, int64_t k_dim, int64_t block_n, int64_t block_k) {
+// bf16 WMMA fragments are Ampere+; see MoeGroupedGemmBf16Wmma.
+#if __CUDA_ARCH__ >= 800
+  const int rcount = tile_rows[blockIdx.y];
+  if (rcount == 0) return;
+  constexpr int kThreads = WARPS_M * WARPS_N * 32;
+  constexpr int WMPER = BM / WARPS_M, WNPER = BN / WARPS_N;
+  constexpr int MF = WMPER / 16, NF = WNPER / 16;
+  constexpr int kChunks = BK / 16;
+  __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
+  __shared__ __align__(16) __nv_bfloat16 Wg[BN * BK];
+  __shared__ __align__(16) __nv_bfloat16 Wu[BN * BK];
+  __shared__ float Cs[BM * BN];
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, wm = warp / WARPS_N, wn = warp % WARPS_N;
+  const int e = tile_expert[blockIdx.y];
+  const int row0 = tile_row0[blockIdx.y];
+  const int64_t col0 = static_cast<int64_t>(blockIdx.x) * BN;
+  const auto* wg = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(gate_ptrs[e]));
+  const auto* wu = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(up_ptrs[e]));
+  const int64_t k_blocks = (k_dim + block_k - 1) / block_k;
+  const int64_t srow = (col0 / block_n) * k_blocks;
+  const auto* sg = reinterpret_cast<const float*>(static_cast<uintptr_t>(gate_scale_ptrs[e])) + srow;
+  const auto* su = reinterpret_cast<const float*>(static_cast<uintptr_t>(up_scale_ptrs[e])) + srow;
+  const int64_t tiles_per_block = block_k / BK;
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_g[MF][NF], part_g[MF][NF];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_u[MF][NF], part_u[MF][NF];
+#pragma unroll
+  for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < NF; ++ni) {
+      wmma::fill_fragment(acc_g[mi][ni], 0.0f);
+      wmma::fill_fragment(part_g[mi][ni], 0.0f);
+      wmma::fill_fragment(acc_u[mi][ni], 0.0f);
+      wmma::fill_fragment(part_u[mi][ni], 0.0f);
+    }
+
+  int64_t t = 0;
+  for (int64_t kt = 0; kt < k_dim; kt += BK, ++t) {
+    for (int idx = tid; idx < BM * BK; idx += kThreads) {
+      const int r = idx / BK, c = idx % BK;
+      __nv_bfloat16 v = __float2bfloat16(0.0f);
+      if (r < rcount && kt + c < k_dim) v = act[static_cast<int64_t>(sr[row0 + r]) * k_dim + kt + c];
+      As[idx] = v;
+    }
+    for (int idx = tid; idx < 2 * BN * kChunks; idx += kThreads) {
+      const int tab = idx / (BN * kChunks), rem = idx % (BN * kChunks);
+      const int nl = rem / kChunks, c16 = (rem % kChunks) * 16;
+      const int64_t gn = col0 + nl, gk = kt + c16;
+      __nv_bfloat16* dst = (tab == 0 ? Wg : Wu) + nl * BK + c16;
+      if (gn < n_cols && gk < k_dim) {  // K % 16 == 0: a chunk is wholly in or out
+        const uint8_t* w = tab == 0 ? wg : wu;
+        const uint4 v = *reinterpret_cast<const uint4*>(w + gn * k_dim + gk);
+        const uint32_t vv[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const float2 lo = Fp8x2E4m3ToFloat2(vv[i]);
+          const float2 hi = Fp8x2E4m3ToFloat2(vv[i] >> 16);
+          dst[4 * i + 0] = __float2bfloat16(lo.x);  // exact: e4m3 fits in bf16
+          dst[4 * i + 1] = __float2bfloat16(lo.y);
+          dst[4 * i + 2] = __float2bfloat16(hi.x);
+          dst[4 * i + 3] = __float2bfloat16(hi.y);
+        }
+      } else {
+#pragma unroll
+        for (int i = 0; i < 16; ++i) dst[i] = __float2bfloat16(0.0f);
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int kk = 0; kk < BK / 16; ++kk) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af[MF];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bg[NF], bu[NF];
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+        wmma::load_matrix_sync(af[mi], &As[(wm * WMPER + mi * 16) * BK + kk * 16], BK);
+#pragma unroll
+      for (int ni = 0; ni < NF; ++ni) {
+        wmma::load_matrix_sync(bg[ni], &Wg[(wn * WNPER + ni * 16) * BK + kk * 16], BK);
+        wmma::load_matrix_sync(bu[ni], &Wu[(wn * WNPER + ni * 16) * BK + kk * 16], BK);
+      }
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < NF; ++ni) {
+          wmma::mma_sync(part_g[mi][ni], af[mi], bg[ni], part_g[mi][ni]);
+          wmma::mma_sync(part_u[mi][ni], af[mi], bu[ni], part_u[mi][ni]);
+        }
+    }
+    __syncthreads();
+
+    if ((t + 1) % tiles_per_block == 0 || kt + BK >= k_dim) {
+      const float scale_g = sg[t / tiles_per_block];
+      const float scale_u = su[t / tiles_per_block];
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < NF; ++ni)
+#pragma unroll
+          for (int i = 0; i < acc_g[mi][ni].num_elements; ++i) {
+            acc_g[mi][ni].x[i] = fmaf(part_g[mi][ni].x[i], scale_g, acc_g[mi][ni].x[i]);
+            part_g[mi][ni].x[i] = 0.0f;
+            acc_u[mi][ni].x[i] = fmaf(part_u[mi][ni].x[i], scale_u, acc_u[mi][ni].x[i]);
+            part_u[mi][ni].x[i] = 0.0f;
+          }
+    }
+  }
+
+  // Element i of the gate and of the up fragment is the same (row, column): both
+  // are the same fragment type filled by the same operations.
+#pragma unroll
+  for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < NF; ++ni) {
+#pragma unroll
+      for (int i = 0; i < acc_g[mi][ni].num_elements; ++i)
+        acc_g[mi][ni].x[i] = SiluMulOfBf16Sums(acc_g[mi][ni].x[i], acc_u[mi][ni].x[i]);
+      wmma::store_matrix_sync(&Cs[(wm * WMPER + mi * 16) * BN + (wn * WNPER + ni * 16)],
+                              acc_g[mi][ni], BN, wmma::mem_row_major);
+    }
+  __syncthreads();
+
+  for (int idx = tid; idx < BM * BN; idx += kThreads) {
+    const int r = idx / BN, c = idx % BN;
+    const int64_t gc = col0 + c;
+    if (r < rcount && gc < n_cols)
+      Store(out, static_cast<int64_t>(sp[row0 + r]) * n_cols + gc, Cs[idx]);
+  }
+#else
+  __trap();
+#endif
+}
+
+template <int BM, int WARPS_M, int WARPS_N>
+void LaunchGroupedFp8BlockGateUpSiluWmma(cudaStream_t s, Tensor& out, const Tensor& act,
+                                         const Tensor& expert_ids, const Tensor* row_map,
+                                         const Tensor& gate_ptrs, const Tensor& gate_scale_ptrs,
+                                         const Tensor& up_ptrs, const Tensor& up_scale_ptrs,
+                                         int64_t p, int64_t n, int64_t k, int64_t e_count,
+                                         int64_t bn, int64_t bk) {
+  constexpr int BN = 64, BK = 32;
+  const int max_tiles = static_cast<int>((p + BM - 1) / BM + e_count);
+  const int64_t n_i32 = 3 * e_count + 2 * p + 3 * max_tiles;
+  int32_t* scratch = EnsureMoeScratch(n_i32);
+  int32_t* count = scratch;
+  int32_t* offset = count + e_count;
+  int32_t* cursor = offset + e_count;
+  int32_t* sp = cursor + e_count;
+  int32_t* sr = sp + p;
+  int32_t* tile_expert = sr + p;
+  int32_t* tile_row0 = tile_expert + max_tiles;
+  int32_t* tile_rows = tile_row0 + max_tiles;
+
+  Check(cudaMemsetAsync(count, 0, static_cast<size_t>(e_count) * sizeof(int32_t), s),
+        "memset count");
+  Check(cudaMemsetAsync(cursor, 0, static_cast<size_t>(e_count) * sizeof(int32_t), s),
+        "memset cursor");
+  const int32_t* eids = expert_ids.Ptr<int32_t>();
+  const int32_t* rmap = row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr;
+  const int hb = 256;
+  MoeHistKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, count, p);
+  LaunchMoeOffsetsTileMap(s, count, offset, tile_expert, tile_row0, tile_rows, e_count, BM,
+                          max_tiles);
+  MoeScatterKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, rmap, offset,
+                                                                          cursor, sp, sr, p);
+  const dim3 grid(static_cast<unsigned>((n + BN - 1) / BN), static_cast<unsigned>(max_tiles));
+  MoeGroupedGemmFp8BlockGateUpSiluWmma<BM, BN, BK, WARPS_M, WARPS_N>
+      <<<grid, WARPS_M * WARPS_N * 32, 0, s>>>(
+          out.Ptr<__nv_bfloat16>(), act.Ptr<__nv_bfloat16>(), sp, sr, gate_ptrs.Ptr<int64_t>(),
+          gate_scale_ptrs.Ptr<int64_t>(), up_ptrs.Ptr<int64_t>(), up_scale_ptrs.Ptr<int64_t>(),
+          tile_expert, tile_row0, tile_rows, n, k, bn, bk);
+  Check(cudaGetLastError(), "moe_grouped_gemm_fp8_block_gate_up_silu kernel launch (wmma)");
+}
+
 void MoeGroupedGemmFp8BlockGateUpSiluCuda(Queue& q, Tensor& out, const Tensor& act,
                                           const Tensor& expert_ids, const Tensor* row_map,
                                           const Tensor& gate_ptrs, const Tensor& gate_scale_ptrs,
@@ -2097,6 +2559,27 @@ void MoeGroupedGemmFp8BlockGateUpSiluCuda(Queue& q, Tensor& out, const Tensor& a
   VT_CHECK(out.dtype == DType::kBF16,
            "cuda moe_grouped_gemm_fp8_block_gate_up_silu: out must be bf16");
   cudaStream_t s = AsStream(q);
+  // The tile conditions and bounds are LaunchGroupedFp8Block's, so the tile and its
+  // height are the ones the triplet's GEMMs run.
+  const bool tile = (k % 16 == 0) && (block_k % 16 == 0) && (block_n % 64 == 0) &&
+                    (block_k % 32 == 0) && WmmaEnabled();
+  if (tile && p > kFp8BlockWarpMaxP) {
+    const int64_t e_count = gate_ptrs.shape[0];
+    if (MoeDecodeEnabled() && p <= Fp8BlockSmallTileMaxP() && Fp8BlockPipeEnabled() &&
+        Fp8BlockPipeShapeOk(k, block_n, block_k))
+      LaunchGroupedFp8BlockPipe<2, __nv_bfloat16>(s, out, act, expert_ids, row_map, gate_ptrs,
+                                                  gate_scale_ptrs, &up_ptrs, &up_scale_ptrs, p, n,
+                                                  k, e_count, block_n, block_k);
+    else if (MoeDecodeEnabled() && p <= Fp8BlockSmallTileMaxP())
+      LaunchGroupedFp8BlockGateUpSiluWmma<kMoeDecodeBM, 1, 2>(
+          s, out, act, expert_ids, row_map, gate_ptrs, gate_scale_ptrs, up_ptrs, up_scale_ptrs, p,
+          n, k, e_count, block_n, block_k);
+    else
+      LaunchGroupedFp8BlockGateUpSiluWmma<kGroupBM, 2, 2>(
+          s, out, act, expert_ids, row_map, gate_ptrs, gate_scale_ptrs, up_ptrs, up_scale_ptrs, p,
+          n, k, e_count, block_n, block_k);
+    return;
+  }
   const int32_t* eids = expert_ids.Ptr<int32_t>();
   const int32_t* rmap = row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr;
   const unsigned y = static_cast<unsigned>(p < 65535 ? p : 65535);

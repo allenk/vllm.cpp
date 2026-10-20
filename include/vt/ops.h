@@ -3508,10 +3508,10 @@ void MoeGroupedGemmFp8Block(Queue& q, Tensor& out, const Tensor& act, const Tens
 //   out[p, n] = silu(bf16(gate[p, n])) * bf16(up[p, n])      (bf16 out)
 // where gate and up are MoeGroupedGemmFp8Block's sums over gate_ptrs /
 // gate_scale_ptrs and up_ptrs / up_scale_ptrs. Bit-identical to those two
-// grouped GEMMs into bf16 followed by MoeSiluMul; one launch reads both weights
-// against one activation load. Built for decode-sized P: any P is correct, but
-// every pair re-reads its expert's bytes, so large P belongs to
-// MoeGroupedGemmFp8Block's grouped tile. Registered on kCUDA.
+// grouped GEMMs into bf16 followed by MoeSiluMul at every P: up to 64 pairs one
+// launch reads both weights against one activation load, as the grouped op's
+// warp kernel; above that the grouped op's tile runs both tables against one
+// activation tile, after one counting sort. Registered on kCUDA.
 //   out          [P, N] bf16
 //   act          [*, K] bf16
 //   expert_ids   [P] i32 (device); row_map [P] i32 (device) or nullptr

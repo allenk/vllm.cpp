@@ -459,13 +459,15 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block BM=16 tile matches the block-scaled re
   RunCase(d);
 }
 
-// P = 1024 > 512 -> BM=64 WMMA tile. N = 130 leaves a 2-column last tile, K = 384
-// three K-blocks; identity routing and bf16 out on the second call.
+// P = 1024 with the small-tile bound at 512 -> BM=64 WMMA tile. N = 130 leaves a
+// 2-column last tile, K = 384 three K-blocks; identity routing and bf16 out on the
+// second call.
 TEST_CASE("GPU moe_grouped_gemm_fp8_block BM=64 tile matches the block-scaled reference") {
   if (!HasCuda()) {
     MESSAGE("CUDA backend unavailable; skipping");
     return;
   }
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P", "512");
   Case c;
   c.e_count = 9; c.t_rows = 128; c.top_k = 8; c.k_dim = 384; c.n_cols = 130;
   c.block_n = 64; c.seed = 500;
@@ -473,6 +475,42 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block BM=64 tile matches the block-scaled re
   Case d = c;
   d.use_row_map = false; d.bf16_out = true; d.seed = 510;
   RunCase(d);
+  vllm_test::UnsetEnv("VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P");
+}
+
+// The pipelined BM=16 tile (BK = 128, loads in flight under the MMAs) against the
+// BM=16 tile it replaces, which VT_MOE_FP8_BLOCK_PIPE=0 selects: one table and the
+// gate+up pair, bit for bit, at the Qwen3.6-35B-A3B prefill-chunk shape (about 4
+// pairs per expert, K = 2048 for gate/up and 512 for down, 128-wide scale blocks),
+// at a two-scale-block K, and at P = 1024, which the 16,384 bound now gives this tile.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block pipelined BM=16 tile is the BM=16 tile bit for bit") {
+  if (!HasCuda()) {
+    MESSAGE("CUDA backend unavailable; skipping");
+    return;
+  }
+  constexpr const char* kKnob = "VT_MOE_FP8_BLOCK_PIPE";
+  Case gate;
+  gate.e_count = 64; gate.t_rows = 32; gate.top_k = 8; gate.k_dim = 2048; gate.n_cols = 128;
+  gate.seed = 1100;
+  Case down = gate;
+  down.k_dim = 512; down.n_cols = 192; down.use_row_map = false; down.bf16_out = true;
+  down.seed = 1110;
+  Case two = gate;
+  two.e_count = 9; two.t_rows = 128; two.k_dim = 384; two.n_cols = 130; two.block_n = 64;
+  two.block_k = 256; two.seed = 1120;
+  for (const Case& c : {gate, down, two}) {
+    CAPTURE(c.seed);
+    const Fixture f = Build(c);
+    const Fixture u = BuildUp(c);
+    vllm_test::SetEnv(kKnob, "0");
+    const std::vector<float> old_out = Run(f);
+    const std::vector<uint16_t> old_fused = RunGateUp(f, u).fused;
+    vllm_test::UnsetEnv(kKnob);
+    const std::vector<float> pipe_out = Run(f);
+    CheckAgainstReference(f, pipe_out);
+    CHECK(pipe_out == old_out);
+    CHECK(RunGateUp(f, u).fused == old_fused);
+  }
 }
 
 // Greedy decode must be reproducible: the warp kernel's lane order and butterfly
@@ -524,16 +562,32 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu equals the gate, up and s
   RunGateUpCase(w, true);
 }
 
-TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu is correct above the warp range") {
+// Above the warp range the fused op runs the grouped tile for both tables, at the
+// height the triplet's GEMMs pick, so it is the triplet bit for bit there too.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu equals the triplet above the warp range") {
   if (!HasCuda()) {
     MESSAGE("CUDA backend unavailable; skipping");
     return;
   }
-  // P = 160: the triplet's GEMMs run the BM=16 tile, which sums in another order,
-  // so only the reference applies.
+  // P = 160: the BM=16 tile; N = 192 spans two scale-row blocks.
   Case c;
   c.e_count = 7; c.t_rows = 20; c.top_k = 8; c.k_dim = 256; c.n_cols = 192; c.seed = 800;
-  RunGateUpCase(c, /*expect_bit_identical=*/false);
+  RunGateUpCase(c, /*expect_bit_identical=*/true);
+  // P = 1024: the pipelined BM=16 tile, then with the small-tile bound at 512 the
+  // BM=64 tile; N = 130 leaves a 2-column last tile, K = 384 three K-blocks,
+  // identity routing.
+  Case b;
+  b.e_count = 9; b.t_rows = 128; b.top_k = 8; b.k_dim = 384; b.n_cols = 130; b.block_n = 64;
+  b.use_row_map = false; b.seed = 810;
+  RunGateUpCase(b, true);
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P", "512");
+  RunGateUpCase(b, true);
+  vllm_test::UnsetEnv("VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P");
+  // The Qwen3.6-35B-A3B prefill-chunk shape at reduced width: about 4 pairs per
+  // expert over 64 experts, K = 2048 in 128-wide blocks.
+  Case q;
+  q.e_count = 64; q.t_rows = 32; q.top_k = 8; q.k_dim = 2048; q.n_cols = 128; q.seed = 820;
+  RunGateUpCase(q, true);
 }
 
 // The warp kernels batch their weight loads (several output columns per warp,
