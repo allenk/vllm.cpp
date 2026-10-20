@@ -55,6 +55,7 @@ using vllm::v1::get_request_block_hasher;
 using vllm::v1::init_none_hash;
 using vllm::v1::KVCacheConfig;
 using vllm::v1::ModelRunnerOutput;
+using vllm::v1::PrefillStats;
 using vllm::v1::Request;
 using vllm::v1::RequestStatus;
 using vllm::v1::Scheduler;
@@ -2023,6 +2024,49 @@ TEST_CASE("Scheduler.make_stats: prefix-cache lookups survive a second schedule(
 
   // Published once: the next snapshot starts from zero.
   CHECK(scheduler->make_stats().prefix_cache_stats.queries == 0);
+}
+
+// ---------------------------------------------------------------------------
+// prefill_stats (scheduler.py:898-905, 1962-1969 @ 0.28.0): the lookup that
+// admits a request is recorded on it, and the request's first output hands the
+// split to the frontend; later outputs carry none. vllm:prompt_tokens_cached
+// and the computed share of vllm:iteration_tokens_total are counted from it.
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.update_from_output: the first output carries the prefill split") {
+  auto scheduler = CreateScheduler();
+  // The same 40-token prompt twice: "b" finds the two full blocks "a" filled.
+  auto first = CreateRequests(/*num_requests=*/1, /*num_tokens=*/40, {"a"});
+  Request* a = AddRequest(*scheduler, std::move(first[0]));
+
+  auto out0 = scheduler->schedule();
+  auto eco0 = scheduler->update_from_output(out0, MakeRunnerOutput({{"a", {7}}}));
+  REQUIRE(eco0.outputs.size() == 1);
+  REQUIRE(eco0.outputs[0].prefill_stats.has_value());
+  CHECK(eco0.outputs[0].prefill_stats->num_prompt_tokens == 40);
+  CHECK(eco0.outputs[0].prefill_stats->num_computed_tokens == 40);
+  CHECK(eco0.outputs[0].prefill_stats->num_cached_tokens == 0);
+  CHECK_FALSE(a->prefill_stats.has_value());  // handed over once
+
+  auto second = CreateRequests(/*num_requests=*/1, /*num_tokens=*/40, {"b"});
+  AddRequest(*scheduler, std::move(second[0]));
+  auto out1 = scheduler->schedule();  // "a" decodes, "b" is admitted
+  REQUIRE(out1.num_scheduled_tokens.at("b") == 8);
+  auto eco1 = scheduler->update_from_output(
+      out1, MakeRunnerOutput({{"a", {7}}, {"b", {7}}}));
+  REQUIRE(eco1.outputs.size() == 2);
+  for (const auto& output : eco1.outputs) {
+    if (output.request_id == "a") {
+      CHECK_FALSE(output.prefill_stats.has_value());
+      continue;
+    }
+    REQUIRE(output.prefill_stats.has_value());
+    const PrefillStats& split = *output.prefill_stats;
+    CHECK(split.num_prompt_tokens == 40);
+    CHECK(split.num_computed_tokens == 8);
+    CHECK(split.num_cached_tokens == 32);
+    CHECK(split.num_local_cached_tokens == 32);
+    CHECK(split.num_external_cached_tokens == 0);
+  }
 }
 
 // ---------------------------------------------------------------------------

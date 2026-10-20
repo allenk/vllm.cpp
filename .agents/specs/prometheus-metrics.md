@@ -11,10 +11,11 @@ Wire a self-contained Prometheus registry + text-format-0.0.4 exposition and the
 always-on vLLM metric catalog (`PrometheusStatLogger`), and expose it at
 `GET /metrics` behind an opt-in backing on the OpenAI `ApiServer`. The gate is
 metric-NAME + label-schema parity with vLLM's own scrape spec. Config-gated
-metric families (kv-connector, mm-cache, LoRA, spec-decoding, kv-block-lifetime,
-corrupted, prompt_tokens_by_source, engine_sleep_state) are OUT of the always-on
-core and stay INVENTORIED — vLLM itself only registers them under the matching
-config, so their absence is faithful, not a gap.
+metric families (kv-connector, mm-cache, LoRA, kv-block-lifetime, corrupted,
+engine_sleep_state) are OUT of the always-on core and stay INVENTORIED — vLLM
+itself only registers them under the matching config, so their absence is
+faithful, not a gap. (prompt_tokens_by_source was listed here; in vLLM 0.28.0 it
+is always on, and W7 below registers it. Spec-decoding landed with its config.)
 
 ## Upstream chain
 
@@ -113,6 +114,29 @@ the same into the AsyncLLM production-serving loop is the remaining follow-on.
 - W6 (residual): the AsyncLLM production-serving metric wiring; the config-gated
   families (spec-decode/kv-connector/mm/LoRA) as their configs land; the
   chat/completion RESPONSE-BODY per-request timing surface — OPEN.
+- W7: the prompt-token split and stats-only steps, to vLLM 0.28.0 — **DONE
+  2026-10-20.** Found by comparing a translation workload's scrape against vLLM
+  0.28.0 with prefix caching on: `vllm:prompt_tokens_cached` read 0 while 92% of
+  the prompt tokens hit, `vllm:iteration_tokens_total` counted the hits as
+  computed, and about 430 requests' prefix-cache lookups were missing.
+  - `PrefillStats` (`stats.py:259-299`) is set on `Request` in the waiting loop
+    until the first preemption (`scheduler.py:898-905`) and taken onto the
+    request's first `EngineCoreOutput` (`:1962-1969`). The output processor
+    folds it into `IterationStats.prompt_token_stats` (`PromptTokenStats`,
+    `stats.py:301-346`) and the request's `num_cached_tokens`.
+  - `Record()` takes `const IterationStats*`; null is a step without request
+    outputs, which records the scheduler state only (`loggers.py:1185-1186`).
+    `vllm:prompt_tokens` counts `total`, `vllm:prompt_tokens_cached` counts
+    `cached_tokens`, `vllm:iteration_tokens_total` observes `computed +
+    num_generation_tokens`, and the always-on `vllm:prompt_tokens_by_source`
+    and `vllm:request_prefill_kv_computed_tokens` are registered.
+  - `EngineCore` returns a stats-only `EngineCoreOutputs` for a step without
+    request outputs while `log_stats` is on (`scheduler.py:2121-2134`); AsyncLLM
+    and LLMEngine record it. Under async scheduling a `schedule()`'s lookups are
+    published by the update of the batch before it, which has no outputs when it
+    was all partial prefills or the flush after a finish.
+  - Deferred: `PrefillStats.finalize` / `num_cache_creation_tokens` and
+    `RequestOutput.num_cached_tokens`, whose consumers are not ported.
 
 ## Risks/decisions
 

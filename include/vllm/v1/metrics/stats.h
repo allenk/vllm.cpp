@@ -38,11 +38,15 @@
 #ifndef VLLM_V1_METRICS_STATS_H_
 #define VLLM_V1_METRICS_STATS_H_
 
+#include <array>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -211,26 +215,102 @@ struct FinishedRequestStats {
   double inference_time = 0.0;
   double decode_time = 0.0;
   double mean_time_per_output_token = 0.0;
+  // The prompt tokens this request did not compute (its first output's
+  // PrefillStats.num_cached_tokens). vllm:request_prefill_kv_computed_tokens
+  // observes num_prompt_tokens minus this.
   int64_t num_cached_tokens = 0;
 };
 
-// Ported from: @dataclass IterationStats (vllm/v1/metrics/stats.py, the frontend
-// per-step aggregate consumed by PrometheusStatLogger.record). The always-on
-// subset: token counters, per-step iteration-token count, preemptions, and the
-// per-request TTFT/ITL/n samples plus finished-request breakdowns.
+// Ported from: @dataclass PrefillStats (vllm/v1/metrics/stats.py:259-299 @
+// 0.28.0). The breakdown of a request's first scheduled prefill. The scheduler
+// sets it each time the request is looked up in the waiting queue before its
+// first preemption (scheduler.py:898-905), so the lookup that admits the
+// request is the one reported, and hands it to the frontend on the request's
+// first output (scheduler.py:1962-1969).
+//
+// DEFERRED: num_cache_creation_tokens and finalize(). Their only consumer is
+// RequestOutput.num_cache_creation_tokens, which is not ported.
+struct PrefillStats {
+  // Tokens to be prefilled.
+  int64_t num_prompt_tokens = 0;
+  // Tokens prefilled locally (actual compute work).
+  int64_t num_computed_tokens = 0;
+  // Tokens prefilled without compute work (local + external).
+  int64_t num_cached_tokens = 0;
+  // Tokens served from the local prefix cache.
+  int64_t num_local_cached_tokens = 0;
+  // Tokens served by an external KV transfer.
+  int64_t num_external_cached_tokens = 0;
+
+  // Upstream: set() (stats.py:278-291).
+  void set(int64_t prompt_tokens, int64_t local_cached_tokens,
+           int64_t external_cached_tokens) {
+    const int64_t cached = local_cached_tokens + external_cached_tokens;
+    assert(cached <= prompt_tokens);
+    num_prompt_tokens = prompt_tokens;
+    num_computed_tokens = prompt_tokens - cached;
+    num_cached_tokens = cached;
+    num_local_cached_tokens = local_cached_tokens;
+    num_external_cached_tokens = external_cached_tokens;
+  }
+};
+
+// Ported from: @dataclass PromptTokenStats (vllm/v1/metrics/stats.py:301-346 @
+// 0.28.0). The prompt tokens of the requests whose first output arrived this
+// step, by source. Invariants: computed + local_cache_hit +
+// external_kv_transfer == total, and local_cache_hit + external_kv_transfer ==
+// cached_tokens.
+struct PromptTokenStats {
+  // The `source` label values of vllm:prompt_tokens_by_source, in upstream's
+  // ALL_SOURCES order.
+  static constexpr std::array<std::string_view, 3> kAllSources = {
+      "local_compute", "local_cache_hit", "external_kv_transfer"};
+
+  int64_t computed = 0;
+  int64_t local_cache_hit = 0;
+  int64_t external_kv_transfer = 0;
+  int64_t cached_tokens = 0;
+  int64_t total = 0;
+
+  // Upstream: update_from_output() (stats.py:328-335).
+  void update_from_output(const PrefillStats& prefill_stats) {
+    computed += prefill_stats.num_computed_tokens;
+    cached_tokens += prefill_stats.num_cached_tokens;
+    total += prefill_stats.num_prompt_tokens;
+    local_cache_hit += prefill_stats.num_local_cached_tokens;
+    external_kv_transfer += prefill_stats.num_external_cached_tokens;
+  }
+
+  // Upstream: get_by_source() (stats.py:337-346).
+  int64_t get_by_source(std::string_view source) const {
+    if (source == "local_compute") return computed;
+    if (source == "local_cache_hit") return local_cache_hit;
+    if (source == "external_kv_transfer") return external_kv_transfer;
+    throw std::invalid_argument("Unknown source: " + std::string(source));
+  }
+};
+
+// Ported from: IterationStats (vllm/v1/metrics/stats.py:349-371 @ 0.28.0), the
+// frontend per-step aggregate consumed by PrometheusStatLogger.record. The
+// always-on subset: token counters, preemptions, and the per-request TTFT/ITL/n
+// samples plus finished-request breakdowns. A frontend builds one only for a
+// step that has request outputs; a stats-only step records scheduler stats
+// alone.
 struct IterationStats {
-  int64_t num_prompt_tokens = 0;      // vllm:prompt_tokens_total
   int64_t num_generation_tokens = 0;  // vllm:generation_tokens_total
+  // vllm:prompt_tokens_total, _by_source and _cached. Its `computed` part, not
+  // `total`, is the prompt share of vllm:iteration_tokens_total.
+  PromptTokenStats prompt_token_stats;
   int64_t num_preempted_reqs = 0;     // vllm:num_preemptions_total
-  int64_t num_prompt_tokens_cached = 0;  // vllm:prompt_tokens_cached
-  // vllm:iteration_tokens_total observes (prompt + generation) for this step.
-  int64_t iteration_tokens = 0;
   // Per-request samples observed this step.
   std::vector<double> time_to_first_tokens_iter;     // seconds
   std::vector<double> inter_token_latencies_iter;    // seconds
   std::vector<int64_t> n_params_iter;                // request `n`
   std::vector<int64_t> max_num_generation_tokens_iter;
   std::vector<FinishedRequestStats> finished_requests;
+
+  // Upstream @property num_prompt_tokens (stats.py:368-371).
+  int64_t num_prompt_tokens() const { return prompt_token_stats.total; }
 };
 
 }  // namespace vllm::v1

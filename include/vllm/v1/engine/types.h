@@ -32,8 +32,10 @@
 //     (ROAD-V1-C7); events (EngineCoreEvent) is now PRESENT
 //     (SERVE-RESPONSE-METRICS — the per-request QUEUED/SCHEDULED/PREEMPTED
 //     timing events the scheduler drains onto each output); pooling_output is
-//     now PRESENT (ARCH-ONE-SURFACE ROW 6); kv_transfer_params, trace_headers,
-//     prefill_stats, routed_experts, num_nans_in_logits deferred.
+//     now PRESENT (ARCH-ONE-SURFACE ROW 6); prefill_stats is now PRESENT (the
+//     cached/computed prompt-token split the frontend counters read);
+//     kv_transfer_params, trace_headers, routed_experts, num_nans_in_logits
+//     deferred.
 //   EngineCoreOutputs: scheduler_stats (SchedulerStats), utility_output,
 //     finished_requests, wave_complete / start_wave (DP wave signalling), and
 //     the __post_init__ monotonic-timestamp default (the frontend stamps it).
@@ -200,6 +202,11 @@ struct EngineCoreOutput {
   // `pooling_output=pooler_output`). nullopt on every generation output ->
   // byte-identical text path.
   std::optional<std::vector<float>> pooling_output;
+  // prefill_stats (EngineCoreOutput.prefill_stats, engine/__init__.py:211 @
+  // 0.28.0): set on a request's first output only, from
+  // Request::take_prefill_stats. The frontend folds it into
+  // IterationStats.prompt_token_stats and the request's num_cached_tokens.
+  std::optional<PrefillStats> prefill_stats;
 
   // finished (property): a request is finished iff finish_reason is set.
   bool Finished() const { return finish_reason.has_value(); }

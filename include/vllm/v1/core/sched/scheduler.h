@@ -377,6 +377,11 @@ class Scheduler {
   // deferred with their config-gated metric families (see loggers.h).
   SchedulerStats make_stats() const;
 
+  // log_stats (scheduler.py: `self.log_stats`): upstream's make_stats() returns
+  // None when it is off, and only then does a step with no request outputs
+  // return nothing to the frontend. The engine core reads it for that choice.
+  bool log_stats() const { return log_stats_; }
+
   // Emit the chunked-prefill progress lines for the step just executed
   // (VT_SERVER_PREFILL_PROGRESS / VT_SERVER_VERBOSE). Called by EngineCore
   // AFTER execute_model, because schedule() advances num_computed_tokens before

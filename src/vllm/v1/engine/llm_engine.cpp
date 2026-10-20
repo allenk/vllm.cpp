@@ -197,12 +197,15 @@ std::vector<RequestOutput> LLMEngine::step() {
   for (auto& entry : outputs_by_client) {
     EngineCoreOutputs& engine_core_outputs = entry.second;
 
-    // llm_engine.py:308 iteration_stats = IterationStats() if self.log_stats.
-    // Built only when a stat logger is attached; otherwise process_outputs runs
-    // its byte-identical no-stats path.
+    // llm_engine.py @ 0.28.0 step(): iteration_stats = IterationStats() if
+    // self.log_stats and outputs.outputs else None. Built only when a stat
+    // logger is attached and the step has request outputs; otherwise
+    // process_outputs runs its byte-identical no-stats path.
     IterationStats iteration_stats;
     IterationStats* iteration_stats_ptr =
-        stat_logger_ != nullptr ? &iteration_stats : nullptr;
+        stat_logger_ != nullptr && !engine_core_outputs.outputs.empty()
+            ? &iteration_stats
+            : nullptr;
 
     // llm_engine.py:309 process_outputs — detokenize + string-stop + assemble
     // (+ fold IterationStats when logging).
@@ -213,11 +216,13 @@ std::vector<RequestOutput> LLMEngine::step() {
     // detokenizer stopped them but EngineCore did not signal it itself).
     engine_core_.abort_requests(processed.reqs_to_abort);
 
-    // llm_engine.py:319-329 record stats: fold this step's SchedulerStats +
-    // IterationStats into the Prometheus registry. Guarded by outputs>0 exactly
-    // as upstream (len(outputs.outputs) > 0).
-    if (stat_logger_ != nullptr && !engine_core_outputs.outputs.empty()) {
-      stat_logger_->Record(engine_core_outputs.scheduler_stats, iteration_stats);
+    // llm_engine.py @ 0.28.0 step() 4) Record stats: fold this step's
+    // SchedulerStats + IterationStats into the Prometheus registry "even when
+    // this step produced no request outputs" — the engine core sends a
+    // stats-only entry for such a step.
+    if (stat_logger_ != nullptr) {
+      stat_logger_->Record(engine_core_outputs.scheduler_stats,
+                           iteration_stats_ptr);
     }
 
     for (RequestOutput& ro : processed.request_outputs) {

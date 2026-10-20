@@ -958,6 +958,16 @@ SchedulerOutput Scheduler::schedule() {
         num_computed_tokens += num_external_computed_tokens;
       }
 
+      // Track the first scheduled prefill, not a repeat prefill after a
+      // preemption (scheduler.py:898-905 @ 0.28.0). Rewritten on every lookup,
+      // so a request that waits for blocks reports the lookup that admitted it.
+      if (request->num_computed_tokens == 0 &&
+          request->prefill_stats.has_value() && request->num_preemptions <= 0) {
+        request->prefill_stats->set(request->num_prompt_tokens,
+                                    num_new_local_computed_tokens,
+                                    num_external_computed_tokens);
+      }
+
       // Number of tokens to schedule (num_tokens covers resumed reqs' output).
       int num_new_tokens = request->NumTokens() - num_computed_tokens;
       if (0 < long_prefill_token_threshold_ &&
@@ -1447,6 +1457,9 @@ EngineCoreOutputs Scheduler::update_from_output(
       // accumulated QUEUED/SCHEDULED/PREEMPTED events onto this output and clear
       // them. nullopt (omit-default) when log_stats is off or none fired.
       out.events = request->take_events();
+      // prefill_stats=request.take_prefill_stats() (scheduler.py:1962-1969 @
+      // 0.28.0): only the request's first output carries it.
+      out.prefill_stats = request->take_prefill_stats();
       outputs.push_back(std::move(out));
     }
   }

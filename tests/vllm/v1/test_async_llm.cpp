@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -41,7 +42,9 @@
 #include "vllm/v1/core/sched/output.h"
 #include "vllm/v1/core/sched/scheduler.h"
 #include "vllm/v1/engine/async_llm.h"
+#include "vllm/v1/engine/core.h"
 #include "vllm/v1/engine/input_processor.h"
+#include "vllm/v1/engine/llm_engine.h"
 #include "vllm/v1/engine/output_processor.h"
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
@@ -109,6 +112,48 @@ class RunnerStub : public ModelRunnerBase {
  private:
   SchedulerOutput stashed_output_;
   std::chrono::microseconds delay_;
+};
+
+// RunnerStub plus the real runner's partial-prefill rule: a request whose
+// prompt is not fully computed after this step samples nothing (an empty token
+// list), so a step of partial prefills produces no request outputs. Progress is
+// tracked from the scheduled steps, starting at a new request's prefix-cache
+// hit.
+class PrefillAwareRunnerStub : public ModelRunnerBase {
+ public:
+  std::optional<ModelRunnerOutput> execute_model(
+      const SchedulerOutput& scheduler_output) override {
+    stashed_output_ = scheduler_output;
+    return std::nullopt;
+  }
+
+  ModelRunnerOutput sample_tokens(
+      const std::optional<vllm::v1::GrammarOutput>& /*grammar_output*/) override {
+    for (const auto& new_req : stashed_output_.scheduled_new_reqs) {
+      prompt_len_[new_req.req_id] =
+          static_cast<int>(new_req.prompt_token_ids->size());
+      computed_[new_req.req_id] = new_req.num_computed_tokens;
+    }
+    ModelRunnerOutput output;
+    int index = 0;
+    for (const auto& [request_id, num_tokens] :
+         stashed_output_.num_scheduled_tokens) {
+      computed_[request_id] += num_tokens;
+      output.req_ids.push_back(request_id);
+      output.req_id_to_index[request_id] = index++;
+      if (computed_[request_id] >= prompt_len_[request_id]) {
+        output.sampled_token_ids.push_back({kCannedToken});
+      } else {
+        output.sampled_token_ids.push_back({});
+      }
+    }
+    return output;
+  }
+
+ private:
+  SchedulerOutput stashed_output_;
+  std::map<std::string, int> prompt_len_;
+  std::map<std::string, int> computed_;
 };
 
 // A runner whose engine-thread sampling hook throws, so the busy-loop fatal
@@ -294,6 +339,37 @@ void InitHash() {
     init_none_hash(sha256_cbor);
     initialized = true;
   }
+}
+
+// A pre-tokenized prompt of `n` ids inside the fixture vocabulary.
+std::vector<int32_t> PromptTokens(int n, int salt = 0) {
+  std::vector<int32_t> ids(static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    ids[static_cast<std::size_t>(i)] = (i + salt) % 13;
+  }
+  return ids;
+}
+
+// The async-scheduling engine of the metrics cases below: prefix caching on,
+// block 16, `max_num_batched_tokens` per step.
+SchedulerConfig AsyncMetricsConfig(int max_num_batched_tokens) {
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = 16;
+  cfg.max_num_batched_tokens = max_num_batched_tokens;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = 8192;
+  cfg.watermark = 0.0;
+  cfg.async_scheduling = true;
+  return cfg;
+}
+
+KVCacheConfig AsyncMetricsKVConfig() {
+  KVCacheConfig kv;
+  kv.num_blocks = 10000;
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<FullAttentionSpec>(16, 1, 1, DType::kF32));
+  return kv;
 }
 
 }  // namespace
@@ -1012,4 +1088,157 @@ TEST_CASE("async_llm: depth-2 batch-queue step folds IterationStats") {
                            kLabels) > 0.0);
   CHECK(MetricValue(t, std::string("vllm:e2e_request_latency_seconds_sum") +
                            kLabels) > 0.0);
+}
+
+// ─── Prompt-token metrics split cached from computed tokens ───────────────────
+// vLLM 0.28.0 counts a request's prompt from the PrefillStats its first output
+// carries (stats.py:389-391): vllm:prompt_tokens_cached and the local_cache_hit
+// source get the tokens served from the prefix cache, and
+// vllm:iteration_tokens_total counts only the computed ones
+// (loggers.py:1205-1208). The same 40-token prompt runs twice; the second run
+// reuses the two full blocks the first filled (32 tokens) and computes 8.
+//
+// RED before PrefillStats: prompt_tokens_cached stayed 0, the by-source and
+// prefill_kv_computed families did not exist, and the iteration-token sum
+// counted the 32 cached tokens as computed.
+TEST_CASE("async_llm: prompt-token metrics split cached from computed tokens") {
+  InitHash();
+  Tokenizer tokenizer = BuildFixture();
+  HfConfig config = MakeConfig();
+  vllm::v1::AsyncScheduler scheduler(AsyncMetricsConfig(8192),
+                                     AsyncMetricsKVConfig(), /*block_size=*/16,
+                                     /*enable_caching=*/true);
+  PrefillAwareRunnerStub runner;
+  Executor executor(runner);
+  InputProcessor input(tokenizer, config);
+  OutputProcessor output(&tokenizer);
+  AsyncLLM engine(input, scheduler, executor, output,
+                  get_request_block_hasher(16, sha256_cbor),
+                  /*shutdown_timeout_s=*/0, /*max_concurrent_batches=*/2);
+  PrometheusStatLogger logger("m", /*max_model_len=*/8192);
+  engine.set_stat_logger(&logger);
+
+  const std::vector<int32_t> prompt = PromptTokens(40);
+  for (const char* id : {"first", "second"}) {
+    AsyncRequest request =
+        engine.add_request(id, prompt, Params(2, RequestOutputKind::kDelta));
+    CHECK(Drain(engine, request) == 2);
+  }
+  engine.shutdown();
+
+  const std::string t = logger.Expose();
+  const std::string kLabels = "{model_name=\"m\",engine=\"0\"}";
+  auto by_source = [](const std::string& source) {
+    return "vllm:prompt_tokens_by_source_total{model_name=\"m\",engine=\"0\","
+           "source=\"" + source + "\"}";
+  };
+  CHECK(MetricValue(t, "vllm:prefix_cache_hits_total" + kLabels) == 32.0);
+  CHECK(MetricValue(t, "vllm:prompt_tokens_total" + kLabels) == 80.0);
+  CHECK(MetricValue(t, "vllm:prompt_tokens_cached_total" + kLabels) == 32.0);
+  CHECK(MetricValue(t, by_source("local_cache_hit")) == 32.0);
+  CHECK(MetricValue(t, by_source("local_compute")) == 48.0);
+  CHECK(MetricValue(t, by_source("external_kv_transfer")) == 0.0);
+  // 48 computed prompt tokens plus 2 x 2 generated.
+  CHECK(MetricValue(t, "vllm:iteration_tokens_total_sum" + kLabels) == 52.0);
+  CHECK(MetricValue(t, "vllm:request_prefill_kv_computed_tokens_sum" +
+                           kLabels) == 48.0);
+  CHECK(MetricValue(t, "vllm:request_prefill_kv_computed_tokens_count" +
+                           kLabels) == 2.0);
+}
+
+// ─── The stats of a step with no request outputs ──────────────────────────────
+// With a 16-token budget a 40-token prompt runs as 16 + 16 + 8, so the step
+// whose make_stats() publishes its prefix-cache lookup has no request outputs.
+// vLLM sends that step's stats anyway (scheduler.py:2121-2134 @ 0.28.0) and the
+// frontend records them (async_llm.py:735-741). The second prompt shares the
+// first's two full blocks and is also admitted for a partial prefill, so its
+// hit rides a stats-only step too.
+//
+// RED before: the engine core dropped those entries, and both counters read 0.
+TEST_CASE("async_llm: a step without request outputs still records its stats") {
+  InitHash();
+  Tokenizer tokenizer = BuildFixture();
+  HfConfig config = MakeConfig();
+  vllm::v1::AsyncScheduler scheduler(AsyncMetricsConfig(16),
+                                     AsyncMetricsKVConfig(), /*block_size=*/16,
+                                     /*enable_caching=*/true);
+  PrefillAwareRunnerStub runner;
+  Executor executor(runner);
+  InputProcessor input(tokenizer, config);
+  OutputProcessor output(&tokenizer);
+  AsyncLLM engine(input, scheduler, executor, output,
+                  get_request_block_hasher(16, sha256_cbor),
+                  /*shutdown_timeout_s=*/0, /*max_concurrent_batches=*/2);
+  PrometheusStatLogger logger("m", /*max_model_len=*/8192);
+  engine.set_stat_logger(&logger);
+
+  const std::vector<int32_t> first = PromptTokens(40);
+  const std::vector<int32_t> second = [&] {
+    std::vector<int32_t> ids(first.begin(), first.begin() + 32);
+    const std::vector<int32_t> tail = PromptTokens(40, /*salt=*/5);
+    ids.insert(ids.end(), tail.begin(), tail.end());
+    return ids;  // 72 tokens, the first 32 shared
+  }();
+
+  int index = 0;
+  for (const std::vector<int32_t>* prompt : {&first, &second}) {
+    AsyncRequest request =
+        engine.add_request("r" + std::to_string(index++), *prompt,
+                           Params(1, RequestOutputKind::kDelta));
+    CHECK(Drain(engine, request) == 1);
+  }
+  engine.shutdown();
+
+  const std::string t = logger.Expose();
+  const std::string kLabels = "{model_name=\"m\",engine=\"0\"}";
+  CHECK(MetricValue(t, "vllm:prefix_cache_queries_total" + kLabels) == 112.0);
+  CHECK(MetricValue(t, "vllm:prefix_cache_hits_total" + kLabels) == 32.0);
+  CHECK(MetricValue(t, "vllm:generation_tokens_total" + kLabels) == 2.0);
+  CHECK(MetricValue(t, "vllm:num_requests_running" + kLabels) == 0.0);
+}
+
+// The same two prompts through the synchronous LLMEngine, which vLLM 0.28.0
+// also records "even when this step produced no request outputs". Each
+// request's first step is a 16-token partial prefill, so its lookup rides a
+// stats-only step, and its first output carries the prefill split.
+//
+// RED before: queries and hits read 0, prompt_tokens_cached 0, and the
+// iteration-token sum counted the 32 cached tokens.
+TEST_CASE("llm_engine: stats-only steps and the prefill split are recorded") {
+  InitHash();
+  Tokenizer tokenizer = BuildFixture();
+  HfConfig config = MakeConfig();
+  SchedulerConfig cfg = AsyncMetricsConfig(16);
+  cfg.async_scheduling = false;
+  Scheduler scheduler(cfg, AsyncMetricsKVConfig(), /*block_size=*/16,
+                      /*enable_caching=*/true);
+  PrefillAwareRunnerStub runner;
+  Executor executor(runner);
+  vllm::v1::EngineCore core(scheduler, executor);
+  InputProcessor input(tokenizer, config);
+  OutputProcessor output(&tokenizer);
+  vllm::v1::LLMEngine engine(input, core, output,
+                             get_request_block_hasher(16, sha256_cbor));
+  PrometheusStatLogger logger("m", /*max_model_len=*/8192);
+  engine.set_stat_logger(&logger);
+
+  const std::vector<int32_t> first = PromptTokens(40);
+  std::vector<int32_t> second(first.begin(), first.begin() + 32);
+  const std::vector<int32_t> tail = PromptTokens(40, /*salt=*/5);
+  second.insert(second.end(), tail.begin(), tail.end());  // 72, 32 shared
+
+  engine.add_request("r0", first, Params(1, RequestOutputKind::kDelta));
+  while (engine.has_unfinished_requests()) engine.step();
+  engine.add_request("r1", second, Params(1, RequestOutputKind::kDelta));
+  while (engine.has_unfinished_requests()) engine.step();
+
+  const std::string t = logger.Expose();
+  const std::string kLabels = "{model_name=\"m\",engine=\"0\"}";
+  CHECK(MetricValue(t, "vllm:prefix_cache_queries_total" + kLabels) == 112.0);
+  CHECK(MetricValue(t, "vllm:prefix_cache_hits_total" + kLabels) == 32.0);
+  CHECK(MetricValue(t, "vllm:prompt_tokens_total" + kLabels) == 112.0);
+  CHECK(MetricValue(t, "vllm:prompt_tokens_cached_total" + kLabels) == 32.0);
+  // 40 + 40 computed prompt tokens plus 2 generated.
+  CHECK(MetricValue(t, "vllm:iteration_tokens_total_sum" + kLabels) == 82.0);
+  CHECK(MetricValue(t, "vllm:generation_tokens_total" + kLabels) == 2.0);
 }

@@ -568,17 +568,20 @@ void AsyncLLM::RunOutputHandler() {
       // EngineCore after leaving the OutputProcessor critical section.
       engine_core_.abort_requests_async(processed.reqs_to_abort);
 
-      // async_llm.py:697-702 — fold this step's SchedulerStats + IterationStats
-      // into the registry. Upstream records whenever a logger exists; every
-      // EngineCoreOutputs our proc queues came from a map entry that exists
-      // only when `outputs` is non-empty (core.cpp:91-94), so this is also the
-      // sync site's `len(outputs.outputs) > 0` guard (llm_engine.py:321-323).
+      // async_llm.py:735-741 @ 0.28.0 — fold this step's SchedulerStats +
+      // IterationStats into the registry whenever a logger exists, including
+      // a stats-only EngineCoreOutputs (a step with no request outputs, whose
+      // iteration_stats upstream is None). Skipping those lost the
+      // prefix-cache lookups they carried: under async scheduling a lookup is
+      // published by the update of the batch before it, which has no outputs
+      // when it was all partial prefills or the flush after a finish.
       //
       // Deliberately OUTSIDE output_processor_mutex_: the logger's own mutex is
       // then a leaf lock that can never take part in a cycle with the
       // output-processor lock or a collector's condition variable.
-      if (logger != nullptr && !outputs.outputs.empty()) {
-        logger->Record(outputs.scheduler_stats, iteration_stats);
+      if (logger != nullptr) {
+        logger->Record(outputs.scheduler_stats,
+                       outputs.outputs.empty() ? nullptr : &iteration_stats);
       }
     }
   } catch (...) {
