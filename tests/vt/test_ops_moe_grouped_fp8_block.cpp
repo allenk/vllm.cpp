@@ -736,6 +736,8 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 matches the W8A8 block-scaled ref
       const std::vector<double> ref = W8A8Reference(f, QuantizeActCpu(f));
       vllm_test::SetEnv(kW8A8, "1");
       const std::vector<float> got = Run(f);
+      vllm_test::SetEnv(kBM, "16");
+      const std::vector<float> got16 = Run(f);
       vllm_test::SetEnv(kBM, "32");
       const std::vector<float> got32 = Run(f);
       vllm_test::SetEnv(kBM, "64");
@@ -744,6 +746,7 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 matches the W8A8 block-scaled ref
       vllm_test::UnsetEnv(kW8A8);
       // f32: the MMA's own accumulation order and precision, as CheckAgainstReference allows
       CheckNear(got, ref, bf16_out ? 8e-3 : 1e-3);
+      CHECK(got16 == got64);
       CHECK(got32 == got64);
       CHECK(got == got64);
     }
@@ -766,6 +769,42 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu W8A8 equals the W8A8 trip
   vllm_test::UnsetEnv("VT_MOE_FP8_BLOCK_W8A8");
   size_t diff = 0;
   for (size_t i = 0; i < out.fused.size(); ++i) diff += out.fused[i] != out.triplet[i] ? 1 : 0;
+  CAPTURE(diff);
+  CHECK(diff == 0);
+}
+
+// A decode-sized step (P = 64 over 32 experts, two pairs each) stays on the W8A16 warp
+// kernels under VT_MOE_FP8_BLOCK_W8A8 alone, and VT_MOE_FP8_BLOCK_W8A8_DECODE takes it
+// onto the W8A8 tile (16 rows by default): the W8A8 reference there, and the fused
+// gate+up still the separate W8A8 GEMMs and MoeSiluMul bit for bit.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 decode switch: the warp range stays W8A16 unless asked") {
+  if (!HasFp8Mma()) {
+    MESSAGE("no sm_89+ CUDA device; skipping");
+    return;
+  }
+  constexpr const char* kW8A8 = "VT_MOE_FP8_BLOCK_W8A8";
+  constexpr const char* kDecode = "VT_MOE_FP8_BLOCK_W8A8_DECODE";
+  Case c;
+  c.e_count = 32; c.t_rows = 8; c.top_k = 8; c.k_dim = 512; c.n_cols = 256; c.seed = 1500;
+  const Fixture f = Build(c);
+  const Fixture u = BuildUp(c);
+  const std::vector<float> warp = Run(f);
+  const std::vector<uint16_t> warp_fused = RunGateUp(f, u).fused;
+  vllm_test::SetEnv(kW8A8, "1");
+  const std::vector<float> w8a8_only = Run(f);
+  const std::vector<uint16_t> w8a8_only_fused = RunGateUp(f, u).fused;
+  vllm_test::SetEnv(kDecode, "1");
+  const std::vector<float> tile = Run(f);
+  const GateUpOut tile_gu = RunGateUp(f, u);
+  vllm_test::UnsetEnv(kDecode);
+  vllm_test::UnsetEnv(kW8A8);
+  CHECK(w8a8_only == warp);
+  CHECK(w8a8_only_fused == warp_fused);
+  CheckAgainstReference(f, warp);
+  CheckNear(tile, W8A8Reference(f, QuantizeActCpu(f)), 1e-3);
+  size_t diff = 0;
+  for (size_t i = 0; i < tile_gu.fused.size(); ++i)
+    diff += tile_gu.fused[i] != tile_gu.triplet[i] ? 1 : 0;
   CAPTURE(diff);
   CHECK(diff == 0);
 }

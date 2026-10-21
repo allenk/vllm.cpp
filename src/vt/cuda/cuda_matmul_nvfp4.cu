@@ -50,9 +50,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "vt/cuda/cuda_arch_tactics.h"
 #include "vt/cuda/cuda_device_caps.h"
@@ -876,15 +878,35 @@ __global__ void MoeGroupedGemmNvfp4Wmma(Tout* out, const Tin* act, const int32_t
 // (grown on demand, kept alive) so the decode path never pays the per-call
 // cudaMallocAsync/cudaFreeAsync — at conc-8 the grouped GEMM runs ~80x/step, and
 // the stream-ordered alloc/free serialize behind the (occupancy-bound) kernel.
-// Mirrors the argmax persistent-scratch discipline (cuda_sample.cu). The model
-// forward drives ONE CUDA stream, so consecutive grouped-GEMM calls are already
-// serialized on the stream => reusing one buffer is race-free (the hist/scatter/
-// tilemap kernels rewrite it every call). cudaMalloc (not async) fires once at
-// warmup / on growth, never on the steady-state decode path.
-int32_t* g_moe_scratch = nullptr;
-size_t g_moe_scratch_cap = 0;  // capacity in int32 elements
-int32_t* EnsureMoeScratch(int64_t elems) {
-  if (static_cast<size_t>(elems) > g_moe_scratch_cap) {
+// Mirrors the argmax persistent-scratch discipline (cuda_sample.cu). One block per
+// CUDA stream: consecutive grouped-GEMM calls on a stream are serialized by it, so
+// reusing that stream's block is race-free (the hist/scatter/tilemap kernels
+// rewrite it every call), and the MoE shared expert issued on the aux stream
+// (qwen3_5.cpp MoeAuxStreamFor) never shares a live block with the routed GEMMs on
+// the main stream, as the aux pool keeps its DBufs apart (device_pool.h).
+// cudaMalloc (not async) fires once at warmup / on growth, never on the
+// steady-state decode path; the first block is at least kStreamScratchMinBytes so
+// a decode-sized step inside a CUDA-graph capture never has to grow it.
+struct StreamScratch {
+  cudaStream_t stream;
+  void* block;
+  size_t bytes;
+};
+
+constexpr size_t kStreamScratchMinBytes = size_t{8} << 20;
+
+void* EnsureStreamScratch(std::vector<StreamScratch>& table, cudaStream_t s, size_t bytes,
+                          const char* what) {
+  static std::mutex mu;
+  std::lock_guard<std::mutex> lock(mu);
+  StreamScratch* e = nullptr;
+  for (StreamScratch& t : table)
+    if (t.stream == s) e = &t;
+  if (e == nullptr) {
+    table.push_back({s, nullptr, 0});
+    e = &table.back();
+  }
+  if (bytes > e->bytes) {
     // RETIRE the old block instead of freeing it: the MoE grouped-GEMM index
     // scratch pointer is baked into the captured pure-decode CUDA graph (the
     // WMMA-scatter memset/hist/scatter/tilemap nodes). A later, larger forward
@@ -892,12 +914,29 @@ int32_t* EnsureMoeScratch(int64_t elems) {
     // concurrency > 1) grows this buffer; freeing the old block here would dangle
     // the captured graph's pointer → illegal memory access on the next replay.
     // See graph_safe_scratch.h. (Growth is O(log); retired memory is negligible.)
-    RetireGraphScratch(g_moe_scratch);
-    Check(cudaMalloc(&g_moe_scratch, static_cast<size_t>(elems) * sizeof(int32_t)),
-          "moe grouped persistent scratch");
-    g_moe_scratch_cap = static_cast<size_t>(elems);
+    RetireGraphScratch(e->block);
+    const size_t grown = std::max(bytes, kStreamScratchMinBytes);
+    Check(cudaMalloc(&e->block, grown), what);
+    e->bytes = grown;
   }
-  return g_moe_scratch;
+  return e->block;
+}
+
+size_t StreamScratchBytes(const std::vector<StreamScratch>& table, cudaStream_t s) {
+  for (const StreamScratch& t : table)
+    if (t.stream == s) return t.bytes;
+  return 0;
+}
+
+std::vector<StreamScratch>& MoeSortScratchTable() {
+  static std::vector<StreamScratch> table;
+  return table;
+}
+
+int32_t* EnsureMoeScratch(cudaStream_t s, int64_t elems) {
+  return static_cast<int32_t*>(EnsureStreamScratch(MoeSortScratchTable(), s,
+                                                   static_cast<size_t>(elems) * sizeof(int32_t),
+                                                   "moe grouped persistent scratch"));
 }
 
 // Small-M decode gate for the grouped WMMA path: at/below this many (token,expert)
@@ -923,7 +962,7 @@ void LaunchGroupedWmma(cudaStream_t s, Tensor& out, const Tensor& act, const Ten
   // Single scratch block, int32 sub-slices: count,offset,cursor [E]; sp,sr [P];
   // tile_expert,tile_row0,tile_rows [max_tiles].
   const int64_t n_i32 = 3 * e_count + 2 * p + 3 * max_tiles;
-  int32_t* scratch = EnsureMoeScratch(n_i32);
+  int32_t* scratch = EnsureMoeScratch(s, n_i32);
   int32_t* count = scratch;
   int32_t* offset = count + e_count;
   int32_t* cursor = offset + e_count;
@@ -1451,7 +1490,7 @@ void LaunchGroupedBf16Wmma(cudaStream_t s, Tensor& out, const Tensor& act,
   constexpr int kPipeBN = 128, kPipeBK = 32, kPipeStages = 3;
   const int max_tiles = static_cast<int>((p + BM - 1) / BM + e_count);
   const int64_t n_i32 = 3 * e_count + 2 * p + 3 * max_tiles;
-  int32_t* scratch = EnsureMoeScratch(n_i32);
+  int32_t* scratch = EnsureMoeScratch(s, n_i32);
   int32_t* count = scratch;
   int32_t* offset = count + e_count;
   int32_t* cursor = offset + e_count;
@@ -1847,7 +1886,7 @@ void LaunchGroupedFp8BlockWmma(cudaStream_t s, Tensor& out, const Tensor& act,
   constexpr int BN = 64, BK = 32;
   const int max_tiles = static_cast<int>((p + BM - 1) / BM + e_count);
   const int64_t n_i32 = 3 * e_count + 2 * p + 3 * max_tiles;
-  int32_t* scratch = EnsureMoeScratch(n_i32);
+  int32_t* scratch = EnsureMoeScratch(s, n_i32);
   int32_t* count = scratch;
   int32_t* offset = count + e_count;
   int32_t* cursor = offset + e_count;
@@ -2106,7 +2145,7 @@ MoeTileSort SortPairsIntoTiles(cudaStream_t s, const Tensor& expert_ids, const T
                                int64_t p, int64_t e_count, int bm) {
   const int max_tiles = static_cast<int>((p + bm - 1) / bm + e_count);
   const int64_t n_i32 = 3 * e_count + 2 * p + 3 * max_tiles;
-  int32_t* scratch = EnsureMoeScratch(n_i32);
+  int32_t* scratch = EnsureMoeScratch(s, n_i32);
   int32_t* count = scratch;
   int32_t* offset = count + e_count;
   int32_t* cursor = offset + e_count;
@@ -2150,6 +2189,12 @@ void LaunchGroupedFp8BlockPipe(cudaStream_t s, Tensor& out, const Tensor& act,
   Check(cudaGetLastError(), "moe_grouped_gemm_fp8_block kernel launch (pipe)");
 }
 
+// At or below this many (token, expert) pairs the warp kernel runs: c=8 decode is
+// P = 64, where an expert's bytes are re-read once per pair routed to it and the
+// repeats come back from L2. Above it the grouped tile reads each expert once
+// per BM rows.
+constexpr int64_t kFp8BlockWarpMaxP = 64;
+
 // ---------------------------------------------------------------------------
 // W8A8 grouped block-FP8 GEMM (VT_MOE_FP8_BLOCK_W8A8=1, sm_89+, 128x128 scale
 // blocks), the numerics vLLM 0.28.0 runs this MoE with (fused_moe with
@@ -2161,9 +2206,11 @@ void LaunchGroupedFp8BlockPipe(cudaStream_t s, Tensor& out, const Tensor& act,
 // keep the activation in bf16 and convert the weights instead; on a whole-prompt
 // prefill of Qwen3.6-35B-A3B (about 39 pairs per expert) their routed-expert GEMMs
 // ran at about 52 effective TFLOPS against about 127 for vLLM's W8A8 kernel.
-// Tile: BM rows x 128 columns, a 128-wide K-step (one scale block), STAGES-deep
-// cp.async loads, ldmatrix into m16n8k32 fragments; shared rows are padded by 16
-// bytes so the eight rows of an ldmatrix land in different banks.
+// Tile: BM (16, 32 or 64) rows x 128 columns, a 128-wide K-step (one scale block),
+// STAGES-deep cp.async loads, ldmatrix into m16n8k32 fragments; shared rows are
+// padded by 16 bytes so the eight rows of an ldmatrix land in different banks. Steps
+// of up to 64 pairs keep the W8A16 warp kernels unless VT_MOE_FP8_BLOCK_W8A8_DECODE
+// takes them onto the tile too.
 constexpr int kW8A8BN = 128, kW8A8BK = 128, kW8A8LDS = kW8A8BK + 16;
 constexpr int kW8A8Stages = 3;
 
@@ -2360,20 +2407,24 @@ bool Fp8BlockW8A8Enabled() {
   return e != nullptr && e[0] == '1';
 }
 
+// VT_MOE_FP8_BLOCK_W8A8_DECODE=1 takes decode-sized steps (up to 64 pairs, where the
+// W8A16 warp kernels run) onto the W8A8 tile as well, as vLLM's fused_moe runs its
+// one kernel at every batch size; it needs VT_MOE_FP8_BLOCK_W8A8 too.
+bool Fp8BlockW8A8DecodeEnabled() {
+  const char* e = std::getenv("VT_MOE_FP8_BLOCK_W8A8_DECODE");
+  return e != nullptr && e[0] == '1';
+}
+
 // The activation's fp8 bytes and scales, and the gate+up op's two bf16 tables, in one
-// persistent block grown like EnsureMoeScratch (retired, not freed, on growth). One
-// stream at a time, like that scratch: the block-FP8 shared expert that runs on the
-// aux stream stays at or below 64 rows (qwen3_5.cpp kSharedGroupedMaxRows), where the
-// warp kernels run and neither scratch is touched.
-uint8_t* g_moe_w8a8_scratch = nullptr;
-size_t g_moe_w8a8_scratch_cap = 0;
-uint8_t* EnsureMoeW8A8Scratch(size_t bytes) {
-  if (bytes > g_moe_w8a8_scratch_cap) {
-    RetireGraphScratch(g_moe_w8a8_scratch);
-    Check(cudaMalloc(&g_moe_w8a8_scratch, bytes), "moe w8a8 persistent scratch");
-    g_moe_w8a8_scratch_cap = bytes;
-  }
-  return g_moe_w8a8_scratch;
+// persistent block per stream, kept like the sort scratch (EnsureStreamScratch).
+std::vector<StreamScratch>& MoeW8A8ScratchTable() {
+  static std::vector<StreamScratch> table;
+  return table;
+}
+
+uint8_t* EnsureMoeW8A8Scratch(cudaStream_t s, size_t bytes) {
+  return static_cast<uint8_t*>(
+      EnsureStreamScratch(MoeW8A8ScratchTable(), s, bytes, "moe w8a8 persistent scratch"));
 }
 
 size_t AlignUp256(size_t v) { return (v + 255) & ~static_cast<size_t>(255); }
@@ -2383,20 +2434,43 @@ size_t W8A8SmemBytes() {
   return static_cast<size_t>(kW8A8Stages) * (BM + kW8A8BN) * kW8A8LDS;
 }
 
-// Whether the W8A8 path can run this call: the switch, a device with e4m3 MMAs and the
-// shared memory for the tall tile, 128 x 128 scale blocks, a bf16 activation, and no
-// scratch growth inside a CUDA-graph capture (cudaMalloc cannot run there; the call
-// keeps the W8A16 tile instead).
-bool Fp8BlockW8A8Runnable(cudaStream_t s, const Tensor& act, int64_t k, int64_t bn, int64_t bk,
-                          size_t scratch_bytes) {
+// VT_MOE_FP8_BLOCK_W8A8_BM picks the tile height (16, 32 or 64) for an A/B. By default
+// 64 once the step averages 24 or more pairs per expert, 32 from 4, and 16 below (a
+// decode step, about one pair per expert).
+int W8A8TileRows(int64_t p, int64_t e_count) {
+  const char* e = std::getenv("VT_MOE_FP8_BLOCK_W8A8_BM");
+  if (e != nullptr && (e[0] == '1' || e[0] == '3' || e[0] == '6'))
+    return e[0] == '1' ? 16 : e[0] == '3' ? 32 : 64;
+  return p >= 24 * e_count ? 64 : p >= 4 * e_count ? 32 : 16;
+}
+
+// The counting-sort scratch SortPairsIntoTiles takes for tiles of `bm` rows.
+int64_t SortScratchElems(int64_t p, int64_t e_count, int bm) {
+  const int64_t max_tiles = (p + bm - 1) / bm + e_count;
+  return 3 * e_count + 2 * p + 3 * max_tiles;
+}
+
+// Whether the W8A8 path can run this call: the switches, a device with e4m3 MMAs and
+// the shared memory for the tallest tile, 128 x 128 scale blocks and a contiguous
+// bf16 activation. Inside a CUDA-graph capture the stream's scratch blocks must
+// already be large enough, since cudaMalloc cannot run there; such a call keeps the
+// W8A16 kernels. The blocks start at kStreamScratchMinBytes, so a decode-sized step
+// after any eager step never meets that case.
+bool Fp8BlockW8A8Runnable(cudaStream_t s, const Tensor& act, int64_t p, int64_t e_count,
+                          int64_t k, int64_t bn, int64_t bk, size_t scratch_bytes) {
   if (!Fp8BlockW8A8Enabled()) return false;
+  if (p <= kFp8BlockWarpMaxP && !Fp8BlockW8A8DecodeEnabled()) return false;
   const DeviceCaps& caps = GetDeviceCaps();
   if (!caps.valid || caps.sm_arch() < 89) return false;
   if (static_cast<long long>(W8A8SmemBytes<64>()) > caps.max_shared_memory_per_block_optin)
     return false;
   if (bn != kW8A8BN || bk != kW8A8BK || k % kW8A8BK != 0) return false;
   if (act.dtype != DType::kBF16 || !act.IsContiguous()) return false;
-  if (scratch_bytes > g_moe_w8a8_scratch_cap) {
+  const size_t sort_bytes =
+      static_cast<size_t>(SortScratchElems(p, e_count, W8A8TileRows(p, e_count))) *
+      sizeof(int32_t);
+  if (scratch_bytes > StreamScratchBytes(MoeW8A8ScratchTable(), s) ||
+      sort_bytes > StreamScratchBytes(MoeSortScratchTable(), s)) {
     cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
     Check(cudaStreamIsCapturing(s, &cs), "moe w8a8 capture query");
     if (cs != cudaStreamCaptureStatusNone) return false;
@@ -2428,14 +2502,6 @@ void LaunchW8A8Tile(cudaStream_t s, const MoeTileSort& ts, Tout* out0, Tout* out
   Check(cudaGetLastError(), "moe_grouped_gemm_fp8_block kernel launch (w8a8)");
 }
 
-// VT_MOE_FP8_BLOCK_W8A8_BM picks the tile height (64 or 32) for an A/B; by default
-// 64 once the step averages 24 or more pairs per expert, 32 below.
-int W8A8TileRows(int64_t p, int64_t e_count) {
-  const char* e = std::getenv("VT_MOE_FP8_BLOCK_W8A8_BM");
-  if (e != nullptr && (e[0] == '3' || e[0] == '6')) return e[0] == '3' ? 32 : 64;
-  return p >= 24 * e_count ? 64 : 32;
-}
-
 // The W8A8 grouped GEMM: quantize every activation row per 128-wide group, sort the
 // pairs into tiles, run the tile. `act_rows` is act.shape[0] (the rows row_map
 // indexes, or P without one).
@@ -2455,20 +2521,16 @@ void RunGroupedFp8BlockW8A8(Queue& q, cudaStream_t s, uint8_t* scratch, Tout* ou
   const MoeTileSort ts = SortPairsIntoTiles(s, expert_ids, row_map, p, e_count, bm);
   if (bm == 64)
     LaunchW8A8Tile<Tout, 64, 2, 2>(s, ts, out0, out1, act_q, act_s, w0, s0, w1, s1, n, k);
-  else
+  else if (bm == 32)
     LaunchW8A8Tile<Tout, 32, 2, 4>(s, ts, out0, out1, act_q, act_s, w0, s0, w1, s1, n, k);
+  else
+    LaunchW8A8Tile<Tout, 16, 1, 4>(s, ts, out0, out1, act_q, act_s, w0, s0, w1, s1, n, k);
 }
 
 size_t W8A8ActScratchBytes(int64_t act_rows, int64_t k) {
   return AlignUp256(static_cast<size_t>(act_rows * k)) +
          AlignUp256(static_cast<size_t>(act_rows * (k / kW8A8BK)) * sizeof(float));
 }
-
-// At or below this many (token, expert) pairs the warp kernel runs: c=8 decode is
-// P = 64, where an expert's bytes are re-read once per pair routed to it and the
-// repeats come back from L2. Above it the grouped tile reads each expert once
-// per BM rows.
-constexpr int64_t kFp8BlockWarpMaxP = 64;
 
 // Above kFp8BlockWarpMaxP pairs, up to this many run the BM=16 tile and more run
 // BM=64. A hybrid prefill chunk on a cached prompt is about 1,000 pairs over 256
@@ -2544,10 +2606,10 @@ void MoeGroupedGemmFp8BlockKernelCuda(Queue& q, Tensor& out, const Tensor& act,
   if (p == 0 || n == 0) return;
   const int64_t e_count = weight_ptrs.shape[0];
   cudaStream_t s = AsStream(q);
-  if (p > kFp8BlockWarpMaxP && (out.dtype == DType::kF32 || out.dtype == DType::kBF16)) {
+  if (out.dtype == DType::kF32 || out.dtype == DType::kBF16) {
     const size_t need = W8A8ActScratchBytes(act.shape[0], k);
-    if (Fp8BlockW8A8Runnable(s, act, k, block_n, block_k, need)) {
-      uint8_t* scratch = EnsureMoeW8A8Scratch(need);
+    if (Fp8BlockW8A8Runnable(s, act, p, e_count, k, block_n, block_k, need)) {
+      uint8_t* scratch = EnsureMoeW8A8Scratch(s, need);
       if (out.dtype == DType::kF32)
         RunGroupedFp8BlockW8A8<float>(q, s, scratch, out.Ptr<float>(), nullptr, act, expert_ids,
                                       row_map, weight_ptrs.Ptr<int64_t>(),
@@ -2850,7 +2912,7 @@ void LaunchGroupedFp8BlockGateUpSiluWmma(cudaStream_t s, Tensor& out, const Tens
   constexpr int BN = 64, BK = 32;
   const int max_tiles = static_cast<int>((p + BM - 1) / BM + e_count);
   const int64_t n_i32 = 3 * e_count + 2 * p + 3 * max_tiles;
-  int32_t* scratch = EnsureMoeScratch(n_i32);
+  int32_t* scratch = EnsureMoeScratch(s, n_i32);
   int32_t* count = scratch;
   int32_t* offset = count + e_count;
   int32_t* cursor = offset + e_count;
@@ -2893,12 +2955,12 @@ void MoeGroupedGemmFp8BlockGateUpSiluCuda(Queue& q, Tensor& out, const Tensor& a
   cudaStream_t s = AsStream(q);
   // W8A8: both tables in one launch over one sort, each into a bf16 [P, N] table, then
   // MoeSiluMul -- the separate gate GEMM, up GEMM and MoeSiluMul bit for bit.
-  if (p > kFp8BlockWarpMaxP) {
+  {
     const size_t act_bytes = W8A8ActScratchBytes(act.shape[0], k);
     const size_t table_bytes = AlignUp256(static_cast<size_t>(p * n) * sizeof(__nv_bfloat16));
     const size_t need = act_bytes + 2 * table_bytes;
-    if (Fp8BlockW8A8Runnable(s, act, k, block_n, block_k, need)) {
-      uint8_t* scratch = EnsureMoeW8A8Scratch(need);
+    if (Fp8BlockW8A8Runnable(s, act, p, gate_ptrs.shape[0], k, block_n, block_k, need)) {
+      uint8_t* scratch = EnsureMoeW8A8Scratch(s, need);
       auto* gate = reinterpret_cast<__nv_bfloat16*>(scratch + act_bytes);
       auto* up = reinterpret_cast<__nv_bfloat16*>(scratch + act_bytes + table_bytes);
       RunGroupedFp8BlockW8A8<__nv_bfloat16>(
