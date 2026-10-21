@@ -2217,6 +2217,9 @@ constexpr int64_t kFp8BlockWarpMaxP = 64;
 constexpr int kW8A8BN = 128, kW8A8BK = 128, kW8A8LDS = kW8A8BK + 16;
 constexpr int kW8A8Stages = 3;
 
+// Under the kernel's own arch guard: below sm_89 nothing references these, and an
+// unreferenced function is warning 177, an error under -Werror=all-warnings.
+#if __CUDA_ARCH__ >= 890
 __device__ __forceinline__ void W8A8LdMatrixX4(uint32_t (&r)[4], const uint8_t* smem) {
   const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
@@ -2229,6 +2232,7 @@ __device__ __forceinline__ void W8A8CpAsync16(uint8_t* smem, const uint8_t* gmem
   const int bytes = valid ? 16 : 0;  // 0: zero-fill, nothing read
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(bytes));
 }
+#endif
 
 template <typename Tout, int BM, int WARPS_M, int WARPS_N, int STAGES>
 __global__ __launch_bounds__(WARPS_M * WARPS_N * 32) void MoeGroupedGemmFp8BlockW8A8Kernel(
