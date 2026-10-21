@@ -30,6 +30,9 @@
 #include "vt/dtype.h"
 #include "vt/fp8_kv.h"
 #include "vt/ops.h"
+#ifdef VLLM_CPP_CUDA
+#include "vt/cuda/cuda_device_caps.h"
+#endif
 
 namespace {
 
@@ -47,6 +50,17 @@ bool HasCuda() {
   } catch (const std::runtime_error&) {
     return false;
   }
+}
+
+// e4m3 MMAs (the W8A8 path) are sm_89+.
+bool HasFp8Mma() {
+#ifdef VLLM_CPP_CUDA
+  if (!HasCuda()) return false;
+  const vt::cuda::DeviceCaps& caps = vt::cuda::GetDeviceCaps();
+  return caps.valid && caps.sm_arch() >= 89;
+#else
+  return false;
+#endif
 }
 
 Tensor MakeTensor(void* data, DType dt, Device dev, const std::vector<int64_t>& shape) {
@@ -623,6 +637,164 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block warp layouts are bit-identical to one 
     CHECK(Run(fb) == one_bf16);
     CHECK(RunGateUp(f, u).fused == one_fused);
   }
+}
+
+// --- W8A8 (VT_MOE_FP8_BLOCK_W8A8=1) ---------------------------------------------
+// The activation rows quantized per 128-wide group by the CPU QuantFp8Group arm, which
+// the CUDA kernel the W8A8 path calls matches byte for byte
+// (test_ops_quant_fp8_group_cpu.cpp G6).
+struct QuantAct {
+  std::vector<uint8_t> q;  // [act_rows, K] e4m3
+  std::vector<float> s;    // [act_rows, K / 128]
+};
+
+QuantAct QuantizeActCpu(const Fixture& f) {
+  const Case& c = f.c;
+  QuantAct qa;
+  qa.q.resize(static_cast<size_t>(f.act_rows * c.k_dim));
+  qa.s.resize(static_cast<size_t>(f.act_rows * (c.k_dim / 128)));
+  const Device cpu{DeviceType::kCPU, 0};
+  Queue cq{cpu, nullptr};
+  Tensor x = MakeTensor(const_cast<uint16_t*>(f.act.data()), DType::kBF16, cpu,
+                        {f.act_rows, c.k_dim});
+  Tensor tq = MakeTensor(qa.q.data(), DType::kI8, cpu, {f.act_rows, c.k_dim});
+  Tensor ts = MakeTensor(qa.s.data(), DType::kF32, cpu, {f.act_rows, c.k_dim / 128});
+  vt::QuantFp8Group(cq, tq, ts, x, 128);
+  return qa;
+}
+
+// out[p, n] = sum_kb a_s[row, kb] * s_e[n / 128, kb] * sum_{k in kb} a_q[row, k] * w_e[n, k]
+// in double: what the W8A8 kernel computes, up to the f32 order of its sums.
+std::vector<double> W8A8Reference(const Fixture& f, const QuantAct& qa) {
+  const Case& c = f.c;
+  const int64_t kb = c.k_dim / 128;
+  std::vector<double> ref(static_cast<size_t>(f.P * c.n_cols), 0.0);
+  for (int64_t p = 0; p < f.P; ++p) {
+    const auto e = static_cast<size_t>(f.expert_ids[static_cast<size_t>(p)]);
+    const int64_t r = c.use_row_map ? f.row_map[static_cast<size_t>(p)] : p;
+    for (int64_t n = 0; n < c.n_cols; ++n) {
+      double acc = 0.0;
+      for (int64_t b = 0; b < kb; ++b) {
+        double part = 0.0;
+        for (int64_t k = b * 128; k < (b + 1) * 128; ++k)
+          part += static_cast<double>(vt::F8E4M3ToF32(qa.q[static_cast<size_t>(r * c.k_dim + k)])) *
+                  static_cast<double>(vt::F8E4M3ToF32(f.w[e][static_cast<size_t>(n * c.k_dim + k)]));
+        acc += part * static_cast<double>(qa.s[static_cast<size_t>(r * kb + b)]) *
+               static_cast<double>(f.s[e][static_cast<size_t>((n / c.block_n) * f.kb + b)]);
+      }
+      ref[static_cast<size_t>(p * c.n_cols + n)] = acc;
+    }
+  }
+  return ref;
+}
+
+// Element-wise |got - ref| <= rtol * (|ref| + rms(ref)).
+void CheckNear(const std::vector<float>& got, const std::vector<double>& ref, double rtol) {
+  REQUIRE(got.size() == ref.size());
+  double ss = 0.0;
+  for (double v : ref) ss += v * v;
+  const double rms = std::sqrt(ss / static_cast<double>(ref.size()));
+  size_t bad = 0, first_bad = 0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    const double err = std::fabs(static_cast<double>(got[i]) - ref[i]);
+    if (!(err <= rtol * (std::fabs(ref[i]) + rms))) {
+      if (bad == 0) first_bad = i;
+      ++bad;
+    }
+  }
+  if (bad != 0) {
+    CAPTURE(bad);
+    CAPTURE(first_bad);
+    CAPTURE(got[first_bad]);
+    CAPTURE(ref[first_bad]);
+    CAPTURE(rms);
+  }
+  CHECK(bad == 0);
+}
+
+// Above the warp range the switch runs the W8A8 tile, which must be the W8A8 reference
+// to the MMA's summation (and one bf16 rounding on a bf16 output), at both tile heights
+// and bit-identically between them. N = 192 leaves a half 128-column tile; P = 320
+// over 9 experts (about 36 rows each) picks the 64-row tile and over 16 experts (20
+// each) the 32-row one; K = 512 is four scale blocks.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 matches the W8A8 block-scaled reference") {
+  if (!HasFp8Mma()) {
+    MESSAGE("no sm_89+ CUDA device; skipping");
+    return;
+  }
+  constexpr const char* kW8A8 = "VT_MOE_FP8_BLOCK_W8A8";
+  constexpr const char* kBM = "VT_MOE_FP8_BLOCK_W8A8_BM";
+  for (const int64_t experts : {int64_t{9}, int64_t{16}}) {
+    for (const bool bf16_out : {false, true}) {
+      CAPTURE(experts);
+      CAPTURE(bf16_out);
+      Case c;
+      c.e_count = experts; c.t_rows = 40; c.top_k = 8; c.k_dim = 512; c.n_cols = 192;
+      c.bf16_out = bf16_out; c.use_row_map = !bf16_out;
+      c.seed = 1200 + static_cast<uint32_t>(experts) + (bf16_out ? 50u : 0u);
+      const Fixture f = Build(c);
+      const std::vector<double> ref = W8A8Reference(f, QuantizeActCpu(f));
+      vllm_test::SetEnv(kW8A8, "1");
+      const std::vector<float> got = Run(f);
+      vllm_test::SetEnv(kBM, "32");
+      const std::vector<float> got32 = Run(f);
+      vllm_test::SetEnv(kBM, "64");
+      const std::vector<float> got64 = Run(f);
+      vllm_test::UnsetEnv(kBM);
+      vllm_test::UnsetEnv(kW8A8);
+      // f32: the MMA's own accumulation order and precision, as CheckAgainstReference allows
+      CheckNear(got, ref, bf16_out ? 8e-3 : 1e-3);
+      CHECK(got32 == got64);
+      CHECK(got == got64);
+    }
+  }
+}
+
+// The fused W8A8 gate+up runs both tables in one launch over one sort, then MoeSiluMul:
+// the separate W8A8 gate and up GEMMs and MoeSiluMul, bit for bit.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu W8A8 equals the W8A8 triplet") {
+  if (!HasFp8Mma()) {
+    MESSAGE("no sm_89+ CUDA device; skipping");
+    return;
+  }
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_W8A8", "1");
+  Case c;
+  c.e_count = 9; c.t_rows = 40; c.top_k = 8; c.k_dim = 512; c.n_cols = 256; c.seed = 1300;
+  const Fixture g = Build(c);
+  const Fixture u = BuildUp(c);
+  const GateUpOut out = RunGateUp(g, u);
+  vllm_test::UnsetEnv("VT_MOE_FP8_BLOCK_W8A8");
+  size_t diff = 0;
+  for (size_t i = 0; i < out.fused.size(); ++i) diff += out.fused[i] != out.triplet[i] ? 1 : 0;
+  CAPTURE(diff);
+  CHECK(diff == 0);
+}
+
+// W8A8 against the exact-activation reference: what quantizing the activation to e4m3
+// (3 mantissa bits, a scale per 128 values) costs, bounded so a wrong scale or a
+// misplaced fragment cannot pass. Off, the same call is the W8A16 tile.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 stays within e4m3 activation error") {
+  if (!HasFp8Mma()) {
+    MESSAGE("no sm_89+ CUDA device; skipping");
+    return;
+  }
+  Case c;
+  c.e_count = 9; c.t_rows = 40; c.top_k = 8; c.k_dim = 512; c.n_cols = 192; c.seed = 1400;
+  const Fixture f = Build(c);
+  const std::vector<float> w8a16 = Run(f);
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_W8A8", "1");
+  const std::vector<float> w8a8 = Run(f);
+  vllm_test::UnsetEnv("VT_MOE_FP8_BLOCK_W8A8");
+  CheckAgainstReference(f, w8a16);
+  double se = 0.0, ss = 0.0;
+  for (size_t i = 0; i < w8a8.size(); ++i) {
+    se += (static_cast<double>(w8a8[i]) - f.ref[i]) * (static_cast<double>(w8a8[i]) - f.ref[i]);
+    ss += f.ref[i] * f.ref[i];
+  }
+  const double rel_rms = std::sqrt(se / ss);
+  MESSAGE("W8A8 vs exact activation: relative RMS error " << rel_rms);
+  CHECK(rel_rms > 1e-4);  // it did quantize
+  CHECK(rel_rms < 6e-2);
 }
 
 TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu is bit-reproducible run to run") {
