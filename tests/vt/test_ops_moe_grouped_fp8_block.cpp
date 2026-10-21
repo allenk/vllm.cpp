@@ -52,6 +52,14 @@ bool HasCuda() {
   }
 }
 
+// The W8A8 path is the default above the warp range on sm_89+. This file's W8A16
+// cases hold the W8A16 kernels to their own reference, so the process starts with
+// VT_MOE_FP8_BLOCK_W8A8=0; each W8A8 case sets it to 1 and back to 0.
+[[maybe_unused]] const bool kW8A16ForThisFile = [] {
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_W8A8", "0");
+  return true;
+}();
+
 // e4m3 MMAs (the W8A8 path) are sm_89+.
 bool HasFp8Mma() {
 #ifdef VLLM_CPP_CUDA
@@ -743,7 +751,7 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 matches the W8A8 block-scaled ref
       vllm_test::SetEnv(kBM, "64");
       const std::vector<float> got64 = Run(f);
       vllm_test::UnsetEnv(kBM);
-      vllm_test::UnsetEnv(kW8A8);
+      vllm_test::SetEnv(kW8A8, "0");
       // f32: the MMA's own accumulation order and precision, as CheckAgainstReference allows
       CheckNear(got, ref, bf16_out ? 8e-3 : 1e-3);
       CHECK(got16 == got64);
@@ -766,7 +774,7 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu W8A8 equals the W8A8 trip
   const Fixture g = Build(c);
   const Fixture u = BuildUp(c);
   const GateUpOut out = RunGateUp(g, u);
-  vllm_test::UnsetEnv("VT_MOE_FP8_BLOCK_W8A8");
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_W8A8", "0");
   size_t diff = 0;
   for (size_t i = 0; i < out.fused.size(); ++i) diff += out.fused[i] != out.triplet[i] ? 1 : 0;
   CAPTURE(diff);
@@ -797,7 +805,7 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 decode switch: the warp range sta
   const std::vector<float> tile = Run(f);
   const GateUpOut tile_gu = RunGateUp(f, u);
   vllm_test::UnsetEnv(kDecode);
-  vllm_test::UnsetEnv(kW8A8);
+  vllm_test::SetEnv(kW8A8, "0");
   CHECK(w8a8_only == warp);
   CHECK(w8a8_only_fused == warp_fused);
   CheckAgainstReference(f, warp);
@@ -807,6 +815,33 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 decode switch: the warp range sta
     diff += tile_gu.fused[i] != tile_gu.triplet[i] ? 1 : 0;
   CAPTURE(diff);
   CHECK(diff == 0);
+}
+
+// With the variable unset (a server's default) a step above the warp range runs the W8A8
+// tile, and a decode-sized step the W8A16 warp kernel.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 is the default above the warp range") {
+  if (!HasFp8Mma()) {
+    MESSAGE("no sm_89+ CUDA device; skipping");
+    return;
+  }
+  constexpr const char* kW8A8 = "VT_MOE_FP8_BLOCK_W8A8";
+  Case c;
+  c.e_count = 9; c.t_rows = 40; c.top_k = 8; c.k_dim = 512; c.n_cols = 192; c.seed = 1600;
+  const Fixture f = Build(c);
+  Case d;
+  d.e_count = 32; d.t_rows = 8; d.top_k = 8; d.k_dim = 512; d.n_cols = 256; d.seed = 1610;
+  const Fixture g = Build(d);
+  const std::vector<float> tile_w8a16 = Run(f);
+  const std::vector<float> warp_w8a16 = Run(g);
+  vllm_test::SetEnv(kW8A8, "1");
+  const std::vector<float> tile_w8a8 = Run(f);
+  vllm_test::UnsetEnv(kW8A8);
+  const std::vector<float> tile_default = Run(f);
+  const std::vector<float> warp_default = Run(g);
+  vllm_test::SetEnv(kW8A8, "0");
+  CHECK(tile_default == tile_w8a8);
+  CHECK(tile_default != tile_w8a16);
+  CHECK(warp_default == warp_w8a16);
 }
 
 // W8A8 against the exact-activation reference: what quantizing the activation to e4m3
@@ -823,7 +858,7 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 stays within e4m3 activation erro
   const std::vector<float> w8a16 = Run(f);
   vllm_test::SetEnv("VT_MOE_FP8_BLOCK_W8A8", "1");
   const std::vector<float> w8a8 = Run(f);
-  vllm_test::UnsetEnv("VT_MOE_FP8_BLOCK_W8A8");
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_W8A8", "0");
   CheckAgainstReference(f, w8a16);
   double se = 0.0, ss = 0.0;
   for (size_t i = 0; i < w8a8.size(); ++i) {

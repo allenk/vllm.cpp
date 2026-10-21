@@ -2196,8 +2196,8 @@ void LaunchGroupedFp8BlockPipe(cudaStream_t s, Tensor& out, const Tensor& act,
 constexpr int64_t kFp8BlockWarpMaxP = 64;
 
 // ---------------------------------------------------------------------------
-// W8A8 grouped block-FP8 GEMM (VT_MOE_FP8_BLOCK_W8A8=1, sm_89+, 128x128 scale
-// blocks), the numerics vLLM 0.28.0 runs this MoE with (fused_moe with
+// W8A8 grouped block-FP8 GEMM (default on, VT_MOE_FP8_BLOCK_W8A8=0 off; sm_89+,
+// 128x128 scale blocks), the numerics vLLM 0.28.0 runs this MoE with (fused_moe with
 // use_fp8_w8a8 and block_shape [128, 128]) and the checkpoints declare
 // (activation_scheme "dynamic"): each activation row is quantized per 128-wide
 // group by vt::QuantFp8Group (upstream's per_token_group_quant, byte for byte),
@@ -2210,7 +2210,10 @@ constexpr int64_t kFp8BlockWarpMaxP = 64;
 // STAGES-deep cp.async loads, ldmatrix into m16n8k32 fragments; shared rows are
 // padded by 16 bytes so the eight rows of an ldmatrix land in different banks. Steps
 // of up to 64 pairs keep the W8A16 warp kernels unless VT_MOE_FP8_BLOCK_W8A8_DECODE
-// takes them onto the tile too.
+// takes them onto the tile too; it stays off, since at about one pair per expert the
+// tile's extra launches cost more than its MMAs save (c=1 decode 240 -> 146 tok/s on
+// Qwen3.6-35B-A3B). Below sm_89 every step keeps the W8A16 kernels, which is also
+// how vLLM serves FP8 there (Marlin, weight-only).
 constexpr int kW8A8BN = 128, kW8A8BK = 128, kW8A8LDS = kW8A8BK + 16;
 constexpr int kW8A8Stages = 3;
 
@@ -2402,14 +2405,18 @@ __global__ __launch_bounds__(WARPS_M * WARPS_N * 32) void MoeGroupedGemmFp8Block
 #endif
 }
 
+// DEFAULT ON. VT_MOE_FP8_BLOCK_W8A8=0 keeps every step on the W8A16 kernels, the
+// numerics of 0.0.4-vk.2 and earlier, for a same-binary A/B. Read per call so a test
+// can flip it in-process.
 bool Fp8BlockW8A8Enabled() {
   const char* e = std::getenv("VT_MOE_FP8_BLOCK_W8A8");
-  return e != nullptr && e[0] == '1';
+  return !(e != nullptr && e[0] == '0');
 }
 
 // VT_MOE_FP8_BLOCK_W8A8_DECODE=1 takes decode-sized steps (up to 64 pairs, where the
 // W8A16 warp kernels run) onto the W8A8 tile as well, as vLLM's fused_moe runs its
-// one kernel at every batch size; it needs VT_MOE_FP8_BLOCK_W8A8 too.
+// one kernel at every batch size; off by default (see the section comment above),
+// and VT_MOE_FP8_BLOCK_W8A8=0 turns it off with the rest of the W8A8 path.
 bool Fp8BlockW8A8DecodeEnabled() {
   const char* e = std::getenv("VT_MOE_FP8_BLOCK_W8A8_DECODE");
   return e != nullptr && e[0] == '1';
