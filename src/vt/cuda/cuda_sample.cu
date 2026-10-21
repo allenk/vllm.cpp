@@ -433,21 +433,20 @@ __device__ inline int BlockRedSumI(int v, int* s) {
   return r;
 }
 
-__global__ void ApplyTopKTopPRowKernel(float* logits, const int32_t* k_arr, const float* p_arr,
-                                       int64_t v) {
-  const int64_t row = blockIdx.x;
-  float* r = logits + row * v;
+// The two thresholds a row is masked with -- keep r >= thr_k, then keep
+// exp(r - mx) > low (low < 0 keeps every top-k survivor) -- and the row max. One
+// block per row. ApplyTopKTopPRowKernel masks with them; the fused sampler below
+// computes them for the rows its candidates cannot decide.
+struct TopKTopPThresholds {
+  float thr_k;
+  float low;
+  float mx;
+};
+
+__device__ TopKTopPThresholds RowTopKTopPThresholds(const float* r, int64_t v, bool has_k,
+                                                    int32_t k, bool has_p, float p, float* red,
+                                                    int* redi, float* sh_thr_k, float* sh_low) {
   const int t = threadIdx.x;
-
-  __shared__ float red[kBlock];
-  __shared__ int redi[kBlock];
-  __shared__ float sh_thr_k;
-  __shared__ float sh_low;
-
-  const bool has_k = (k_arr != nullptr);
-  const bool has_p = (p_arr != nullptr);
-  const int32_t k = has_k ? k_arr[row] : 0;
-  const float p = has_p ? p_arr[row] : 1.0f;
 
   // Row max (softmax reference) and min over FINITE logits (the top-k search
   // lower bracket must be finite — upstream masks (min_p / bad_words / allowed
@@ -507,9 +506,9 @@ __global__ void ApplyTopKTopPRowKernel(float* logits, const int32_t* k_arr, cons
       thr_k = min_gt_low;
     }
   }
-  if (t == 0) sh_thr_k = thr_k;
+  if (t == 0) *sh_thr_k = thr_k;
   __syncthreads();
-  thr_k = sh_thr_k;
+  thr_k = *sh_thr_k;
   // survivor(j) := r[j] >= thr_k
 
   // ---- top-p over survivors: keep {survivor && e_j > low}, e_j = exp(r-mx) ----
@@ -552,14 +551,34 @@ __global__ void ApplyTopKTopPRowKernel(float* logits, const int32_t* k_arr, cons
     }
     low = lo;
   }
-  if (t == 0) sh_low = low;
+  if (t == 0) *sh_low = low;
   __syncthreads();
-  low = sh_low;
+  low = *sh_low;
+  return {thr_k, low, mx};
+}
+
+__global__ void ApplyTopKTopPRowKernel(float* logits, const int32_t* k_arr, const float* p_arr,
+                                       int64_t v) {
+  const int64_t row = blockIdx.x;
+  float* r = logits + row * v;
+  const int t = threadIdx.x;
+
+  __shared__ float red[kBlock];
+  __shared__ int redi[kBlock];
+  __shared__ float sh_thr_k;
+  __shared__ float sh_low;
+
+  const bool has_k = (k_arr != nullptr);
+  const bool has_p = (p_arr != nullptr);
+  const int32_t k = has_k ? k_arr[row] : 0;
+  const float p = has_p ? p_arr[row] : 1.0f;
+  const TopKTopPThresholds th =
+      RowTopKTopPThresholds(r, v, has_k, k, has_p, p, red, redi, &sh_thr_k, &sh_low);
 
   // ---- final in-place mask ----
   for (int64_t j = t; j < v; j += kBlock) {
     const float x = r[j];
-    const bool keep = (x >= thr_k) && (low < 0.0f || expf(x - mx) > low);
+    const bool keep = (x >= th.thr_k) && (th.low < 0.0f || expf(x - th.mx) > th.low);
     if (!keep) r[j] = kNegInf;
   }
 }
@@ -573,6 +592,508 @@ void ApplyTopKTopPCuda(Queue& q, Tensor& logits, const Tensor* k, const Tensor* 
       logits.Ptr<float>(), k != nullptr ? k->Ptr<int32_t>() : nullptr,
       p != nullptr ? p->Ptr<float>() : nullptr, v);
   Check(cudaGetLastError(), "top_k_top_p launch");
+}
+
+// --- top_k_top_p_sample: ApplyTopKTopP + ComputeProbs + RandomSample in one ---
+// Those three ops each walk the whole vocabulary with one block per row, so a
+// decode step of n rows runs on n SMs. On Qwen3.6-35B-A3B (248,320 logits) that
+// was 1.2 ms per step, against 0.15 ms for the FlashInfer kernels vLLM 0.28.0
+// samples with. With top-k on every row (1 <= k <= kFusedMaxK) the kept set is
+// the k-th largest logit plus ties, so:
+//   1. FusedTopKCandidatesKernel, grid (chunks, rows): each block radix-selects
+//      its chunk's k-th largest logit and writes every logit above it, then the
+//      ties at it while kFusedCap lasts. Every row survivor is among them.
+//   2. FusedTopKTopPSampleKernel, one block per row: the exact k-th largest of
+//      the candidates, then top-p, the softmax and the Gumbel draw over the
+//      survivors only.
+// Step 2 computes the same floats as the three ops: a survivor j is summed by
+// thread j % kBlock in increasing j, as ApplyTopKTopPRowKernel and SoftmaxKernel
+// sum it, and the per-thread sums go through the same tree, so the drawn token
+// is the token they draw. A masked token's probability is 0, so its Gumbel score
+// is 0 and the draw is decided by the survivors. The k-th largest is exact where
+// ApplyTopKTopPRowKernel's bracket search is exact (it converges, <= 17
+// iterations observed against a cap of 64). A row the candidates cannot decide
+// (a chunk dropped ties at or above the threshold, fewer than k finite logits,
+// a NaN, too many survivors) runs the three ops' arithmetic on its full row in
+// the same block. The logits are read, not masked.
+constexpr int kFusedChunk = 4096;
+constexpr int kFusedPerThread = kFusedChunk / kBlock;
+constexpr int kFusedMaxK = kTopKTopPSampleMaxK;
+constexpr int kFusedCap = 128;  // > kFusedMaxK: the logits above the threshold always fit
+constexpr int kFusedMaxSurvivors = 512;
+constexpr int kFusedMaxPerThread = 8;
+constexpr int kFusedMaxChunks = 256;
+static_assert(kFusedCap > kFusedMaxK, "a chunk must fit its k - 1 logits above the threshold");
+static_assert(static_cast<int64_t>(kFusedMaxChunks) * kFusedChunk >= kTopKTopPSampleMaxVocab,
+              "the finish kernel keeps one written count per chunk in shared memory");
+
+// Flags of a chunk's candidate list.
+constexpr int kFusedTiesDropped = 1;
+constexpr int kFusedNaN = 2;
+constexpr int kFusedBadK = 4;
+
+struct FusedChunkMeta {
+  int written;  // candidates written, <= kFusedCap
+  int finite;   // logits other than -inf (NaN counts, and also sets kFusedNaN)
+  float thr;    // the chunk's k-th largest logit
+  int flags;
+};
+
+// Order-preserving map of a float to an unsigned key. -0 maps to +0's key, so a
+// tie the way `>=` sees it is a tie in the key order too.
+__device__ inline uint32_t FusedKey(float x) {
+  const uint32_t b = __float_as_uint(x == 0.0f ? 0.0f : x);
+  return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+__device__ inline float FusedKeyValue(uint32_t key) {
+  return __uint_as_float((key & 0x80000000u) ? (key & 0x7fffffffu) : ~key);
+}
+
+__device__ inline int WarpSumI(int v) {
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  return v;
+}
+
+// One radix-select step, run by warp 0 after `hist` holds the 8-bit digit at
+// `shift` of every key that matches the prefix fixed so far: find the digit
+// holding the *sh_krem-th largest key, fix it into *sh_prefix and leave in
+// *sh_krem the rank still wanted inside that digit. Lane l owns digits
+// 255 - 8l down to 248 - 8l.
+__device__ void RadixPickDigit(const int* hist, int shift, uint32_t* sh_prefix, int* sh_krem) {
+  const int lane = threadIdx.x;
+  int bins[8];
+  int sum = 0;
+  for (int i = 0; i < 8; ++i) {
+    bins[i] = hist[255 - lane * 8 - i];
+    sum += bins[i];
+  }
+  int incl = sum;
+  for (int o = 1; o < 32; o <<= 1) {
+    const int y = __shfl_up_sync(0xffffffffu, incl, o);
+    if (lane >= o) incl += y;
+  }
+  const int krem = *sh_krem;
+  __syncwarp();
+  const int excl = incl - sum;
+  if (excl < krem && krem <= incl) {
+    int before = excl;
+    for (int i = 0; i < 8; ++i) {
+      if (krem <= before + bins[i]) {
+        *sh_prefix |= static_cast<uint32_t>(255 - lane * 8 - i) << shift;
+        *sh_krem = krem - before;
+        break;
+      }
+      before += bins[i];
+    }
+  }
+}
+
+// Exclusive block scan of one int per thread; *total gets the block sum.
+__device__ int BlockExclusiveScanI(int v, int* warp_tot, int* total) {
+  const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+  int incl = v;
+  for (int o = 1; o < 32; o <<= 1) {
+    const int y = __shfl_up_sync(0xffffffffu, incl, o);
+    if (lane >= o) incl += y;
+  }
+  if (lane == 31) warp_tot[warp] = incl;
+  __syncthreads();
+  int before = 0, all = 0;
+  for (int w = 0; w < kBlock / 32; ++w) {
+    if (w < warp) before += warp_tot[w];
+    all += warp_tot[w];
+  }
+  __syncthreads();
+  *total = all;
+  return before + incl - v;
+}
+
+__global__ void FusedTopKCandidatesKernel(const float* logits, const int32_t* k_arr,
+                                          float* cand_val, int32_t* cand_idx,
+                                          FusedChunkMeta* meta, int chunks, int64_t v) {
+  const int c = blockIdx.x;
+  const int64_t row = blockIdx.y;
+  const int t = threadIdx.x;
+  const int32_t k = k_arr[row];
+  const float* r = logits + row * v;
+  const int64_t base = static_cast<int64_t>(c) * kFusedChunk;
+  const int64_t slot = row * chunks + c;
+
+  __shared__ int hist[256];
+  __shared__ uint32_t sh_prefix;
+  __shared__ int sh_krem;
+  __shared__ int sh_count[3];  // valid, finite, NaN
+  __shared__ int warp_tot[kBlock / 32];
+
+  if (k < 1 || k > kFusedMaxK) {
+    if (t == 0) meta[slot] = FusedChunkMeta{0, 0, kNegInf, kFusedBadK};
+    return;
+  }
+
+  // Element e of this thread is j = base + e * kBlock + t: coalesced loads, and
+  // the valid ones are e < n_valid.
+  float vals[kFusedPerThread];
+  uint32_t keys[kFusedPerThread];
+  int n_valid = 0, n_finite = 0, n_nan = 0;
+  for (int e = 0; e < kFusedPerThread; ++e) {
+    const int64_t j = base + static_cast<int64_t>(e) * kBlock + t;
+    if (j < v) {
+      const float x = r[j];
+      vals[e] = x;
+      keys[e] = FusedKey(x);
+      ++n_valid;
+      if (x != kNegInf) ++n_finite;
+      if (x != x) ++n_nan;
+    }
+  }
+  if (t < 3) sh_count[t] = 0;
+  __syncthreads();
+  const int wv = WarpSumI(n_valid), wf = WarpSumI(n_finite), wn = WarpSumI(n_nan);
+  if ((t & 31) == 0) {
+    atomicAdd(&sh_count[0], wv);
+    atomicAdd(&sh_count[1], wf);
+    atomicAdd(&sh_count[2], wn);
+  }
+  __syncthreads();
+  const int total = sh_count[0];
+
+  // The chunk's k-th largest key; with fewer than k logits every logit is a
+  // candidate (key 0 is below every float's key).
+  uint32_t thr = 0u;
+  if (total >= k) {
+    if (t == 0) {
+      sh_prefix = 0u;
+      sh_krem = k;
+    }
+    uint32_t mask = 0u;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+      for (int i = t; i < 256; i += kBlock) hist[i] = 0;
+      __syncthreads();
+      const uint32_t prefix = sh_prefix;
+      for (int e = 0; e < n_valid; ++e)
+        if ((keys[e] & mask) == prefix) atomicAdd(&hist[(keys[e] >> shift) & 255u], 1);
+      __syncthreads();
+      if (t < 32) RadixPickDigit(hist, shift, &sh_prefix, &sh_krem);
+      __syncthreads();
+      mask |= 0xffu << shift;
+    }
+    thr = sh_prefix;
+  }
+
+  // Fewer than k keys lie above the threshold, so they always fit; the ties at
+  // it are written while the list has room.
+  int n_gt = 0, n_eq = 0;
+  for (int e = 0; e < n_valid; ++e) {
+    if (keys[e] > thr) {
+      ++n_gt;
+    } else if (keys[e] == thr) {
+      ++n_eq;
+    }
+  }
+  int tot_gt = 0, tot_eq = 0;
+  int pg = BlockExclusiveScanI(n_gt, warp_tot, &tot_gt);
+  int pe = tot_gt + BlockExclusiveScanI(n_eq, warp_tot, &tot_eq);
+  float* cv = cand_val + slot * kFusedCap;
+  int32_t* ci = cand_idx + slot * kFusedCap;
+  for (int e = 0; e < n_valid; ++e) {
+    const int32_t j = static_cast<int32_t>(base + static_cast<int64_t>(e) * kBlock + t);
+    if (keys[e] > thr) {
+      cv[pg] = vals[e];
+      ci[pg] = j;
+      ++pg;
+    } else if (keys[e] == thr) {
+      if (pe < kFusedCap) {
+        cv[pe] = vals[e];
+        ci[pe] = j;
+      }
+      ++pe;
+    }
+  }
+  if (t == 0) {
+    const int all = tot_gt + tot_eq;
+    meta[slot] = FusedChunkMeta{all < kFusedCap ? all : kFusedCap, sh_count[1],
+                                total >= k ? FusedKeyValue(thr) : kNegInf,
+                                (all > kFusedCap ? kFusedTiesDropped : 0) |
+                                    (sh_count[2] > 0 ? kFusedNaN : 0)};
+  }
+}
+
+// The three ops' arithmetic on one full row: ApplyTopKTopPRowKernel's
+// thresholds, SoftmaxKernel's max and sum over the masked row, and
+// RandomSample's argmax of the Gumbel scores. A row with finite logits keeps its
+// max, so every masked token's score is 0 and only the kept tokens are scored;
+// any other row scores every token, as RandomSample does.
+__device__ void FusedFullRowSample(int64_t* out, const float* r, int64_t v, int64_t row,
+                                   int32_t k, bool has_p, float p, uint64_t seed, float* red,
+                                   int* redi, int64_t* si, float* sh_thr_k, float* sh_low,
+                                   bool row_has_nan) {
+  const int t = threadIdx.x;
+  const TopKTopPThresholds th =
+      RowTopKTopPThresholds(r, v, /*has_k=*/true, k, has_p, p, red, redi, sh_thr_k, sh_low);
+  float m = kNegInf;
+  for (int64_t j = t; j < v; j += kBlock) {
+    const float x = r[j];
+    const bool keep = (x >= th.thr_k) && (th.low < 0.0f || expf(x - th.mx) > th.low);
+    m = fmaxf(m, keep ? x : kNegInf);
+  }
+  const float mm = BlockRedMaxF(m, red);
+  float acc = 0.0f;
+  for (int64_t j = t; j < v; j += kBlock) {
+    const float x = r[j];
+    const bool keep = (x >= th.thr_k) && (th.low < 0.0f || expf(x - th.mx) > th.low);
+    acc += expf((keep ? x : kNegInf) - mm);
+  }
+  const float sum = BlockRedSumF(acc, red);
+  const bool kept_only = !row_has_nan && isfinite(mm) && isfinite(sum) && sum > 0.0f;
+  float bv = kNegInf;
+  int64_t bi = kArgSentinel;
+  for (int64_t j = t; j < v; j += kBlock) {
+    const float x = r[j];
+    const bool keep = (x >= th.thr_k) && (th.low < 0.0f || expf(x - th.mx) > th.low);
+    if (kept_only && !keep) continue;
+    ArgReduce(bv, bi, GumbelScore(expf((keep ? x : kNegInf) - mm) / sum, seed, row, j), j);
+  }
+  red[t] = bv;
+  si[t] = bi;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s >>= 1) {
+    if (t < s) ArgReduce(red[t], si[t], red[t + s], si[t + s]);
+    __syncthreads();
+  }
+  if (t == 0) out[row] = (si[0] == kArgSentinel) ? 0 : si[0];
+}
+
+__global__ void FusedTopKTopPSampleKernel(int64_t* out, const float* logits, const int32_t* k_arr,
+                                          const float* p_arr, const int64_t* seeds,
+                                          const float* cand_val, const int32_t* cand_idx,
+                                          const FusedChunkMeta* meta, int chunks, int64_t v) {
+  const int64_t row = blockIdx.x;
+  const int t = threadIdx.x;
+  const int32_t k = k_arr[row];
+  const bool has_p = (p_arr != nullptr);
+  const float p = has_p ? p_arr[row] : 1.0f;
+  const uint64_t seed = static_cast<uint64_t>(seeds[row]);
+  const float* r = logits + row * v;
+  const FusedChunkMeta* m = meta + row * chunks;
+  const float* cv = cand_val + row * chunks * kFusedCap;
+  const int32_t* ci = cand_idx + row * chunks * kFusedCap;
+
+  __shared__ float red[kBlock];
+  __shared__ int redi[kBlock];
+  __shared__ int64_t si[kBlock];
+  __shared__ int hist[256];
+  __shared__ uint32_t sh_prefix;
+  __shared__ int sh_krem;
+  __shared__ int sh_nsurv;
+  __shared__ float sh_thr_k, sh_low;
+  __shared__ float surv_val[kFusedMaxSurvivors];
+  __shared__ int32_t surv_idx[kFusedMaxSurvivors];
+  __shared__ float sorted_val[kFusedMaxSurvivors];
+  __shared__ int32_t sorted_idx[kFusedMaxSurvivors];
+  __shared__ int written[kFusedMaxChunks];
+
+  int fin = 0, flags = 0;
+  for (int c = t; c < chunks; c += kBlock) {
+    fin += m[c].finite;
+    flags |= m[c].flags;
+    written[c] = m[c].written;
+  }
+  const int total_finite = BlockRedSumI(fin, redi);
+  const bool row_has_nan = BlockRedSumI(flags & kFusedNaN, redi) != 0;
+  const bool bad_k = BlockRedSumI(flags & kFusedBadK, redi) != 0;
+  if (bad_k || row_has_nan || static_cast<int64_t>(k) >= v || total_finite < k) {
+    FusedFullRowSample(out, r, v, row, k, has_p, p, seed, red, redi, si, &sh_thr_k, &sh_low,
+                       row_has_nan);
+    return;
+  }
+
+  // The exact k-th largest logit of the row: the candidates hold every chunk's
+  // top k, ties at a chunk's threshold aside.
+  if (t == 0) {
+    sh_prefix = 0u;
+    sh_krem = k;
+  }
+  // Every block thread walks the flat (chunk, slot) space; slot i of chunk c
+  // holds a candidate when i < written[c].
+  const int span = chunks * kFusedCap;
+  uint32_t mask = 0u;
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    for (int i = t; i < 256; i += kBlock) hist[i] = 0;
+    __syncthreads();
+    const uint32_t prefix = sh_prefix;
+    for (int f = t; f < span; f += kBlock) {
+      if (f % kFusedCap >= written[f / kFusedCap]) continue;
+      const uint32_t key = FusedKey(cv[f]);
+      if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 255u], 1);
+    }
+    __syncthreads();
+    if (t < 32) RadixPickDigit(hist, shift, &sh_prefix, &sh_krem);
+    __syncthreads();
+    mask |= 0xffu << shift;
+  }
+  const float thr_k = FusedKeyValue(sh_prefix);
+
+  // A chunk that dropped ties at or above thr_k may hide survivors.
+  int dropped = 0;
+  for (int c = t; c < chunks; c += kBlock)
+    if ((m[c].flags & kFusedTiesDropped) && m[c].thr >= thr_k) dropped = 1;
+  if (t == 0) sh_nsurv = 0;
+  __syncthreads();
+  for (int f = t; f < span; f += kBlock) {
+    if (f % kFusedCap >= written[f / kFusedCap]) continue;
+    const float x = cv[f];
+    if (x >= thr_k) {
+      const int pos = atomicAdd(&sh_nsurv, 1);
+      if (pos < kFusedMaxSurvivors) {
+        surv_val[pos] = x;
+        surv_idx[pos] = ci[f];
+      }
+    }
+  }
+  const bool undecided = BlockRedSumI(dropped, redi) != 0;
+  const int ns = sh_nsurv;
+  if (undecided || ns > kFusedMaxSurvivors) {
+    FusedFullRowSample(out, r, v, row, k, has_p, p, seed, red, redi, si, &sh_thr_k, &sh_low,
+                       false);
+    return;
+  }
+
+  // Survivors in increasing j, then the ones the unfused kernels give this
+  // thread (j % kBlock), still in increasing j.
+  for (int s = t; s < ns; s += kBlock) {
+    const int32_t j = surv_idx[s];
+    int rank = 0;
+    for (int u = 0; u < ns; ++u) rank += (surv_idx[u] < j) ? 1 : 0;
+    sorted_val[rank] = surv_val[s];
+    sorted_idx[rank] = j;
+  }
+  __syncthreads();
+  float own_x[kFusedMaxPerThread];
+  int32_t own_j[kFusedMaxPerThread];
+  int own = 0;
+  for (int s = 0; s < ns; ++s) {
+    if ((sorted_idx[s] & (kBlock - 1)) == t) {
+      if (own < kFusedMaxPerThread) {
+        own_x[own] = sorted_val[s];
+        own_j[own] = sorted_idx[s];
+      }
+      ++own;
+    }
+  }
+  if (BlockRedSumI(own > kFusedMaxPerThread ? 1 : 0, redi) != 0) {
+    FusedFullRowSample(out, r, v, row, k, has_p, p, seed, red, redi, si, &sh_thr_k, &sh_low,
+                       false);
+    return;
+  }
+
+  // The row max is the largest survivor.
+  float lmx = kNegInf;
+  for (int e = 0; e < own; ++e) lmx = fmaxf(lmx, own_x[e]);
+  const float mx = BlockRedMaxF(lmx, red);
+  if (!isfinite(mx)) {
+    FusedFullRowSample(out, r, v, row, k, has_p, p, seed, red, redi, si, &sh_thr_k, &sh_low,
+                       false);
+    return;
+  }
+
+  // Top-p over the survivors: RowTopKTopPThresholds' loop, where each thread's
+  // sums run over its survivors only (it skips the other tokens).
+  float low = -1.0f;
+  if (has_p && p < 1.0f) {
+    float lden = 0.0f;
+    for (int e = 0; e < own; ++e) lden += expf(own_x[e] - mx);
+    const float denom = BlockRedSumF(lden, red);
+    const float target = p * denom;
+    float lo = 0.0f, hi = 1.0f, min_gt_low = 1.0f, max_le_high = 0.0f;
+    for (int iter = 0; denom > 0.0f && iter < kThreshMaxIter; ++iter) {
+      const float p0 = (2.0f * lo + hi) / 3.0f;
+      const float p1 = (lo + 2.0f * hi) / 3.0f;
+      float la0 = 0.0f, la1 = 0.0f, lmglow = hi, lmleh = lo;
+      for (int e = 0; e < own; ++e) {
+        const float ev = expf(own_x[e] - mx);
+        if (ev > p0) la0 += ev;
+        if (ev > p1) la1 += ev;
+        if (ev > lo) lmglow = fminf(lmglow, ev);
+        if (ev <= hi) lmleh = fmaxf(lmleh, ev);
+      }
+      const float a0 = BlockRedSumF(la0, red);
+      const float a1 = BlockRedSumF(la1, red);
+      min_gt_low = BlockRedMinF(lmglow, red);
+      max_le_high = BlockRedMaxF(lmleh, red);
+      if (a1 >= target) {
+        lo = p1;
+      } else if (a0 >= target) {
+        lo = p0;
+        hi = fminf(p1, max_le_high);
+      } else {
+        hi = fminf(p0, max_le_high);
+      }
+      if (min_gt_low == max_le_high) break;
+    }
+    low = lo;
+  }
+
+  // SoftmaxKernel's sum over the masked row (a masked token adds exp(-inf) = 0),
+  // then RandomSample's argmax of probs / Exp(1) over the kept tokens.
+  bool keep[kFusedMaxPerThread];
+  float acc = 0.0f;
+  for (int e = 0; e < own; ++e) {
+    keep[e] = (low < 0.0f || expf(own_x[e] - mx) > low);
+    if (keep[e]) acc += expf(own_x[e] - mx);
+  }
+  const float sum = BlockRedSumF(acc, red);
+  float bv = kNegInf;
+  int64_t bi = kArgSentinel;
+  for (int e = 0; e < own; ++e)
+    if (keep[e]) ArgReduce(bv, bi, GumbelScore(expf(own_x[e] - mx) / sum, seed, row, own_j[e]),
+                           own_j[e]);
+  red[t] = bv;
+  si[t] = bi;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s >>= 1) {
+    if (t < s) ArgReduce(red[t], si[t], red[t + s], si[t + s]);
+    __syncthreads();
+  }
+  if (t == 0) out[row] = (si[0] == kArgSentinel) ? 0 : si[0];
+}
+
+// Candidate lists, grown on demand and kept (n * chunks * kFusedCap entries:
+// about 3.9 MiB at 8 rows of a 248,320 vocab).
+struct FusedSampleScratch {
+  float* val = nullptr;
+  int32_t* idx = nullptr;
+  FusedChunkMeta* meta = nullptr;
+  size_t slots = 0;  // (row, chunk) pairs
+};
+FusedSampleScratch g_fused_scratch;
+
+void TopKTopPSampleCuda(Queue& q, Tensor& token_ids, const Tensor& logits, const Tensor& k,
+                        const Tensor* p, const Tensor& seeds) {
+  const int64_t n = logits.shape[0], v = logits.shape[1];
+  if (n == 0 || v == 0) return;
+  const int chunks = static_cast<int>((v + kFusedChunk - 1) / kFusedChunk);
+  const size_t slots = static_cast<size_t>(n) * static_cast<size_t>(chunks);
+  FusedSampleScratch& s = g_fused_scratch;
+  if (slots > s.slots) {
+    if (s.val) cudaFree(s.val);
+    if (s.idx) cudaFree(s.idx);
+    if (s.meta) cudaFree(s.meta);
+    Check(cudaMalloc(&s.val, slots * kFusedCap * sizeof(float)), "top_k_top_p_sample scratch val");
+    Check(cudaMalloc(&s.idx, slots * kFusedCap * sizeof(int32_t)),
+          "top_k_top_p_sample scratch idx");
+    Check(cudaMalloc(&s.meta, slots * sizeof(FusedChunkMeta)), "top_k_top_p_sample scratch meta");
+    s.slots = slots;
+  }
+  cudaStream_t st = AsStream(q);
+  FusedTopKCandidatesKernel<<<dim3(static_cast<unsigned>(chunks), static_cast<unsigned>(n)), kBlock,
+                              0, st>>>(logits.Ptr<float>(), k.Ptr<int32_t>(), s.val, s.idx,
+                                       s.meta, chunks, v);
+  FusedTopKTopPSampleKernel<<<static_cast<unsigned>(n), kBlock, 0, st>>>(
+      token_ids.Ptr<int64_t>(), logits.Ptr<float>(), k.Ptr<int32_t>(),
+      p != nullptr ? p->Ptr<float>() : nullptr, seeds.Ptr<int64_t>(), s.val, s.idx, s.meta,
+      chunks, v);
+  Check(cudaGetLastError(), "top_k_top_p_sample launch");
 }
 
 // --- top-k that EMITS the surviving (id, value) pairs -----------------------
@@ -1015,6 +1536,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<ComputeLogprobsFn>(&ComputeLogprobsCuda)));
     RegisterOp(OpId::kRandomSample, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RandomSampleFn>(&RandomSampleCuda)));
+    RegisterOp(OpId::kTopKTopPSample, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<TopKTopPSampleFn>(&TopKTopPSampleCuda)));
     RegisterOp(OpId::kGreedyRejectionSample, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<GreedyRejectionSampleFn>(&GreedyRejectionSampleCuda)));

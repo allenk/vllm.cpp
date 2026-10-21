@@ -933,6 +933,11 @@ enum class OpId : uint8_t {
   // fused (MatmulFp8BlockScaledGemv). Appended before kCount so no existing op's
   // id shifts.
   kMatmulFp8BlockScaledGemv,
+  // ApplyTopKTopP + ComputeProbs + RandomSample in one op, for rows that all
+  // carry a top-k (vt::TopKTopPSample). CUDA only; the Sampler falls back to the
+  // three ops where it is not registered. Appended before kCount so no existing
+  // op's id shifts.
+  kTopKTopPSample,
   kCount
 };
 
@@ -2785,6 +2790,8 @@ using ApplyTopKTopPFn = void (*)(Queue&, Tensor&, const Tensor*, const Tensor*);
 using ComputeProbsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using ComputeLogprobsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using RandomSampleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+using TopKTopPSampleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*,
+                                  const Tensor&);
 // --- Greedy spec-decode rejection sampling (SPEC-REJECTION I3).
 using GreedyRejectionSampleFn = void (*)(Queue&, Tensor&, Tensor&, Tensor&, const Tensor&,
                                          const Tensor&, const Tensor&);
@@ -3501,10 +3508,10 @@ void MoeGroupedGemmFp8Block(Queue& q, Tensor& out, const Tensor& act, const Tens
 //   out[p, n] = silu(bf16(gate[p, n])) * bf16(up[p, n])      (bf16 out)
 // where gate and up are MoeGroupedGemmFp8Block's sums over gate_ptrs /
 // gate_scale_ptrs and up_ptrs / up_scale_ptrs. Bit-identical to those two
-// grouped GEMMs into bf16 followed by MoeSiluMul; one launch reads both weights
-// against one activation load. Built for decode-sized P: any P is correct, but
-// every pair re-reads its expert's bytes, so large P belongs to
-// MoeGroupedGemmFp8Block's grouped tile. Registered on kCUDA.
+// grouped GEMMs into bf16 followed by MoeSiluMul at every P: up to 64 pairs one
+// launch reads both weights against one activation load, as the grouped op's
+// warp kernel; above that the grouped op's tile runs both tables against one
+// activation tile, after one counting sort. Registered on kCUDA.
 //   out          [P, N] bf16
 //   act          [*, K] bf16
 //   expert_ids   [P] i32 (device); row_map [P] i32 (device) or nullptr
@@ -5839,6 +5846,20 @@ void ComputeLogprobs(Queue& q, Tensor& logprobs, const Tensor& logits);
 // M1.7 deferral. Greedy stays bit-exact; random is validated by algorithm +
 // determinism + distribution.
 void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor& seeds);
+
+// The token RandomSample draws from ComputeProbs of ApplyTopKTopP(logits, k, p),
+// in one op that reads the logits and leaves them unmasked. Every row needs a
+// top-k: k [num_reqs] i32 with 1 <= k <= kTopKTopPSampleMaxK; p [num_reqs] f32
+// or nullptr (no top-p); seeds [num_reqs] i64 as for RandomSample; logits
+// [num_reqs, vocab] f32 with vocab <= kTopKTopPSampleMaxVocab. The three ops
+// walk the whole vocabulary with one block per row; this op scans it once
+// across the GPU and finishes on the top-k candidates, with the same floats and
+// so the same token (src/vt/cuda/cuda_sample.cu, "top_k_top_p_sample"). CUDA
+// only: callers check OpRegistered(OpId::kTopKTopPSample, device).
+inline constexpr int32_t kTopKTopPSampleMaxK = 64;
+inline constexpr int64_t kTopKTopPSampleMaxVocab = 1048576;
+void TopKTopPSample(Queue& q, Tensor& token_ids, const Tensor& logits, const Tensor& k,
+                    const Tensor* p, const Tensor& seeds);
 
 // --- Greedy spec-decode rejection sampling (SPEC-REJECTION I3) --------------
 // Ported from vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py @ e24d1b24:

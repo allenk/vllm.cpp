@@ -139,6 +139,16 @@ class Sampler {
                      const SamplingMetadata& sampling_metadata, vt::Tensor& ids,
                      std::vector<float>* processed_out) const;
 
+  // The per-row RandomSample seeds: StreamSeed(PositionKey(request seed,
+  // position), row) when rng_seeds is set, else the generators over the default.
+  static std::vector<int64_t> row_seeds(const SamplingMetadata& sampling_metadata, int64_t n);
+
+  // Whether vt::TopKTopPSample can stand in for top-k/top-p, softmax and
+  // RandomSample: every row has 1 <= top_k <= kTopKTopPSampleMaxK below the
+  // vocab, the device registers the op, and VT_FUSED_TOPK_SAMPLE is not 0.
+  static bool use_fused_top_k_top_p(const SamplingMetadata& sampling_metadata,
+                                    vt::DeviceType device, int64_t vocab);
+
   // The processed_* snapshot of `logits` into the host vector `out`
   // (sampler.py:267-270): the logits themselves or their logprobs, by mode.
   void snapshot_processed(vt::Queue& q, const vt::Tensor& logits,

@@ -390,6 +390,8 @@ const char* OpNameImpl(OpId op) {
       return "ComputeLogprobs";
     case OpId::kRandomSample:
       return "RandomSample";
+    case OpId::kTopKTopPSample:
+      return "TopKTopPSample";
     case OpId::kApplyPenalties:
       return "ApplyPenalties";
     case OpId::kApplyMinP:

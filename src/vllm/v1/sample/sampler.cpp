@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -369,6 +370,17 @@ void Sampler::sample_random(vt::Queue& q, vt::Tensor& logits,
   if (sm.top_p.has_value()) {
     p = s.Upload(q, s.top_p, sm.top_p->data(), vt::DType::kF32, {n});
   }
+  const std::vector<int64_t> seeds = row_seeds(sm, n);
+
+  // 7d-7e in one op when every row has a top-k the op takes: it draws the token
+  // the three ops below draw, from the same floats, without masking the logits
+  // or writing the probs. A processed snapshot needs the masked logits, so it
+  // keeps the three ops. VT_FUSED_TOPK_SAMPLE=0 keeps them too (A/B).
+  if (processed_out == nullptr && use_fused_top_k_top_p(sm, logits.device.type, vocab)) {
+    vt::TopKTopPSample(q, ids, logits, k, sm.top_p.has_value() ? &p : nullptr,
+                       s.Upload(q, s.seeds, seeds.data(), vt::DType::kI64, {n}));
+    return;
+  }
   vt::ApplyTopKTopP(q, logits, sm.top_k.has_value() ? &k : nullptr,
                     sm.top_p.has_value() ? &p : nullptr);
 
@@ -380,7 +392,11 @@ void Sampler::sample_random(vt::Queue& q, vt::Tensor& logits,
   // 7e. probs = softmax(logits); random_sample (exponential-noise gumbel-max).
   vt::Tensor probs = s.View(logits.device, s.probs, vt::DType::kF32, {n, vocab});
   vt::ComputeProbs(q, probs, logits);
+  vt::RandomSample(q, ids, probs,
+                   s.Upload(q, s.seeds, seeds.data(), vt::DType::kI64, {n}));
+}
 
+std::vector<int64_t> Sampler::row_seeds(const SamplingMetadata& sm, int64_t n) {
   std::vector<int64_t> seeds(static_cast<size_t>(n), static_cast<int64_t>(kDefaultSeed));
   if (!sm.rng_seeds.empty()) {
     // Key each row's draws by its request's seed and the position being sampled
@@ -400,8 +416,22 @@ void Sampler::sample_random(vt::Queue& q, vt::Tensor& logits,
       seeds[static_cast<size_t>(i)] = static_cast<int64_t>(seed);
     }
   }
-  vt::RandomSample(q, ids, probs,
-                   s.Upload(q, s.seeds, seeds.data(), vt::DType::kI64, {n}));
+  return seeds;
+}
+
+bool Sampler::use_fused_top_k_top_p(const SamplingMetadata& sm, vt::DeviceType device,
+                                    int64_t vocab) {
+  static const bool enabled = [] {
+    const char* e = std::getenv("VT_FUSED_TOPK_SAMPLE");
+    return e == nullptr || e[0] != '0';
+  }();
+  if (!enabled || !sm.top_k.has_value() || vocab > vt::kTopKTopPSampleMaxVocab ||
+      !vt::OpRegistered(vt::OpId::kTopKTopPSample, device)) {
+    return false;
+  }
+  return std::all_of(sm.top_k->begin(), sm.top_k->end(), [vocab](int32_t kk) {
+    return kk >= 1 && kk <= vt::kTopKTopPSampleMaxK && static_cast<int64_t>(kk) < vocab;
+  });
 }
 
 std::vector<int64_t> Sampler::sample(vt::Queue& q, vt::Tensor& logits,

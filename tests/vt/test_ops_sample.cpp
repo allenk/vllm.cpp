@@ -1592,6 +1592,185 @@ TEST_CASE("CUDA random_sample: the parallel path is BIT-IDENTICAL to the serial 
 }
 
 // ---------------------------------------------------------------------------
+// top_k_top_p_sample: one op for ApplyTopKTopP + ComputeProbs + RandomSample on
+// rows that all carry a top-k. Its contract is the token those three ops draw,
+// so the gate runs both on the same rows and requires the SAME id on every row,
+// and the logits unchanged. The rows aim at the paths the op has: distinct
+// logits; bf16-rounded logits (ties are common); ties at the threshold that
+// overflow a chunk's candidate list, at the top (the full-row arm) and far below
+// it (a constant padded tail, which must not leave the fast path); fewer than k
+// finite logits; pre-masked -inf; k from 1 to the maximum; small and
+// non-multiple-of-chunk vocabularies; top-p off, below and at 1.
+namespace {
+
+float Bf16Round(float x) {
+  uint32_t b;
+  std::memcpy(&b, &x, sizeof b);
+  b = (b + 0x7fffu + ((b >> 16) & 1u)) & 0xffff0000u;
+  float y;
+  std::memcpy(&y, &b, sizeof y);
+  return y;
+}
+
+struct FusedCase {
+  const char* what;
+  int64_t n;
+  int64_t v;
+  std::vector<int32_t> k;
+  std::vector<float> p;  // empty: no top-p
+  std::vector<float> logits;
+};
+
+std::vector<int64_t> DrawUnfused(Backend& gpu, Queue& q, const FusedCase& c,
+                                 const std::vector<int64_t>& seeds) {
+  std::vector<float> lg = c.logits;
+  std::vector<int32_t> k = c.k;
+  std::vector<float> p = c.p;
+  DeviceTensor dl(gpu, q, DType::kF32, {c.n, c.v}, lg.data());
+  DeviceTensor dk(gpu, q, DType::kI32, {c.n}, k.data());
+  DeviceTensor dp(gpu, q, DType::kF32, {c.n}, p.empty() ? nullptr : p.data());
+  DeviceTensor dprobs(gpu, q, DType::kF32, {c.n, c.v});
+  DeviceTensor ds(gpu, q, DType::kI64, {c.n}, seeds.data());
+  DeviceTensor did(gpu, q, DType::kI64, {c.n});
+  vt::ApplyTopKTopP(q, dl.tensor(), &dk.tensor(), p.empty() ? nullptr : &dp.tensor());
+  vt::ComputeProbs(q, dprobs.tensor(), dl.tensor());
+  vt::RandomSample(q, did.tensor(), dprobs.tensor(), ds.tensor());
+  std::vector<int64_t> ids(static_cast<size_t>(c.n));
+  did.Download(q, ids.data());
+  return ids;
+}
+
+std::vector<int64_t> DrawFused(Backend& gpu, Queue& q, const FusedCase& c,
+                               const std::vector<int64_t>& seeds, std::vector<float>* after) {
+  std::vector<float> lg = c.logits;
+  std::vector<int32_t> k = c.k;
+  std::vector<float> p = c.p;
+  DeviceTensor dl(gpu, q, DType::kF32, {c.n, c.v}, lg.data());
+  DeviceTensor dk(gpu, q, DType::kI32, {c.n}, k.data());
+  DeviceTensor dp(gpu, q, DType::kF32, {c.n}, p.empty() ? nullptr : p.data());
+  DeviceTensor ds(gpu, q, DType::kI64, {c.n}, seeds.data());
+  DeviceTensor did(gpu, q, DType::kI64, {c.n});
+  vt::TopKTopPSample(q, did.tensor(), dl.tensor(), dk.tensor(),
+                     p.empty() ? nullptr : &dp.tensor(), ds.tensor());
+  std::vector<int64_t> ids(static_cast<size_t>(c.n));
+  did.Download(q, ids.data());
+  after->resize(c.logits.size());
+  dl.Download(q, after->data());
+  return ids;
+}
+
+std::vector<FusedCase> FusedCases() {
+  std::vector<FusedCase> cases;
+  const int64_t kQwen = 248320;
+  {  // the decode shape of Qwen3.6-35B-A3B at temperature 0.2: logits / 0.2
+    FusedCase c{"qwen vocab, k 20, p 0.95", 8, kQwen, {}, {}, {}};
+    c.logits = RandomLogits(static_cast<size_t>(c.n * c.v), 31);
+    for (float& x : c.logits) x *= 5.0f;
+    c.k.assign(static_cast<size_t>(c.n), 20);
+    c.p.assign(static_cast<size_t>(c.n), 0.95f);
+    cases.push_back(std::move(c));
+  }
+  {  // bf16 logits: few distinct values, so ties straddle every threshold
+    FusedCase c{"bf16-rounded logits, mixed k and p", 8, kQwen, {}, {}, {}};
+    c.logits = RandomLogits(static_cast<size_t>(c.n * c.v), 32);
+    for (float& x : c.logits) x = Bf16Round(x * 3.0f);
+    c.k = {1, 2, 20, 20, 33, 50, 64, 64};
+    c.p = {0.95f, 0.5f, 0.95f, 1.0f, 0.8f, 0.99f, 0.95f, 0.1f};
+    cases.push_back(std::move(c));
+  }
+  {  // bf16 logits with a peaked head, as a language model's are: 48 tokens well
+     // above the rest, ties among them from the rounding
+    FusedCase c{"bf16 peaked head", 8, kQwen, {}, {}, {}};
+    c.logits = RandomLogits(static_cast<size_t>(c.n * c.v), 38);
+    const auto head = RandomLogits(static_cast<size_t>(c.n * 48), 39);
+    for (int64_t i = 0; i < c.n; ++i) {
+      for (int64_t h = 0; h < 48; ++h) {
+        const int64_t j = (h * 5171 + i * 977) % kQwen;
+        c.logits[static_cast<size_t>(i * kQwen + j)] =
+            12.0f + head[static_cast<size_t>(i * 48 + h)];
+      }
+    }
+    for (float& x : c.logits) x = Bf16Round(x * 5.0f);
+    c.k = {20, 20, 20, 20, 1, 10, 40, 64};
+    c.p = {0.95f, 0.95f, 0.5f, 1.0f, 0.95f, 0.95f, 0.95f, 0.95f};
+    cases.push_back(std::move(c));
+  }
+  {  // top-k only
+    FusedCase c{"no top-p", 4, 151936, {5, 20, 40, 64}, {}, {}};
+    c.logits = RandomLogits(static_cast<size_t>(c.n * c.v), 33);
+    cases.push_back(std::move(c));
+  }
+  {  // ties overflowing one chunk's list at the top (row 0) and in the tail (row 1)
+    FusedCase c{"chunk ties at the top and in the tail", 4, kQwen, {20, 20, 20, 20},
+                {0.95f, 0.95f, 0.9f, 1.0f}, {}};
+    c.logits = RandomLogits(static_cast<size_t>(c.n * c.v), 34);
+    for (int64_t j = 4096; j < 4096 + 300; ++j) c.logits[static_cast<size_t>(j)] = 9.0f;
+    for (int64_t j = kQwen - 4000; j < kQwen; ++j)
+      c.logits[static_cast<size_t>(1 * kQwen + j)] = -20.0f;
+    for (int64_t j = 0; j < kQwen; j += 997)  // row 2: 250 equal maxima in many chunks
+      c.logits[static_cast<size_t>(2 * kQwen + j)] = 8.0f;
+    for (int64_t j = 0; j < 40; ++j)  // row 3: 40 equal maxima in one chunk
+      c.logits[static_cast<size_t>(3 * kQwen + 8192 + j)] = 7.5f;
+    cases.push_back(std::move(c));
+  }
+  {  // pre-masked rows: -inf everywhere but a few (fewer than k finite in row 0)
+    FusedCase c{"pre-masked -inf", 3, kQwen, {20, 20, 64}, {0.95f, 0.9f, 0.95f}, {}};
+    c.logits.assign(static_cast<size_t>(c.n * c.v), kNegInf);
+    const auto noise = RandomLogits(static_cast<size_t>(c.n * c.v), 35);
+    for (int64_t j = 0; j < 7; ++j)
+      c.logits[static_cast<size_t>(j * 31000)] = noise[static_cast<size_t>(j)];
+    for (int64_t j = 0; j < kQwen; j += 3)
+      c.logits[static_cast<size_t>(1 * kQwen + j)] = noise[static_cast<size_t>(kQwen + j)];
+    for (int64_t j = 100000; j < kQwen; ++j)
+      c.logits[static_cast<size_t>(2 * kQwen + j)] = noise[static_cast<size_t>(2 * kQwen + j)];
+    cases.push_back(std::move(c));
+  }
+  {  // a vocabulary smaller than one chunk, every k up to the maximum
+    FusedCase c{"small vocab, k 1..64", 64, 1000, {}, {}, {}};
+    c.logits = RandomLogits(static_cast<size_t>(c.n * c.v), 36);
+    for (int64_t i = 0; i < c.n; ++i) {
+      c.k.push_back(static_cast<int32_t>(i + 1));
+      c.p.push_back(i % 4 == 0 ? 1.0f : 0.3f + 0.01f * static_cast<float>(i));
+    }
+    cases.push_back(std::move(c));
+  }
+  {  // k at or above the vocabulary: top-k is off for that row
+    FusedCase c{"k >= vocab", 2, 40, {40, 64}, {0.9f, 0.9f}, {}};
+    c.logits = RandomLogits(static_cast<size_t>(c.n * c.v), 37);
+    cases.push_back(std::move(c));
+  }
+  return cases;
+}
+
+}  // namespace
+
+TEST_CASE("CUDA top_k_top_p_sample draws the token of top-k/top-p, softmax and random_sample") {
+  if (!HasCuda() || !vt::OpRegistered(vt::OpId::kTopKTopPSample, DeviceType::kCUDA)) {
+    MESSAGE("no CUDA top_k_top_p_sample registered; skipping (GPU-pending)");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  for (const FusedCase& c : FusedCases()) {
+    for (const uint64_t base : {uint64_t{1}, uint64_t{0x9E3779B97F4A7C15ULL}}) {
+      std::vector<int64_t> seeds(static_cast<size_t>(c.n));
+      for (int64_t i = 0; i < c.n; ++i)
+        seeds[static_cast<size_t>(i)] = static_cast<int64_t>(
+            vt::sample::SplitMix64(base + static_cast<uint64_t>(i)));
+      const std::vector<int64_t> want = DrawUnfused(gpu, gq.q, c, seeds);
+      std::vector<float> after;
+      const std::vector<int64_t> got = DrawFused(gpu, gq.q, c, seeds, &after);
+      INFO(c.what << ", seed base " << base);
+      for (size_t i = 0; i < want.size(); ++i) {
+        INFO("row " << i);
+        CHECK(got[i] == want[i]);
+      }
+      CHECK(std::memcmp(after.data(), c.logits.data(), after.size() * sizeof(float)) == 0);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // ROCm: the same A/B contract as CUDA above. The child re-execs with
 // VT_FAST_RANDOM_SAMPLE=0 and =1 and the token ids must be byte-identical,
 // because both arms use the same device libm and ArgReduce is order-independent.

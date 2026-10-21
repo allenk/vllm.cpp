@@ -3405,6 +3405,8 @@ vllm_cpp_add_test(test_moe_router_tie_stability vt/test_moe_router_tie_stability
 target_include_directories(test_moe_router_tie_stability PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_fp8_block vt/test_ops_moe_grouped_fp8_block.cpp)
+# vt/cuda/cuda_device_caps.h: the W8A8 cases need an sm_89+ device.
+target_include_directories(test_ops_moe_grouped_fp8_block PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_rocm_moe_grouped_bf16 vt/test_rocm_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_rocm_moe_upstream vt/test_rocm_moe_upstream.cpp)
 vllm_cpp_add_test(test_moe_bf16_native_contract vt/test_moe_bf16_native_contract.cpp)

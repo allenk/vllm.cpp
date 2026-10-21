@@ -30,6 +30,9 @@
 #include "vt/dtype.h"
 #include "vt/fp8_kv.h"
 #include "vt/ops.h"
+#ifdef VLLM_CPP_CUDA
+#include "vt/cuda/cuda_device_caps.h"
+#endif
 
 namespace {
 
@@ -47,6 +50,25 @@ bool HasCuda() {
   } catch (const std::runtime_error&) {
     return false;
   }
+}
+
+// The W8A8 path is the default above the warp range on sm_89+. This file's W8A16
+// cases hold the W8A16 kernels to their own reference, so the process starts with
+// VT_MOE_FP8_BLOCK_W8A8=0; each W8A8 case sets it to 1 and back to 0.
+[[maybe_unused]] const bool kW8A16ForThisFile = [] {
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_W8A8", "0");
+  return true;
+}();
+
+// e4m3 MMAs (the W8A8 path) are sm_89+.
+bool HasFp8Mma() {
+#ifdef VLLM_CPP_CUDA
+  if (!HasCuda()) return false;
+  const vt::cuda::DeviceCaps& caps = vt::cuda::GetDeviceCaps();
+  return caps.valid && caps.sm_arch() >= 89;
+#else
+  return false;
+#endif
 }
 
 Tensor MakeTensor(void* data, DType dt, Device dev, const std::vector<int64_t>& shape) {
@@ -459,13 +481,15 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block BM=16 tile matches the block-scaled re
   RunCase(d);
 }
 
-// P = 1024 > 512 -> BM=64 WMMA tile. N = 130 leaves a 2-column last tile, K = 384
-// three K-blocks; identity routing and bf16 out on the second call.
+// P = 1024 with the small-tile bound at 512 -> BM=64 WMMA tile. N = 130 leaves a
+// 2-column last tile, K = 384 three K-blocks; identity routing and bf16 out on the
+// second call.
 TEST_CASE("GPU moe_grouped_gemm_fp8_block BM=64 tile matches the block-scaled reference") {
   if (!HasCuda()) {
     MESSAGE("CUDA backend unavailable; skipping");
     return;
   }
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P", "512");
   Case c;
   c.e_count = 9; c.t_rows = 128; c.top_k = 8; c.k_dim = 384; c.n_cols = 130;
   c.block_n = 64; c.seed = 500;
@@ -473,6 +497,42 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block BM=64 tile matches the block-scaled re
   Case d = c;
   d.use_row_map = false; d.bf16_out = true; d.seed = 510;
   RunCase(d);
+  vllm_test::UnsetEnv("VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P");
+}
+
+// The pipelined BM=16 tile (BK = 128, loads in flight under the MMAs) against the
+// BM=16 tile it replaces, which VT_MOE_FP8_BLOCK_PIPE=0 selects: one table and the
+// gate+up pair, bit for bit, at the Qwen3.6-35B-A3B prefill-chunk shape (about 4
+// pairs per expert, K = 2048 for gate/up and 512 for down, 128-wide scale blocks),
+// at a two-scale-block K, and at P = 1024, which the 16,384 bound now gives this tile.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block pipelined BM=16 tile is the BM=16 tile bit for bit") {
+  if (!HasCuda()) {
+    MESSAGE("CUDA backend unavailable; skipping");
+    return;
+  }
+  constexpr const char* kKnob = "VT_MOE_FP8_BLOCK_PIPE";
+  Case gate;
+  gate.e_count = 64; gate.t_rows = 32; gate.top_k = 8; gate.k_dim = 2048; gate.n_cols = 128;
+  gate.seed = 1100;
+  Case down = gate;
+  down.k_dim = 512; down.n_cols = 192; down.use_row_map = false; down.bf16_out = true;
+  down.seed = 1110;
+  Case two = gate;
+  two.e_count = 9; two.t_rows = 128; two.k_dim = 384; two.n_cols = 130; two.block_n = 64;
+  two.block_k = 256; two.seed = 1120;
+  for (const Case& c : {gate, down, two}) {
+    CAPTURE(c.seed);
+    const Fixture f = Build(c);
+    const Fixture u = BuildUp(c);
+    vllm_test::SetEnv(kKnob, "0");
+    const std::vector<float> old_out = Run(f);
+    const std::vector<uint16_t> old_fused = RunGateUp(f, u).fused;
+    vllm_test::UnsetEnv(kKnob);
+    const std::vector<float> pipe_out = Run(f);
+    CheckAgainstReference(f, pipe_out);
+    CHECK(pipe_out == old_out);
+    CHECK(RunGateUp(f, u).fused == old_fused);
+  }
 }
 
 // Greedy decode must be reproducible: the warp kernel's lane order and butterfly
@@ -524,16 +584,32 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu equals the gate, up and s
   RunGateUpCase(w, true);
 }
 
-TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu is correct above the warp range") {
+// Above the warp range the fused op runs the grouped tile for both tables, at the
+// height the triplet's GEMMs pick, so it is the triplet bit for bit there too.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu equals the triplet above the warp range") {
   if (!HasCuda()) {
     MESSAGE("CUDA backend unavailable; skipping");
     return;
   }
-  // P = 160: the triplet's GEMMs run the BM=16 tile, which sums in another order,
-  // so only the reference applies.
+  // P = 160: the BM=16 tile; N = 192 spans two scale-row blocks.
   Case c;
   c.e_count = 7; c.t_rows = 20; c.top_k = 8; c.k_dim = 256; c.n_cols = 192; c.seed = 800;
-  RunGateUpCase(c, /*expect_bit_identical=*/false);
+  RunGateUpCase(c, /*expect_bit_identical=*/true);
+  // P = 1024: the pipelined BM=16 tile, then with the small-tile bound at 512 the
+  // BM=64 tile; N = 130 leaves a 2-column last tile, K = 384 three K-blocks,
+  // identity routing.
+  Case b;
+  b.e_count = 9; b.t_rows = 128; b.top_k = 8; b.k_dim = 384; b.n_cols = 130; b.block_n = 64;
+  b.use_row_map = false; b.seed = 810;
+  RunGateUpCase(b, true);
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P", "512");
+  RunGateUpCase(b, true);
+  vllm_test::UnsetEnv("VT_MOE_FP8_BLOCK_SMALL_TILE_MAX_P");
+  // The Qwen3.6-35B-A3B prefill-chunk shape at reduced width: about 4 pairs per
+  // expert over 64 experts, K = 2048 in 128-wide blocks.
+  Case q;
+  q.e_count = 64; q.t_rows = 32; q.top_k = 8; q.k_dim = 2048; q.n_cols = 128; q.seed = 820;
+  RunGateUpCase(q, true);
 }
 
 // The warp kernels batch their weight loads (several output columns per warp,
@@ -569,6 +645,230 @@ TEST_CASE("GPU moe_grouped_gemm_fp8_block warp layouts are bit-identical to one 
     CHECK(Run(fb) == one_bf16);
     CHECK(RunGateUp(f, u).fused == one_fused);
   }
+}
+
+// --- W8A8 (VT_MOE_FP8_BLOCK_W8A8=1) ---------------------------------------------
+// The activation rows quantized per 128-wide group by the CPU QuantFp8Group arm, which
+// the CUDA kernel the W8A8 path calls matches byte for byte
+// (test_ops_quant_fp8_group_cpu.cpp G6).
+struct QuantAct {
+  std::vector<uint8_t> q;  // [act_rows, K] e4m3
+  std::vector<float> s;    // [act_rows, K / 128]
+};
+
+QuantAct QuantizeActCpu(const Fixture& f) {
+  const Case& c = f.c;
+  QuantAct qa;
+  qa.q.resize(static_cast<size_t>(f.act_rows * c.k_dim));
+  qa.s.resize(static_cast<size_t>(f.act_rows * (c.k_dim / 128)));
+  const Device cpu{DeviceType::kCPU, 0};
+  Queue cq{cpu, nullptr};
+  Tensor x = MakeTensor(const_cast<uint16_t*>(f.act.data()), DType::kBF16, cpu,
+                        {f.act_rows, c.k_dim});
+  Tensor tq = MakeTensor(qa.q.data(), DType::kI8, cpu, {f.act_rows, c.k_dim});
+  Tensor ts = MakeTensor(qa.s.data(), DType::kF32, cpu, {f.act_rows, c.k_dim / 128});
+  vt::QuantFp8Group(cq, tq, ts, x, 128);
+  return qa;
+}
+
+// out[p, n] = sum_kb a_s[row, kb] * s_e[n / 128, kb] * sum_{k in kb} a_q[row, k] * w_e[n, k]
+// in double: what the W8A8 kernel computes, up to the f32 order of its sums.
+std::vector<double> W8A8Reference(const Fixture& f, const QuantAct& qa) {
+  const Case& c = f.c;
+  const int64_t kb = c.k_dim / 128;
+  std::vector<double> ref(static_cast<size_t>(f.P * c.n_cols), 0.0);
+  for (int64_t p = 0; p < f.P; ++p) {
+    const auto e = static_cast<size_t>(f.expert_ids[static_cast<size_t>(p)]);
+    const int64_t r = c.use_row_map ? f.row_map[static_cast<size_t>(p)] : p;
+    for (int64_t n = 0; n < c.n_cols; ++n) {
+      double acc = 0.0;
+      for (int64_t b = 0; b < kb; ++b) {
+        double part = 0.0;
+        for (int64_t k = b * 128; k < (b + 1) * 128; ++k)
+          part += static_cast<double>(vt::F8E4M3ToF32(qa.q[static_cast<size_t>(r * c.k_dim + k)])) *
+                  static_cast<double>(vt::F8E4M3ToF32(f.w[e][static_cast<size_t>(n * c.k_dim + k)]));
+        acc += part * static_cast<double>(qa.s[static_cast<size_t>(r * kb + b)]) *
+               static_cast<double>(f.s[e][static_cast<size_t>((n / c.block_n) * f.kb + b)]);
+      }
+      ref[static_cast<size_t>(p * c.n_cols + n)] = acc;
+    }
+  }
+  return ref;
+}
+
+// Element-wise |got - ref| <= rtol * (|ref| + rms(ref)).
+void CheckNear(const std::vector<float>& got, const std::vector<double>& ref, double rtol) {
+  REQUIRE(got.size() == ref.size());
+  double ss = 0.0;
+  for (double v : ref) ss += v * v;
+  const double rms = std::sqrt(ss / static_cast<double>(ref.size()));
+  size_t bad = 0, first_bad = 0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    const double err = std::fabs(static_cast<double>(got[i]) - ref[i]);
+    if (!(err <= rtol * (std::fabs(ref[i]) + rms))) {
+      if (bad == 0) first_bad = i;
+      ++bad;
+    }
+  }
+  if (bad != 0) {
+    CAPTURE(bad);
+    CAPTURE(first_bad);
+    CAPTURE(got[first_bad]);
+    CAPTURE(ref[first_bad]);
+    CAPTURE(rms);
+  }
+  CHECK(bad == 0);
+}
+
+// Above the warp range the switch runs the W8A8 tile, which must be the W8A8 reference
+// to the MMA's summation (and one bf16 rounding on a bf16 output), at both tile heights
+// and bit-identically between them. N = 192 leaves a half 128-column tile; P = 320
+// over 9 experts (about 36 rows each) picks the 64-row tile and over 16 experts (20
+// each) the 32-row one; K = 512 is four scale blocks.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 matches the W8A8 block-scaled reference") {
+  if (!HasFp8Mma()) {
+    MESSAGE("no sm_89+ CUDA device; skipping");
+    return;
+  }
+  constexpr const char* kW8A8 = "VT_MOE_FP8_BLOCK_W8A8";
+  constexpr const char* kBM = "VT_MOE_FP8_BLOCK_W8A8_BM";
+  for (const int64_t experts : {int64_t{9}, int64_t{16}}) {
+    for (const bool bf16_out : {false, true}) {
+      CAPTURE(experts);
+      CAPTURE(bf16_out);
+      Case c;
+      c.e_count = experts; c.t_rows = 40; c.top_k = 8; c.k_dim = 512; c.n_cols = 192;
+      c.bf16_out = bf16_out; c.use_row_map = !bf16_out;
+      c.seed = 1200 + static_cast<uint32_t>(experts) + (bf16_out ? 50u : 0u);
+      const Fixture f = Build(c);
+      const std::vector<double> ref = W8A8Reference(f, QuantizeActCpu(f));
+      vllm_test::SetEnv(kW8A8, "1");
+      const std::vector<float> got = Run(f);
+      vllm_test::SetEnv(kBM, "16");
+      const std::vector<float> got16 = Run(f);
+      vllm_test::SetEnv(kBM, "32");
+      const std::vector<float> got32 = Run(f);
+      vllm_test::SetEnv(kBM, "64");
+      const std::vector<float> got64 = Run(f);
+      vllm_test::UnsetEnv(kBM);
+      vllm_test::SetEnv(kW8A8, "0");
+      // f32: the MMA's own accumulation order and precision, as CheckAgainstReference allows
+      CheckNear(got, ref, bf16_out ? 8e-3 : 1e-3);
+      CHECK(got16 == got64);
+      CHECK(got32 == got64);
+      CHECK(got == got64);
+    }
+  }
+}
+
+// The fused W8A8 gate+up runs both tables in one launch over one sort, then MoeSiluMul:
+// the separate W8A8 gate and up GEMMs and MoeSiluMul, bit for bit.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu W8A8 equals the W8A8 triplet") {
+  if (!HasFp8Mma()) {
+    MESSAGE("no sm_89+ CUDA device; skipping");
+    return;
+  }
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_W8A8", "1");
+  Case c;
+  c.e_count = 9; c.t_rows = 40; c.top_k = 8; c.k_dim = 512; c.n_cols = 256; c.seed = 1300;
+  const Fixture g = Build(c);
+  const Fixture u = BuildUp(c);
+  const GateUpOut out = RunGateUp(g, u);
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_W8A8", "0");
+  size_t diff = 0;
+  for (size_t i = 0; i < out.fused.size(); ++i) diff += out.fused[i] != out.triplet[i] ? 1 : 0;
+  CAPTURE(diff);
+  CHECK(diff == 0);
+}
+
+// A decode-sized step (P = 64 over 32 experts, two pairs each) stays on the W8A16 warp
+// kernels under VT_MOE_FP8_BLOCK_W8A8 alone, and VT_MOE_FP8_BLOCK_W8A8_DECODE takes it
+// onto the W8A8 tile (16 rows by default): the W8A8 reference there, and the fused
+// gate+up still the separate W8A8 GEMMs and MoeSiluMul bit for bit.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 decode switch: the warp range stays W8A16 unless asked") {
+  if (!HasFp8Mma()) {
+    MESSAGE("no sm_89+ CUDA device; skipping");
+    return;
+  }
+  constexpr const char* kW8A8 = "VT_MOE_FP8_BLOCK_W8A8";
+  constexpr const char* kDecode = "VT_MOE_FP8_BLOCK_W8A8_DECODE";
+  Case c;
+  c.e_count = 32; c.t_rows = 8; c.top_k = 8; c.k_dim = 512; c.n_cols = 256; c.seed = 1500;
+  const Fixture f = Build(c);
+  const Fixture u = BuildUp(c);
+  const std::vector<float> warp = Run(f);
+  const std::vector<uint16_t> warp_fused = RunGateUp(f, u).fused;
+  vllm_test::SetEnv(kW8A8, "1");
+  const std::vector<float> w8a8_only = Run(f);
+  const std::vector<uint16_t> w8a8_only_fused = RunGateUp(f, u).fused;
+  vllm_test::SetEnv(kDecode, "1");
+  const std::vector<float> tile = Run(f);
+  const GateUpOut tile_gu = RunGateUp(f, u);
+  vllm_test::UnsetEnv(kDecode);
+  vllm_test::SetEnv(kW8A8, "0");
+  CHECK(w8a8_only == warp);
+  CHECK(w8a8_only_fused == warp_fused);
+  CheckAgainstReference(f, warp);
+  CheckNear(tile, W8A8Reference(f, QuantizeActCpu(f)), 1e-3);
+  size_t diff = 0;
+  for (size_t i = 0; i < tile_gu.fused.size(); ++i)
+    diff += tile_gu.fused[i] != tile_gu.triplet[i] ? 1 : 0;
+  CAPTURE(diff);
+  CHECK(diff == 0);
+}
+
+// With the variable unset (a server's default) a step above the warp range runs the W8A8
+// tile, and a decode-sized step the W8A16 warp kernel.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 is the default above the warp range") {
+  if (!HasFp8Mma()) {
+    MESSAGE("no sm_89+ CUDA device; skipping");
+    return;
+  }
+  constexpr const char* kW8A8 = "VT_MOE_FP8_BLOCK_W8A8";
+  Case c;
+  c.e_count = 9; c.t_rows = 40; c.top_k = 8; c.k_dim = 512; c.n_cols = 192; c.seed = 1600;
+  const Fixture f = Build(c);
+  Case d;
+  d.e_count = 32; d.t_rows = 8; d.top_k = 8; d.k_dim = 512; d.n_cols = 256; d.seed = 1610;
+  const Fixture g = Build(d);
+  const std::vector<float> tile_w8a16 = Run(f);
+  const std::vector<float> warp_w8a16 = Run(g);
+  vllm_test::SetEnv(kW8A8, "1");
+  const std::vector<float> tile_w8a8 = Run(f);
+  vllm_test::UnsetEnv(kW8A8);
+  const std::vector<float> tile_default = Run(f);
+  const std::vector<float> warp_default = Run(g);
+  vllm_test::SetEnv(kW8A8, "0");
+  CHECK(tile_default == tile_w8a8);
+  CHECK(tile_default != tile_w8a16);
+  CHECK(warp_default == warp_w8a16);
+}
+
+// W8A8 against the exact-activation reference: what quantizing the activation to e4m3
+// (3 mantissa bits, a scale per 128 values) costs, bounded so a wrong scale or a
+// misplaced fragment cannot pass. Off, the same call is the W8A16 tile.
+TEST_CASE("GPU moe_grouped_gemm_fp8_block W8A8 stays within e4m3 activation error") {
+  if (!HasFp8Mma()) {
+    MESSAGE("no sm_89+ CUDA device; skipping");
+    return;
+  }
+  Case c;
+  c.e_count = 9; c.t_rows = 40; c.top_k = 8; c.k_dim = 512; c.n_cols = 192; c.seed = 1400;
+  const Fixture f = Build(c);
+  const std::vector<float> w8a16 = Run(f);
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_W8A8", "1");
+  const std::vector<float> w8a8 = Run(f);
+  vllm_test::SetEnv("VT_MOE_FP8_BLOCK_W8A8", "0");
+  CheckAgainstReference(f, w8a16);
+  double se = 0.0, ss = 0.0;
+  for (size_t i = 0; i < w8a8.size(); ++i) {
+    se += (static_cast<double>(w8a8[i]) - f.ref[i]) * (static_cast<double>(w8a8[i]) - f.ref[i]);
+    ss += f.ref[i] * f.ref[i];
+  }
+  const double rel_rms = std::sqrt(se / ss);
+  MESSAGE("W8A8 vs exact activation: relative RMS error " << rel_rms);
+  CHECK(rel_rms > 1e-4);  // it did quantize
+  CHECK(rel_rms < 6e-2);
 }
 
 TEST_CASE("GPU moe_grouped_gemm_fp8_block_gate_up_silu is bit-reproducible run to run") {
