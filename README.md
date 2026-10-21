@@ -55,25 +55,37 @@ carries the Windows CPU and Vulkan lanes.
 **Qwen3.6-35B-A3B-FP8 in `0.0.4-vk.2`.** Qwen's own FP8 release of Qwen3.6-35B-A3B
 (`Qwen/Qwen3.6-35B-A3B-FP8`, 128x128 block-FP8 weights) loads and serves on CUDA. `0.0.4-vk.1`
 refused it at load, as upstream does: the MoE loader read only per-tensor FP8 scales, and this
-checkpoint carries `.weight_scale_inv` block grids instead. The routed experts run through a grouped
-W8A16 kernel (FP8 weights, bf16 activations) that is captured in the decode CUDA graph. It is
-compiled for every SM target of the CUDA archives; only sm_120a has run it. The experts' host
-copies are released once they are on the device, and the server's private working set after
-loading is 3.2 GiB.
+checkpoint carries `.weight_scale_inv` block grids instead.
+
+On sm_89 and newer, the routed experts run the way vLLM 0.28.0 runs them: each activation row is
+quantized to FP8 in groups of 128, and multiplied in e4m3 tensor-core MMAs (W8A8). Two cases use a
+W8A16 kernel (FP8 weights, bf16 activations) instead:
+- decode-sized steps, of up to 64 token-expert pairs;
+- GPUs below sm_89, where vLLM serves FP8 the same way (Marlin).
+
+`VT_MOE_FP8_BLOCK_W8A8=0` keeps every step on W8A16, as in the first `0.0.4-vk.2` candidate. The
+W8A16 kernels are compiled for every SM target of the CUDA archives, the W8A8 kernel for sm_89 and
+newer; only sm_120a has run them. The decode kernels are captured in the decode CUDA graph. The
+experts' host copies are released once they are on the device, and the server's private working set
+after loading is 3.2 GiB.
 
 Against vLLM 0.28.0 on one RTX PRO 6000 Blackwell (350 W power cap), in one session, one server at a
-time: this release's Windows zip and Linux tarball as CI built them, vLLM in WSL2. 887-token prompt,
-greedy, 512 tokens; the two archives ran two interleaved rounds, vLLM one. Three fixed prompts give
-the same tokens as vLLM on both archives (12/12, 12/12, 10/10).
+time: Windows and Linux servers built from this release's source (MSVC with CUDA 13.2; GCC with CUDA
+13.4 in WSL2), vLLM in WSL2. 887-token prompt, greedy, 512 tokens; the Windows build and vLLM ran
+two interleaved rounds, the Linux build one. Three fixed prompts give the same tokens as vLLM on both
+builds (12/12, 12/12, 10/10). The release archives are CI builds of the same source: run back to
+back, the Windows server from a CI dry run and the local build measured within 2% of each other on
+every row below, with the same tokens on the fixed prompts.
 
 ```
                           Windows (MSVC)   Linux (GCC, WSL2)   vLLM 0.28.0 (WSL2)
-decode c=1                228.5 / 229.5    227.3 / 227.2       227.9 tok/s
-decode c=4, aggregate     571.0 / 576.8    569.1 / 568.2       566.8
-time to first token c=1   107 / 100 ms     102 / 102 ms        81 ms
+decode c=1                221.6 / 240.2    208.4               203.9 / 222.5 tok/s
+decode c=4, aggregate     589.6 / 612.2    546.4               526.0 / 572.1
+time to first token c=1   69 / 67 ms       62 ms               104 / 97 ms
 ```
 
-Decode is level with vLLM; prefill is not (next paragraph's workload).
+Both engines decoded about 8% faster in the second round than in the first, so compare within a
+round. Decode is level with or ahead of vLLM, and the first token comes 30 to 40% sooner.
 
 **Prefix caching on Qwen3.5 and Qwen3.6.** `--enable-prefix-caching` now works on these hybrid
 models, in the mode vLLM 0.28.0 uses for them ("align"): the attention block is raised until one
@@ -94,24 +106,28 @@ GDN state rows, where vLLM shares one page between an attention layer and three 
 86 MB per block on the 35B, so an 8 GiB pool (`--kv-cache-memory 8589934592`) holds 99 blocks of
 1,056 tokens.
 
-A translation-shaped workload (a system prompt of about 1,100 tokens shared by every request, a
-short source segment each, 36 output tokens, temperature 0.2, 8 concurrent clients, 480 requests),
-Qwen3.6-35B-A3B-FP8, the same session as the table above:
+Two translation-shaped workloads, Qwen3.6-35B-A3B-FP8, the same session as the table above: 480
+requests, a short source segment each, 36 output tokens, temperature 0.2, 8 concurrent clients. In the
+first, every request shares a system prompt of about 1,100 tokens, which fills one 1,056-token cache
+block. In the second, the system prompt is about 860 tokens, too short to fill a block, so every
+request computes its whole prompt; this happens on both engines.
 
 ```
-                              Windows   Linux    vLLM 0.28.0
-caching off                   74.9 s    -        -
-caching on                    44.0 s    45.1 s   27.7 s
-prompt tokens from cache      90.1%     90.1%    90.1%
+                                     Windows       Linux         vLLM 0.28.0
+system prompt shared (cache hits)    30.3 / 29.1   31.7          31.0 / 31.7 s
+  prompt tokens from cache           90.1%         90.1%         90.1%
+system prompt too short (no hits)    44.3 / 43.3   47.4          48.2 / 49.0 s
 ```
 
-The cache hits the same blocks as vLLM's (101,376 of 112,520 prompt tokens on 96 of these
-requests, in all three). vLLM still finishes this workload about 1.6 times faster. A profile of
-the Windows build on it shows where this build spends the time: the steps that carry a prefill
-chunk are 14% of the steps and 53% of the time, 67.6 ms each against 9.8 ms for a decode-only step.
-In such a step the routed-expert GEMM in its prefill shape takes 40.7 ms, and 13.3 ms is the GPU
-waiting for kernel launches, because those steps run outside the CUDA graph. vLLM was not
-profiled, so this says where the time goes here, not why vLLM needs less.
+The first `0.0.4-vk.2` candidate took about 1.6 times as long as vLLM on the first workload. A
+profile put most of that in the routed-expert GEMM of the steps that carry a prefill chunk. Three
+changes in that path closed it, none of which changes an output:
+- a pipelined 16-row tile;
+- gate and up projections in one launch;
+- the expert grouping computed in parallel.
+
+On the second workload W8A8 is what makes the difference. With `VT_MOE_FP8_BLOCK_W8A8=0` (the W8A16
+kernels), an earlier session on the same day measured 51.3 s on it against vLLM's 46.15 s.
 
 **Sampled decoding.** The random draw for each sampled token was keyed by the request's row in the
 batch and did not change from one step to the next, so at temperature 1.0 a request could fall into
@@ -120,6 +136,13 @@ Draws are now keyed by the request's seed and its position. Sampled output there
 `0.0.4-vk.1` for the same seed, by design; greedy output is unchanged. A batch of sampled requests
 is also sampled on the device without a host round trip per step: 6.08 to 5.43 ms per token on the
 35B at one request.
+
+Rows whose requests all set a top-k of at most 64 are now sampled by one operation. It reads the logits
+once across the GPU, finishes on each row's top-k candidates, and draws the same token as the separate
+top-k/top-p, softmax and sampling kernels. On the 35B at temperature 0.2, top-k 20 and top-p 0.95, it
+takes 0.04 ms per decode step, against 1.2 ms before. `VT_FUSED_TOPK_SAMPLE=0` keeps the separate
+kernels. When a decode step with up to 64 rows has its shared expert on the block-FP8 path, the shared
+expert now runs on a second CUDA stream beside the routed experts, as vLLM does.
 
 **`/metrics` counts the prompt the way vLLM 0.28.0 does.** `vllm:prompt_tokens_cached` was always
 0, and `vllm:iteration_tokens_total` counted cached prompt tokens as computed; both now come from
