@@ -70,22 +70,22 @@ experts' host copies are released once they are on the device, and the server's 
 after loading is 3.2 GiB.
 
 Against vLLM 0.28.0 on one RTX PRO 6000 Blackwell (350 W power cap), in one session, one server at a
-time: Windows and Linux servers built from this release's source (MSVC with CUDA 13.2; GCC with CUDA
-13.4 in WSL2), vLLM in WSL2. 887-token prompt, greedy, 512 tokens; the Windows build and vLLM ran
-two interleaved rounds, the Linux build one. Three fixed prompts give the same tokens as vLLM on both
-builds (12/12, 12/12, 10/10). The release archives are CI builds of the same source: run back to
-back, the Windows server from a CI dry run and the local build measured within 2% of each other on
-every row below, with the same tokens on the fixed prompts.
+time, two interleaved rounds each: the Windows zip from the CI dry run before the tag (MSVC with CUDA
+13.2; the one commit in between changes only code for GPUs older than sm_89), a Linux server built
+from this release's source (GCC with CUDA 13.4, in WSL2), and vLLM in WSL2. 887-token prompt, greedy,
+512 tokens. Three fixed prompts give the same tokens as vLLM on both (12/12, 12/12, 10/10). Run back
+to back, that CI-built Windows server and a local build of the same source measured within 2% of
+each other on every row below, with the same tokens on the fixed prompts.
 
 ```
                           Windows (MSVC)   Linux (GCC, WSL2)   vLLM 0.28.0 (WSL2)
-decode c=1                221.6 / 240.2    208.4               203.9 / 222.5 tok/s
-decode c=4, aggregate     589.6 / 612.2    546.4               526.0 / 572.1
-time to first token c=1   69 / 67 ms       62 ms               104 / 97 ms
+decode c=1                230.0 / 236.5    225.9 / 223.7       206.9 / 222.5 tok/s
+decode c=4, aggregate     596.7 / 608.8    586.9 / 587.0       543.5 / 572.7
+time to first token c=1   62 / 60 ms       76 / 65 ms          123 / 85 ms
 ```
 
-Both engines decoded about 8% faster in the second round than in the first, so compare within a
-round. Decode is level with or ahead of vLLM, and the first token comes 30 to 40% sooner.
+vLLM moved more between its two rounds than either build, so compare within a round. Decode is level
+with or ahead of vLLM, and the first token comes sooner.
 
 **Prefix caching on Qwen3.5 and Qwen3.6.** `--enable-prefix-caching` now works on these hybrid
 models, in the mode vLLM 0.28.0 uses for them ("align"): the attention block is raised until one
@@ -114,10 +114,14 @@ request computes its whole prompt; this happens on both engines.
 
 ```
                                      Windows       Linux         vLLM 0.28.0
-system prompt shared (cache hits)    30.3 / 29.1   31.7          31.0 / 31.7 s
+system prompt shared (cache hits)    29.8 / 29.4   30.3 / 30.0   30.8 / 28.1 s
   prompt tokens from cache           90.1%         90.1%         90.1%
-system prompt too short (no hits)    44.3 / 43.3   47.4          48.2 / 49.0 s
+system prompt too short (no hits)    44.2 / 44.1   47.2 / 47.7   47.3 / 47.5 s
 ```
+
+On the first workload the three are within about 7% of each other, and which one is fastest changes
+between rounds. On the second, the Windows build is about 7% faster than vLLM and the Linux build
+level with it.
 
 The first `0.0.4-vk.2` candidate took about 1.6 times as long as vLLM on the first workload. A
 profile put most of that in the routed-expert GEMM of the steps that carry a prefill chunk. Three
