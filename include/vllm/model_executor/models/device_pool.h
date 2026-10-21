@@ -706,8 +706,9 @@ inline DevicePool& Pool(vt::Backend& b) {
 }
 
 // --- Aux-stream scratch pool (ENG-MOE-SHARED-AUX) ----------------------------
-// The MoE shared-expert overlap (MoeBlockFusedMarlinCuda) issues the shared MLP
-// on a SECOND CUDA stream concurrent with the routed experts on the main stream.
+// The MoE shared-expert overlap (MoeBlockFusedMarlinCuda, and MoeBlockFp8BlockCuda
+// in every build) issues the shared MLP on a SECOND CUDA stream concurrent with the
+// routed experts on the main stream.
 // The main `Pool()` above is only reuse-safe under SINGLE-stream ordering: a
 // block returned to the free list is handed back out on the same stream, so CUDA
 // stream ordering guarantees the block's last op has completed before any reuse.
@@ -724,7 +725,6 @@ inline DevicePool& Pool(vt::Backend& b) {
 // The aux pool is per-device too: the stream distinction and the device
 // distinction are independent, and a process with two devices running the MoE
 // overlap needs one aux pool per device, not one shared between them.
-#ifdef VT_MARLIN_NVFP4  // only the Marlin MoE overlap path draws from AuxPool
 namespace detail {
 inline PoolTable& AuxPoolTable() {
   static PoolTable t;
@@ -736,7 +736,6 @@ inline DevicePool& AuxPool(vt::Backend& b) {
   thread_local DevicePool* last_pool = nullptr;
   return detail::MemoizedPool(detail::AuxPoolTable(), b, last_backend, last_pool);
 }
-#endif
 
 // Thread-local OVERRIDE of the scratch pool a DBuf constructs from. Null means
 // "this device's own Pool(b)" — the default, and the only correct default, since
