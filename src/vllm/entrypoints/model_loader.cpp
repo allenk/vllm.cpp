@@ -37,6 +37,7 @@
 #include "vllm/model_executor/models/deepseek_v4_1.h"  // the OWED deepseek41 GGUF refusal (W8)
 #include "vllm/model_executor/models/dots3_note.h"  // the OWED dots3note GGUF refusal (#2882)
 #include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
+#include "vllm/model_executor/models/flint_gguf_weights.h"  // flint GGUF arm
 #include "vllm/model_executor/models/glm5_next_weights.h"  // glm5next GGUF arm
 #include "vllm/model_executor/models/glm_moe_dsa.h"  // glm-dsa GGUF arm
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
@@ -1279,6 +1280,7 @@ constexpr GgufArchArm kGgufArchArms[] = {
     {vllm::kQwen4ExpGgufArch, &vllm::Qwen4ExpHfConfigFromGguf},
     {vllm::kGlm5NextGgufArch, &vllm::Glm5NextHfConfigFromGguf},
     {vllm::kGlmMoeDsaGgufArch, &vllm::GlmMoeDsaHfConfigFromGguf},
+    {vllm::kFlintGgufArch, &vllm::FlintHfConfigFromGguf},
 };
 
 std::string SupportedGgufArchitectures() {

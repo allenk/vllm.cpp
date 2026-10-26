@@ -204,6 +204,25 @@ TEST_CASE("a glm-dsa GGUF reaches ITS OWN builder through the dispatch") {
   CHECK(message.find("qwen3_5 gguf:") == std::string::npos);
 }
 
+TEST_CASE("a flint GGUF reaches ITS OWN builder through the dispatch") {
+  // MODEL-TEXT-FLINT, the GGUF arm (.agents/specs/flint-gguf-arm.md, issue
+  // ISSUE-LOCAL-01M5PRSC2E4VR54HBSWFPMN37E): the published RecursiveSI flint
+  // containers and the unsloth/APEX quants all carry
+  // `general.architecture = flint`, and until this row existed every one of
+  // them was refused as merely unrecognized — a capability the published
+  // files name and no production entry point reached. Proven by the MESSAGE,
+  // exactly as the qwen4exp case above is.
+  const std::string message = RefusalFor(GgufWithArchitecture("flint"));
+  REQUIRE_FALSE(message.empty());
+  CHECK(message.find("flint gguf: missing metadata key") != std::string::npos);
+  CHECK(message.find("flint.embedding_length") != std::string::npos);
+  // Not the unsupported-architecture refusal any more...
+  CHECK(message.find("is not supported by this build") == std::string::npos);
+  // ...and not qwen3_5's, which is the #809 defect this dispatch table exists
+  // to prevent.
+  CHECK(message.find("qwen3_5 gguf:") == std::string::npos);
+}
+
 TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
   // The rejection must fire during architecture resolution, BEFORE any tokenizer
   // or weight I/O — so the arch must be one the registry does NOT know. (Note:
@@ -227,7 +246,7 @@ TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
       "Model architectures ['Gemma4ForCausalLM'] are not supported for now. "
       "Supported architectures: "
       "dict_keys(['BoundaryExtractor', 'CohereForCausalLM', 'CuaS1Forms', 'DeepseekV2ForCausalLM', "
-      "'DeepseekV41ForCausalLM', 'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', "
+      "'DeepseekV41ForCausalLM', 'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'FlintForCausalLM', "
       "'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'Glm5NextForConditionalGeneration', "
