@@ -621,8 +621,8 @@ ForwardLogits FlintPagedModel::ForwardDevice(const std::vector<int32_t>& token_i
 // ─── FlintPagedDecodeGraph ────────────────────────────────────────────────────
 // The Qwen3MoeDecodeGraph driver (qwen3_moe.cpp) with Flint's forward in the
 // captured region: the embedding runs outside, the MoE arenas and dense Marlin
-// residents are built before capture, and the FA-2 decode scratch is keyed per
-// shape and filled by the cold step.
+// residents are built before capture, and the FA-2 decode scratch (keyed by
+// shape and split count) is filled by an eager forward right before each capture.
 //
 // The DevicePool needs the 35B driver's discipline (qwen3_5.cpp #1380 / #2274),
 // which Qwen3MoeDecodeGraph does not carry: a capture must be served entirely
@@ -833,8 +833,18 @@ ForwardLogits FlintPagedDecodeGraph::Step(const std::vector<int32_t>& token_ids,
     // free list is deep enough).
     if (s.dev == nullptr) impl_->BindInputs(d, s, S);
     impl_->StageInputs(d, s);
-    Pool(b).PreGrowForCapture(b, s.demand);
     EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights);
+    // This step's logits come from an EAGER forward over the same inputs, and the
+    // capture after it only records. The order is what makes the capture safe:
+    // the FA-2 decode scratch is keyed by the split count, which follows the
+    // longest sequence (one level per 128 tokens), so a sequence that crossed a
+    // level since the cold step meets a key that does not exist yet INSIDE the
+    // capture, where it cannot be allocated (measured at c=16 with the double-
+    // buffered slots, whose cold step is two steps back). The eager pass creates
+    // exactly the key the capture will use.
+    DBuf eager = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
+                               impl_->weights, impl_->config, kNoGather, s.dev.get());
+    Pool(b).PreGrowForCapture(b, s.demand);
     std::optional<DBuf> lg;
     {
       // kFull: a decode capture is one segment with attention inside, vLLM's
@@ -854,25 +864,22 @@ ForwardLogits FlintPagedDecodeGraph::Step(const std::vector<int32_t>& token_ids,
                  "FlintPagedDecodeGraph: the decode capture was abandoned and its logits "
                  "were never computed");
       }
-      ForwardLogits drained = WrapDeviceLogits(std::move(*lg), B, V);
-      drained.device_tensor =
-          MakeTensor(drained.device_storage.get(), DType::kF32, d.q.device, {B, V});
-      return drained;
+    } else {
+      // Take the blocks the graph baked back out of the free list (the pre-grow
+      // left exactly those on top), BEFORE the old logits are freed into it.
+      if (s.pinned.empty()) s.pinned = Pool(b).PinForGraph(b, s.demand);
+      s.logits = std::make_unique<DBuf>(std::move(*lg));
+      impl_->any_captured = true;
+      s.replays = 0;
+      if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
+        std::fprintf(stderr,
+                     "[FlintPagedDecodeGraph] captured decode graph for padded size S=%lld "
+                     "(real B=%lld)\n",
+                     static_cast<long long>(S), static_cast<long long>(B));
     }
-    // Take the blocks the graph baked back out of the free list (the pre-grow
-    // left exactly those on top), BEFORE the old logits are freed into it.
-    if (s.pinned.empty()) s.pinned = Pool(b).PinForGraph(b, s.demand);
-    s.logits = std::make_unique<DBuf>(std::move(*lg));
-    impl_->any_captured = true;
-    if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
-      std::fprintf(stderr,
-                   "[FlintPagedDecodeGraph] captured decode graph for padded size S=%lld "
-                   "(real B=%lld)\n",
-                   static_cast<long long>(S), static_cast<long long>(B));
-    s.graph.Replay(impl_->queue);
-    s.replays = 1;
-    ++impl_->replays;
-    return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, V);
+    ForwardLogits fl = WrapDeviceLogits(std::move(eager), B, V);
+    fl.device_tensor = MakeTensor(fl.device_storage.get(), DType::kF32, d.q.device, {B, V});
+    return fl;
   }
 
   // Cold size: one eager step warms the pool, the residents and the FA-2 scratch
