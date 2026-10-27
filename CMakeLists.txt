@@ -878,6 +878,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/flint_weights.cpp
   src/vllm/model_executor/models/flint_gguf_weights.cpp
   src/vllm/model_executor/models/flint_paged.cpp
+  src/vllm/model_executor/models/flint_device.cpp
   src/vllm/model_executor/models/qwen4_exp_ple.cpp
   src/vllm/model_executor/models/qwen4_exp.cpp
   src/vllm/model_executor/models/qwen4_exp_weights.cpp
@@ -2023,6 +2024,7 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_glm5_next.cu
     src/vt/cuda/cuda_exl3.cu
     src/vt/cuda/cuda_laguna.cu
+    src/vt/cuda/cuda_flint.cu
     src/vt/cuda/cuda_minimax_h3.cu
     src/vt/cuda/cuda_ltx2.cu
     src/vt/cuda/cuda_ltx2_vae.cu

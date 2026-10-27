@@ -12,6 +12,7 @@
 //   * the Qwen3MoeDecodeGraph capture/replay state machine.
 #include "vllm/model_executor/models/flint_paged.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -27,6 +28,8 @@
 #include "vllm/model_executor/models/decode_graph_sizes.h"
 #include "vllm/model_executor/models/dense_attn_block.h"
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"
+#include "vllm/model_executor/models/flint_device.h"
+#include "vllm/model_executor/models/kv_cache_route.h"  // IsFp8KvCache
 #include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::*DeviceTokenIds
 #include "vllm/model_executor/models/step_token_ids.h"
 #include "vllm/platforms/interface.h"
@@ -35,6 +38,7 @@
 #include "vt/backend.h"
 #include "vt/breakable_graph.h"
 #include "vt/ops.h"
+#include "vt/persistent_step_input.h"
 #ifdef VT_MARLIN_NVFP4
 #include "vt/cuda/marlin_repack.h"
 #endif
@@ -191,13 +195,82 @@ DBuf DenseMlp(Dev d, const FlintPagedLayer& lw, const Tensor& x) {
   return dense_nvfp4::MatmulNvfp4W4A16D(d, act.t(), lw.mlp_down, DType::kBF16);
 }
 
+// The kFlint glue kernels (flint_device.h), or nullptr when this build or device
+// has none, or VT_FLINT_FUSED=0 asks for the composed shared ops (a same-binary
+// A/B: the composed attention rotates with the bf16 cos/sin cache).
+const flint::FlintDeviceKernels* FusedKernels(Dev d) {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FLINT_FUSED");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  if (!on || d.q.device.type != vt::DeviceType::kCUDA || !flint::FlintDeviceKernelsAvailable())
+    return nullptr;
+  return flint::FlintDevice();
+}
+
+// One attention block. With the glue kernels it is vLLM's FlintAttention on SM120:
+// the merged qkv GEMM, then ONE kernel for the per-head q/k RMSNorm, the RoPE in
+// f32 from the f32 cos|sin table (sliding layers only) and the K/V cache write
+// (vLLM's qk_norm_rope_cache), then paged attention with the window and sinks,
+// then o_proj. Without them it is dense_attn::AttnBlock with the layer options.
+DBuf Attention(Dev d, const FlintPagedLayer& lw, const FlintParams& p, const HfConfig& cfg,
+               const Tensor& x, const StepInputs& si, const CommonAttentionMetadata& meta,
+               const PagedKvCache& kv, int64_t T, const flint::FlintDeviceKernels* fk) {
+  AttnBlockLayerOpts opts;
+  if (lw.sliding) {
+    // vLLM per_layer_sliding_window = sliding_window, i.e. FlashAttention's
+    // (W-1, 0); --disable-sliding-window turns it off as for every model.
+    opts.window = ResolveAttentionWindow(std::nullopt, p.sliding_window,
+                                         v1::AttentionType::kDecoder,
+                                         DisableSlidingWindowActive());
+  }
+  opts.sinks = &lw.sinks;
+  opts.rope = lw.rope;
+  // The kernel takes bf16 norm weights; anything else is the composed path.
+  if (fk == nullptr || kv.dtype != DType::kBF16 || IsFp8KvCache(kv) || !lw.attn.IsNvfp4() ||
+      lw.attn.q_norm.dtype != DType::kBF16 || lw.attn.k_norm.dtype != DType::kBF16)
+    return AttnBlock(d, lw.attn, cfg, x, si, meta, kv, T, nullptr, opts);
+
+  const int64_t Hq = p.num_attention_heads, Hkv = p.num_key_value_heads, Dh = p.head_dim;
+  VT_CHECK(kv.num_kv_heads == Hkv && kv.head_size == Dh,
+           "flint paged: KV cache head dims mismatch the config");
+  DBuf qkv = dense_nvfp4::MatmulNvfp4W4A16D(d, x, lw.attn.qkv_proj_fp4, DType::kBF16);
+  DBuf q(d, DType::kBF16, {T, Hq, Dh});
+  Tensor k_cache = KvSlice(kv, d.q.device, 0);
+  Tensor v_cache = KvSlice(kv, d.q.device, 1);
+  Tensor q_w = ResidentWeight(d, lw.attn.q_norm, {Dh});
+  Tensor k_w = ResidentWeight(d, lw.attn.k_norm, {Dh});
+  fk->qk_norm_rope_kv_cache(d.q, q.ptr(), qkv.ptr(), (Hq + 2 * Hkv) * Dh, q_w.data, k_w.data,
+                            lw.rope ? si.cos_sin.t().Ptr<float>() : nullptr, k_cache.data,
+                            v_cache.data, k_cache.stride[0], k_cache.stride[1],
+                            k_cache.stride[2], kv.block_size, si.slot_mapping.t().Ptr<int64_t>(),
+                            T, Hq, Hkv, Dh, static_cast<float>(p.rms_norm_eps));
+
+  vt::PagedAttentionArgs pa{1.0F / std::sqrt(static_cast<float>(Dh)), meta.causal};
+  pa.query_start_loc_host = meta.query_start_loc.data();
+  pa.max_seq_len = meta.max_seq_len;
+  pa.uniform_spec_query_len = meta.uniform_spec_query_len;
+  pa.window_size = opts.window;
+  // f32 sinks upload as they are (vLLM keeps them f32); bf16 ones widen.
+  Tensor sinks = lw.sinks.dtype == DType::kF32 ? ResidentWeight(d, lw.sinks, {Hq})
+                                               : ResidentWeightF32(d, lw.sinks, {Hq});
+  pa.sinks = &sinks;
+  DBuf attn(d, DType::kBF16, {T, Hq, Dh});
+  vt::PagedAttention(d.q, attn.t(), q.t(), k_cache, v_cache, si.block_table.t(),
+                     si.seq_lens.t(), si.query_start_loc.t(), pa);
+  return dense_nvfp4::MatmulNvfp4W4A16D(d, Reshape(attn.t(), {T, Hq * Dh}), lw.attn.o_proj_fp4,
+                                        DType::kBF16);
+}
+
 // One MoE block: bf16 router logits -> sigmoid top-6 renormalised in f32 (the
-// grouped router with a single group, which is plain top-k) -> moe_align -> w13
-// GEMM -> SiluAndMul -> w2 GEMM -> the ungated shared expert -> weighted combine.
+// kFlint kernel, or the grouped router with a single group, which is plain
+// top-k) -> moe_align -> w13 GEMM -> SiluAndMul (vLLM's act_and_mul with the
+// kFlint kernels) -> w2 GEMM -> the ungated shared expert -> weighted combine.
 // The router GEMM stores bf16 because that is what vLLM's GateLinear does on
 // SM120: its fp32-output tiers are gated on SM90 / SM100 (family 100 only) or
 // on an out_dtype Flint does not set, so it falls to F.linear in the model dtype.
-DBuf MoeBlock(Dev d, const FlintPagedMoe& m, const FlintParams& p, const Tensor& x, int64_t T) {
+DBuf MoeBlock(Dev d, const FlintPagedMoe& m, const FlintParams& p, const Tensor& x, int64_t T,
+              const flint::FlintDeviceKernels* fk) {
 #ifdef VT_MARLIN_NVFP4
   const int64_t H = p.hidden_size, E = p.num_experts, Kk = p.num_experts_per_tok;
   const int64_t I = p.moe_intermediate_size, P = T * Kk;
@@ -210,7 +283,10 @@ DBuf MoeBlock(Dev d, const FlintPagedMoe& m, const FlintParams& p, const Tensor&
   vt::MatmulBT(d.q, logits.t(), x, router);
   DBuf topk_w(d, DType::kF32, {T, Kk});
   DBuf topk_id(d, DType::kI32, {T, Kk});
-  {
+  if (fk != nullptr) {
+    fk->sigmoid_topk(d.q, static_cast<float*>(topk_w.ptr()), static_cast<int32_t*>(topk_id.ptr()),
+                     logits.ptr(), T, E, Kk);
+  } else {
     vt::MoeRouterTopKArgs args;
     args.top_k = static_cast<int>(Kk);
     args.renormalize = true;  // norm_topk_prob
@@ -247,7 +323,11 @@ DBuf MoeBlock(Dev d, const FlintPagedMoe& m, const FlintParams& p, const Tensor&
                                   vt::MoeMarlinArgs{block, tki, Ti, 2 * Ii, Hi, false});
   }
   DBuf act(d, DType::kBF16, {P, I});
-  vt::SiluAndMul(d.q, act.t(), gu.t());
+  if (fk != nullptr) {
+    fk->routed_silu_and_mul(d.q, act.ptr(), gu.ptr(), P, I);
+  } else {
+    vt::SiluAndMul(d.q, act.t(), gu.t());
+  }
   DBuf down(d, DType::kBF16, {P, H});
   {
     Tensor wq = MakeTensor(mr.w2, DType::kI32, d.q.device, {E, I / 16, H * 2});
@@ -271,9 +351,22 @@ DBuf MoeBlock(Dev d, const FlintPagedMoe& m, const FlintParams& p, const Tensor&
   (void)p;
   (void)x;
   (void)T;
+  (void)fk;
   VT_CHECK(false, "flint paged: the MoE needs the Marlin NVFP4 build (VLLM_CPP_MARLIN)");
   return DBuf();
 #endif
+}
+
+// res := bf16(x + res); out = RMSNorm(x + res) * w. With the glue kernels this is
+// vLLM's Flint fused_add_rms_norm (the norm taken from the unrounded f32 sum, one
+// launch); without them the shared vt::RmsNorm, which normalises the rounded res.
+void AddRmsNorm(Dev d, DBuf& out, const Tensor& x, DBuf& res, const Tensor& w, float eps,
+                const flint::FlintDeviceKernels* fk) {
+  if (fk != nullptr && x.dtype == DType::kBF16 && w.dtype == DType::kBF16 && x.IsContiguous()) {
+    fk->add_rms_norm(d.q, out.ptr(), x.data, res.ptr(), w.data, x.shape[0], x.shape[1], eps);
+    return;
+  }
+  vt::RmsNorm(d.q, out.t(), x, w, vt::RmsNormArgs{eps, false}, &res.t());
 }
 
 // One decoder layer (vLLM FlintDecoderLayer): fused add + input RMSNorm ->
@@ -282,30 +375,20 @@ DBuf MoeBlock(Dev d, const FlintPagedMoe& m, const FlintParams& p, const Tensor&
 void RunLayer(Dev d, const FlintPagedLayer& lw, const FlintParams& p, const HfConfig& cfg,
               Tensor& hidden, std::shared_ptr<void>& hidden_hold, DBuf& res,
               const StepInputs& si, const CommonAttentionMetadata& meta,
-              const PagedKvCache& kv, int64_t T) {
+              const PagedKvCache& kv, int64_t T, const flint::FlintDeviceKernels* fk) {
   const int64_t H = p.hidden_size;
   const float eps = static_cast<float>(p.rms_norm_eps);
   Tensor w_in = ResidentWeight(d, lw.input_layernorm, {H});
   DBuf normed(d, DType::kBF16, {T, H});
-  vt::RmsNorm(d.q, normed.t(), hidden, w_in, vt::RmsNormArgs{eps, false}, &res.t());
+  AddRmsNorm(d, normed, hidden, res, w_in, eps, fk);
 
-  AttnBlockLayerOpts opts;
-  if (lw.sliding) {
-    // vLLM per_layer_sliding_window = sliding_window, i.e. FlashAttention's
-    // (W-1, 0); --disable-sliding-window turns it off as for every model.
-    opts.window = ResolveAttentionWindow(std::nullopt, p.sliding_window,
-                                         v1::AttentionType::kDecoder,
-                                         DisableSlidingWindowActive());
-  }
-  opts.sinks = &lw.sinks;
-  opts.rope = lw.rope;
-  DBuf attn = AttnBlock(d, lw.attn, cfg, normed.t(), si, meta, kv, T, nullptr, opts);
+  DBuf attn = Attention(d, lw, p, cfg, normed.t(), si, meta, kv, T, fk);
 
   Tensor w_post = ResidentWeight(d, lw.post_attention_layernorm, {H});
   DBuf normed2(d, DType::kBF16, {T, H});
-  vt::RmsNorm(d.q, normed2.t(), attn.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
+  AddRmsNorm(d, normed2, attn.t(), res, w_post, eps, fk);
 
-  DBuf out = lw.dense ? DenseMlp(d, lw, normed2.t()) : MoeBlock(d, lw.moe, p, normed2.t(), T);
+  DBuf out = lw.dense ? DenseMlp(d, lw, normed2.t()) : MoeBlock(d, lw.moe, p, normed2.t(), T, fk);
   hidden = out.t();
   hidden_hold = out.ReleaseShared();
 }
@@ -319,8 +402,9 @@ void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>&
     d.b.Copy(d.q, dp + s * rb, sp + static_cast<size_t>(idx[s]) * rb, rb);
 }
 
-// The embedding stays outside the decode graph: vt::Embedding allocates a device
-// flag and syncs (the qwen3_moe.cpp EmbedInto note).
+// The embedding stays outside the decode graph: vt::Embedding reports bad ids
+// through a device flag it copies back with an event per call (and allocates on
+// a ring slot's first use), which a capture cannot hold.
 void EmbedInto(Dev d, DBuf& hidden, const Tensor& ids, const FlintPagedWeights& w) {
   Tensor table = ResidentWeight(d, w.embed_tokens, {w.params.vocab_size, w.params.hidden_size});
   vt::Embedding(d.q, hidden.t(), table, ids);
@@ -335,12 +419,17 @@ void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
 }
 
 // The capturable region: the layers, the final norm and the head, returning
-// [n_out, vocab] f32 on the device. Per-step inputs are read from host vectors
-// the decode graph keeps at fixed addresses.
+// [n_out, vocab] f32 on the device. Without `persistent` the step inputs are
+// uploaded here from the host vectors; the decode graph instead passes device
+// buffers it refreshed itself OUTSIDE the capture, because H2D copies baked into
+// a graph read pageable memory and stalled each replay (measured: 6 copies and
+// ~120 us of GPU idle per decode step before the first kernel). The RoPE table
+// is a function of the positions, so it is rebuilt here either way.
 DBuf ForwardLayers(Dev d, const Tensor& hidden_in, const std::vector<int32_t>& positions,
                    const CommonAttentionMetadata& meta, const std::vector<PagedKvCache>& kv,
                    const FlintPagedWeights& w, const HfConfig& cfg,
-                   const std::vector<int32_t>& logits_indices) {
+                   const std::vector<int32_t>& logits_indices,
+                   StepInputs* persistent = nullptr) {
   const FlintParams& p = w.params;
   const int64_t T = hidden_in.shape[0], H = p.hidden_size, V = p.vocab_size;
   const float eps = static_cast<float>(p.rms_norm_eps);
@@ -353,16 +442,25 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in, const std::vector<int32_t>& p
 
   DBuf res(d, DType::kBF16, {T, H});
   res.Zero(d);
-  const StepInputs si = BuildStepInputs(d, positions, meta, cfg);
+  const flint::FlintDeviceKernels* fk = FusedKernels(d);
+  StepInputs built;
+  if (persistent == nullptr) {
+    built = BuildStepInputs(d, positions, meta, cfg);
+  } else {
+    vt::RopeCosSinCache(d.q, persistent->cos_sin.t(), persistent->positions.t(),
+                        MakeRopeArgs(cfg));
+    if (fk == nullptr && RopeCacheEnabled())
+      vt::CastBf16(d.q, persistent->cos_sin_bf16.t(), persistent->cos_sin.t());
+  }
+  const StepInputs& si = persistent != nullptr ? *persistent : built;
   Tensor hidden = hidden_in;
   std::shared_ptr<void> hidden_hold;
   for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
     RunLayer(d, w.layers[static_cast<size_t>(l)], p, cfg, hidden, hidden_hold, res, si, meta,
-             kv[static_cast<size_t>(l)], T);
+             kv[static_cast<size_t>(l)], T, fk);
   }
   DBuf normed(d, DType::kBF16, {T, H});
-  vt::RmsNorm(d.q, normed.t(), hidden, ResidentWeight(d, w.final_norm, {H}),
-              vt::RmsNormArgs{eps, false}, &res.t());
+  AddRmsNorm(d, normed, hidden, res, ResidentWeight(d, w.final_norm, {H}), eps, fk);
 
   const bool gather =
       !logits_indices.empty() && static_cast<int64_t>(logits_indices.size()) < T;
@@ -413,7 +511,20 @@ ForwardLogits ViewDeviceLogits(void* base, vt::Device device, int64_t rows, int6
   fl.vocab = vocab;
   fl.device_tensor = MakeTensor(base, DType::kF32, device, {rows, vocab});
   fl.device_storage = std::shared_ptr<void>(base, [](void*) {});
+  fl.non_owning_view = true;  // releasing it frees nothing: the runner may skip its drain
   return fl;
+}
+
+// VT_ASYNC_EXECUTOR=1 (qwen3_5.cpp DecodeGraphDoubleBufferEnabled): the runner
+// skips its pre-forward drain after a graphed step, and its depth-2 loop enqueues
+// sample(i-1) after forward(i), so each padded size keeps two independent slots
+// and alternates them; otherwise replay i+1 would overwrite logits i before they
+// are sampled. VT_ASYNC_EXECUTOR_NO_DBUF=1 is the same test-only escape hatch.
+bool DecodeGraphDoubleBufferEnabled() {
+  const char* v = std::getenv("VT_ASYNC_EXECUTOR");
+  if (v == nullptr || v[0] != '1' || v[1] != '\0') return false;
+  const char* nod = std::getenv("VT_ASYNC_EXECUTOR_NO_DBUF");
+  return !(nod != nullptr && nod[0] == '1' && nod[1] == '\0');
 }
 
 template <typename T>
@@ -423,6 +534,13 @@ void CopyInPlace(std::vector<T>& dst, const std::vector<T>& src) {
   } else {
     std::copy(src.begin(), src.end(), dst.begin());
   }
+}
+
+// The pool the decode graph's retained step inputs come from (qwen3_5.cpp's
+// PersistentDecodeInputPool): per device, separate from the scratch pool.
+DevicePool& FlintInputPool(vt::Backend& b) {
+  static detail::PoolTable table;
+  return table.For(b);
 }
 
 // The S-padded pure-decode inputs (qwen3_moe.cpp BuildPaddedDecodeAttn): the
@@ -525,12 +643,17 @@ struct FlintPagedDecodeGraph::Impl {
               platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
               !platforms::GetPlatform(queue.device.type).static_graph_requires_opt_in() &&
               b.SupportsGraphCapture();
+    dbuf = DecodeGraphDoubleBufferEnabled();
   }
   ~Impl() {
     Backend& b = vt::GetBackend(queue.device.type);
     for (auto& kv : slots) {
-      Pool(b).UnpinForGraph(b, kv.second.pinned);
-      kv.second.pinned.clear();
+      for (SizeSlot& s : kv.second.slot) {
+        Pool(b).UnpinForGraph(b, s.pinned);
+        s.pinned.clear();
+        s.UnbindInputs(b);
+        if (s.staged.handle != nullptr) b.DestroyEvent(s.staged);
+      }
     }
   }
 
@@ -544,9 +667,33 @@ struct FlintPagedDecodeGraph::Impl {
     vt::BreakableGraph graph;
     DevicePool::StepDemand demand;                  // the cold step's pool demand
     std::vector<std::pair<size_t, void*>> pinned;  // blocks the captured graph baked
+    // Device step inputs the captured graph reads, refreshed before every replay
+    // from pinned staging (an async DMA, outside the graph). From FlintInputPool so
+    // retaining them never empties a size class the captured scratch needs.
+    std::unique_ptr<StepInputs> dev;
+    vt::PersistentStepInput in_positions, in_slots, in_block_table, in_seq_lens, in_qsl;
+    // Recorded after each staging; the next refresh of this slot waits on it, so
+    // the pinned block is not rewritten while the previous upload may still be
+    // queued behind a running replay (the async runner overlaps steps).
+    vt::Event staged{};
+    bool staged_pending = false;
     int fa_cols = -1;
     bool warm = false;
     int64_t replays = 0;
+
+    // Waits out an upload still reading the pinned staging before freeing it.
+    void UnbindInputs(Backend& b) {
+      if (staged_pending) {
+        b.SynchronizeEvent(staged);
+        staged_pending = false;
+      }
+      in_positions.Unbind();
+      in_slots.Unbind();
+      in_block_table.Unbind();
+      in_seq_lens.Unbind();
+      in_qsl.Unbind();
+      dev.reset();
+    }
 
     void Refresh(const std::vector<int32_t>& tok, const std::vector<int32_t>& pos,
                  const CommonAttentionMetadata& am) {
@@ -565,12 +712,52 @@ struct FlintPagedDecodeGraph::Impl {
     }
   };
 
+  // Builds this slot's retained device inputs (first capture at this size, or
+  // after a block-table width change) and binds the pinned staging cells to them.
+  void BindInputs(Dev d, SizeSlot& s, int64_t S) {
+    s.UnbindInputs(d.b);
+    {
+      ActivePoolScope scope(&FlintInputPool(d.b));
+      s.dev = std::make_unique<StepInputs>(BuildStepInputs(d, s.positions, s.attn_meta, config));
+    }
+    const auto cols = static_cast<size_t>(s.attn_meta.block_table_num_cols);
+    const auto rows = static_cast<size_t>(S);
+    s.in_positions.Bind(d.b, s.dev->positions.ptr(), sizeof(int32_t) * rows);
+    s.in_slots.Bind(d.b, s.dev->slot_mapping.ptr(), sizeof(int64_t) * rows);
+    s.in_block_table.Bind(d.b, s.dev->block_table.ptr(), sizeof(int32_t) * rows * cols);
+    s.in_seq_lens.Bind(d.b, s.dev->seq_lens.ptr(), sizeof(int32_t) * rows);
+    s.in_qsl.Bind(d.b, s.dev->query_start_loc.ptr(), sizeof(int32_t) * (rows + 1));
+    if (s.staged.handle == nullptr) s.staged = d.b.CreateEvent(/*blocking=*/true);
+    s.staged_pending = false;
+  }
+
+  // Copies this step's padded host inputs into the slot's device buffers.
+  void StageInputs(Dev d, SizeSlot& s) {
+    if (s.staged_pending) d.b.SynchronizeEvent(s.staged);
+    const auto& am = s.attn_meta;
+    s.in_positions.RefreshFromHost(d.q, s.positions.data(), sizeof(int32_t) * s.positions.size());
+    s.in_slots.RefreshFromHost(d.q, am.slot_mapping.data(), sizeof(int64_t) * am.slot_mapping.size());
+    s.in_block_table.RefreshFromHost(d.q, am.block_table_tensor.data(),
+                                     sizeof(int32_t) * am.block_table_tensor.size());
+    s.in_seq_lens.RefreshFromHost(d.q, am.seq_lens.data(), sizeof(int32_t) * am.seq_lens.size());
+    s.in_qsl.RefreshFromHost(d.q, am.query_start_loc.data(),
+                             sizeof(int32_t) * am.query_start_loc.size());
+    d.b.RecordEvent(s.staged, d.q);
+    s.staged_pending = true;
+  }
+
   const FlintPagedWeights& weights;
   const HfConfig& config;
   vt::Queue queue;
   int64_t max_num_reqs = 0;
   bool enabled = false;
-  std::map<int64_t, SizeSlot> slots;
+  bool dbuf = false;  // two slots per size, alternated (VT_ASYNC_EXECUTOR=1)
+  // With dbuf off only slot[0] is used and slot[1] stays empty.
+  struct SlotRing {
+    SizeSlot slot[2];
+    int next = 0;
+  };
+  std::map<int64_t, SlotRing> slots;
   int64_t replays = 0;
   bool any_captured = false;
 };
@@ -605,7 +792,9 @@ ForwardLogits FlintPagedDecodeGraph::Step(const std::vector<int32_t>& token_ids,
     return WrapDeviceLogits(std::move(lg), B, V);
   }
 
-  Impl::SizeSlot& s = impl_->slots[S];
+  Impl::SlotRing& ring = impl_->slots[S];
+  Impl::SizeSlot& s = ring.slot[impl_->dbuf ? ring.next : 0];
+  if (impl_->dbuf) ring.next ^= 1;
   const int cols = attn_meta.block_table_num_cols;
   std::vector<int32_t> ptok, ppos;
   CommonAttentionMetadata pam;
@@ -618,14 +807,18 @@ ForwardLogits FlintPagedDecodeGraph::Step(const std::vector<int32_t>& token_ids,
   const detail::DeviceTokenIds ov = detail::TakeDeviceTokenIds();
   s.ids.Ensure(d, S);
   s.ids.Refresh(d, s.token_ids, ov.ids, ov.count);
-  if (cols_changed && s.graph.captured()) {
-    s.graph.Reset();
-    Pool(b).UnpinForGraph(b, s.pinned);  // no graph, nothing baked
-    s.pinned.clear();
-    s.warm = false;
+  if (cols_changed) {
+    if (s.graph.captured()) {
+      s.graph.Reset();
+      Pool(b).UnpinForGraph(b, s.pinned);  // no graph, nothing baked
+      s.pinned.clear();
+      s.warm = false;
+    }
+    s.UnbindInputs(b);  // the block table it was sized for is gone
   }
 
   if (s.graph.captured()) {
+    impl_->StageInputs(d, s);
     EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights);
     s.graph.Replay(impl_->queue);
     ++s.replays;
@@ -634,8 +827,12 @@ ForwardLogits FlintPagedDecodeGraph::Step(const std::vector<int32_t>& token_ids,
   }
 
   if (s.warm) {
-    // Outside the captured region, where a cudaMalloc is legal; a no-op once the
-    // free list is deep enough.
+    // Outside the captured region, where a cudaMalloc is legal: the retained step
+    // inputs (allocated once per size and width), this step's values staged into
+    // them, and the scratch pool grown to the cold step's demand (a no-op once the
+    // free list is deep enough).
+    if (s.dev == nullptr) impl_->BindInputs(d, s, S);
+    impl_->StageInputs(d, s);
     Pool(b).PreGrowForCapture(b, s.demand);
     EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights);
     std::optional<DBuf> lg;
@@ -644,7 +841,7 @@ ForwardLogits FlintPagedDecodeGraph::Step(const std::vector<int32_t>& token_ids,
       // FULL decode graph.
       vt::GraphCaptureScope scope(b, impl_->queue, s.graph, vt::GraphCaptureMode::kFull);
       lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv, impl_->weights,
-                         impl_->config, kNoGather);
+                         impl_->config, kNoGather, s.dev.get());
     }
     if (!s.graph.captured()) {
       s.warm = false;

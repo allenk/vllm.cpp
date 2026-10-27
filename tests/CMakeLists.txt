@@ -817,6 +817,10 @@ vllm_cpp_add_test(test_flint_gguf vllm/models/test_flint_gguf.cpp)
 target_include_directories(test_flint_gguf PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(test_flint_gguf PRIVATE
   FLINT_GOLDENS="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/flint_goldens_q4_k_m.json")
+# The kFlint CUDA glue kernels against host models of the same arithmetic; skips
+# without a CUDA backend.
+vllm_cpp_add_test(test_flint_device vllm/models/test_flint_device.cpp)
+target_include_directories(test_flint_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_deepseek_v2_load vllm/models/test_deepseek_v2_load.cpp)
 vllm_cpp_add_test(test_deepseek_v2_forward vllm/models/test_deepseek_v2_forward.cpp)
 target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
