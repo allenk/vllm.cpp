@@ -21,6 +21,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -262,10 +263,53 @@ DBuf Attention(Dev d, const FlintPagedLayer& lw, const FlintParams& p, const HfC
                                         DType::kBF16);
 }
 
+// The ungated shared expert (vLLM's merged gate_up_proj, then down_proj).
+DBuf SharedExpert(Dev d, const FlintPagedMoe& m, const Tensor& x) {
+  DBuf act = GateUpAct(d, x, m.shared_gate, m.shared_up);
+  return dense_nvfp4::MatmulNvfp4W4A16D(d, act.t(), m.shared_down, DType::kBF16);
+}
+
+// The second stream the shared expert runs on while the routed experts run on
+// the main one: vLLM's SharedExperts MULTI_STREAM_OVERLAPPED order, taken for
+// steps of at most VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD (256) tokens. The
+// switches are the Qwen3.5 driver's (qwen3_5.cpp MoeSharedAuxStreamEnabled):
+// VT_MOE_SHARED_AUX_STREAM=0 keeps the serial order, VT_MOE_SHARED_AUX_THRESHOLD
+// overrides the token cap (0 never overlaps). Flint keeps vLLM's 256 as its
+// default where the Qwen3.5 driver calibrated 128 on GB10. One queue and two
+// events per device, created at the first (eager) use, before any capture.
+struct FlintAuxStream {
+  vt::Queue q;
+  vt::Event fork;  // recorded on main after the block input; aux waits it
+  vt::Event done;  // recorded on aux after the shared expert; main waits it
+};
+FlintAuxStream* SharedExpertAuxStream(Dev d, int64_t T) {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MOE_SHARED_AUX_STREAM");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  static const int64_t cap = [] {
+    const char* e = std::getenv("VT_MOE_SHARED_AUX_THRESHOLD");
+    return e != nullptr ? static_cast<int64_t>(std::atoll(e)) : int64_t{256};
+  }();
+  if (!on || T > cap || !d.b.SupportsAuxStream()) return nullptr;
+  static std::mutex mu;
+  static std::unordered_map<int, FlintAuxStream> streams;  // by device index
+  std::lock_guard<std::mutex> lk(mu);
+  auto it = streams.find(d.q.device.index);
+  if (it == streams.end()) {
+    FlintAuxStream a{d.b.CreateQueue(), d.b.CreateEvent(), d.b.CreateEvent()};
+    it = streams.emplace(d.q.device.index, a).first;
+  }
+  return &it->second;
+}
+
 // One MoE block: bf16 router logits -> sigmoid top-6 renormalised in f32 (the
 // kFlint kernel, or the grouped router with a single group, which is plain
 // top-k) -> moe_align -> w13 GEMM -> SiluAndMul (vLLM's act_and_mul with the
 // kFlint kernels) -> w2 GEMM -> the ungated shared expert -> weighted combine.
+// For small steps the shared expert runs on the aux stream concurrently with the
+// router and the routed experts (SharedExpertAuxStream); both read x and write
+// disjoint buffers, so the output is the serial one.
 // The router GEMM stores bf16 because that is what vLLM's GateLinear does on
 // SM120: its fp32-output tiers are gated on SM90 / SM100 (family 100 only) or
 // on an out_dtype Flint does not set, so it falls to F.linear in the model dtype.
@@ -277,6 +321,17 @@ DBuf MoeBlock(Dev d, const FlintPagedMoe& m, const FlintParams& p, const Tensor&
   VT_CHECK(x.dtype == DType::kBF16, "flint paged: the Marlin MoE takes a bf16 activation");
   FlintMoeMarlin& mr = ResidentIn<FlintMoeMarlin>(m.marlin);
   if (!mr.ready) BuildFlintMoeMarlin(d, m, H, I, mr);
+
+  std::optional<DBuf> shared;
+  FlintAuxStream* ax = SharedExpertAuxStream(d, T);
+  if (ax != nullptr) {
+    d.b.RecordEvent(ax->fork, d.q);
+    d.b.QueueWaitEvent(ax->q, ax->fork);
+    // Its scratch from AuxPool, so no block is live on both streams at once.
+    ActivePoolScope guard(&AuxPool(d.b));
+    shared.emplace(SharedExpert(Dev{d.b, ax->q}, m, x));
+    d.b.RecordEvent(ax->done, ax->q);
+  }
 
   Tensor router = ResidentWeight(d, m.router, {E, H});
   DBuf logits(d, DType::kBF16, {T, E});
@@ -338,12 +393,15 @@ DBuf MoeBlock(Dev d, const FlintPagedMoe& m, const FlintParams& p, const Tensor&
                                   vt::MoeMarlinArgs{block, 1, Pi, Hi, Ii, false});
   }
 
-  DBuf shared_act = GateUpAct(d, x, m.shared_gate, m.shared_up);
-  DBuf shared = dense_nvfp4::MatmulNvfp4W4A16D(d, shared_act.t(), m.shared_down, DType::kBF16);
+  if (ax != nullptr) {
+    d.b.QueueWaitEvent(d.q, ax->done);  // join before the combine reads it
+  } else {
+    shared.emplace(SharedExpert(d, m, x));
+  }
 
   DBuf out(d, DType::kBF16, {T, H});
   Tensor eo = Reshape(down.t(), {T, Kk, H});
-  vt::MoeCombine(d.q, out.t(), eo, topk_w.t(), &shared.t());
+  vt::MoeCombine(d.q, out.t(), eo, topk_w.t(), &shared->t());
   return out;
 #else
   (void)d;
