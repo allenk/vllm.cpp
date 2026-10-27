@@ -1009,7 +1009,27 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // Epilogue
 
-    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax);
+    Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+    Tensor taccOcO = thr_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
+    static_assert(decltype(size<0>(taccOcO))::value == 4);
+    // Convert to ((2, 2), MMA_M, MMA_K) then take only the row indices.
+    Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
+
+    // vllm.cpp addition: learned attention sinks (flash.h sinks_ptr). An unsplit launch folds
+    // them in here; a split launch keeps its partial LSEs sink-free for the combine. Under the
+    // group swap a block row is a query group, so the query head is bidh * ngroups + row.
+    const bool fold_sinks = !Split && params.sinks_ptr != nullptr;
+    Tensor sink = make_fragment_like(softmax.row_sum);
+    #pragma unroll
+    for (int mi = 0; mi < size(sink); ++mi) {
+        const int row = m_block * kBlockM + get<0>(taccOcO_row(mi));
+        const int head = !params.seqlenq_ngroups_swapped
+            ? bidh : bidh * params.seqlen_q + std::min(row, params.seqlen_q - 1);
+        sink(mi) = fold_sinks ? reinterpret_cast<const float *>(params.sinks_ptr)[head] : 0.f;
+    }
+    Tensor lse = fold_sinks
+        ? softmax.normalize_softmax_lse_sink(acc_o, params.scale_softmax, sink)
+        : softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax);
     // if (cute::thread0()) { print(lse); }
 
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(smem_)), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)
@@ -1056,11 +1076,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor tOrOaccum = make_tensor<ElementO>(shape(tOgOaccum));
     cute::copy(gmem_tiled_copy_Oaccum, tOsOaccum, tOrOaccum);
 
-    Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
-    Tensor taccOcO = thr_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
-    static_assert(decltype(size<0>(taccOcO))::value == 4);
-    // Convert to ((2, 2), MMA_M, MMA_K) then take only the row indices.
-    Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
     CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
     if (get<1>(taccOcO_row(0)) == 0) {
         #pragma unroll
@@ -1210,6 +1225,25 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     // For the case where all local lse == -INFINITY, we want to set lse_logsum to INFINITY. Otherwise
     // lse_logsum is log(0.0) = -INFINITY and we get NaN when we do lse_accum(l) - lse_logsum.
     ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
+    // vllm.cpp addition: learned attention sinks (flash.h sinks_ptr) join the log-sum-exp once,
+    // here, after every split's sink-free partial LSE; the scales below then shrink by the sink's
+    // share. A flat row is (b, h, seqlen_q); under the group swap seqlen_q holds the query groups.
+    if (params.sinks_ptr != nullptr) {
+        const int col = tidx / kRowsPerLoadTranspose;
+        const index_t row = row_offset_lse + col;
+        if (col < kBlockM && row < lse_size) {
+            const int head = params.seqlenq_ngroups_swapped
+                ? static_cast<int>(row % (params.h * params.seqlen_q))
+                : static_cast<int>((row / params.seqlen_q) % params.h);
+            const float sink = reinterpret_cast<const float *>(params.sinks_ptr)[head];
+            if (lse_logsum == INFINITY) {
+                lse_logsum = sink;
+            } else {
+                const float mx = max(lse_logsum, sink);
+                lse_logsum = mx + logf(expf(lse_logsum - mx) + expf(sink - mx));
+            }
+        }
+    }
     // if (bidx == 0 && tidx < 32) { printf("tidx = %d, lse = %f, lse_max = %f, lse_logsum = %f\n", tidx, lse_accum(0), lse_max, lse_logsum); }
     if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) {
         if (params.unpadded_lse) {

@@ -5303,6 +5303,18 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
   }
   VT_CHECK(IsFloat(query.dtype) && IsOutFloat(out.dtype),
            "paged_attention: float query, f32/bf16 out");
+  if (args.sinks != nullptr) {
+    VT_CHECK(args.sinks->rank == 1 && args.sinks->shape[0] == hq &&
+                 args.sinks->dtype == DType::kF32 && args.sinks->IsContiguous() &&
+                 args.sinks->device == q.device,
+             "paged_attention: sinks must be a contiguous f32 [num_q_heads] tensor on the "
+             "queue's device");
+    // Like the fp8 read below, sinks ride an ADDITIVE field of an op other
+    // backends register for the plain softmax, so the list of backends that
+    // fold the sink term is stated here; anywhere else the term would be dropped.
+    VT_CHECK(q.device.type == DeviceType::kCPU || q.device.type == DeviceType::kCUDA,
+             "paged_attention: attention sinks are implemented on CPU and CUDA only");
+  }
   // The KV cache may be a DIFFERENT float dtype than the query (Phase-1 bf16 KV
   // cache: f32 query · bf16 cache — the kernel converts bf16 cache reads to f32
   // and accumulates in f32). Require only that K and V share one float dtype.

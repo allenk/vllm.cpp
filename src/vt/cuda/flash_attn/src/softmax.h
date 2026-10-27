@@ -184,6 +184,31 @@ struct Softmax {
         }
         return lse;
     };
+
+    // vllm.cpp addition: normalize_softmax_lse (no dropout, no split) with one sink logit per
+    // row folded into the denominator after the quad reduction, so each row adds it once.
+    // row_max * softmax_scale is the row's largest scaled logit, the same m the CPU
+    // references subtract. A row with no visible key keeps the original handling.
+    template<typename Tensor0, typename Tensor1>
+    __forceinline__ __device__ TensorT normalize_softmax_lse_sink(Tensor0 &acc_o, float softmax_scale, Tensor1 const &sink) {
+        SumOp<float> sum_op;
+        quad_allreduce_(row_sum, row_sum, sum_op);
+        TensorT lse = make_fragment_like(row_sum);
+        Tensor acc_o_rowcol = make_tensor(acc_o.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
+        static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
+        #pragma unroll
+        for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
+            float sum = row_sum(mi);
+            const bool empty = sum == 0.f || sum != sum;
+            const float m = row_max(mi) * softmax_scale;
+            if (!empty) { sum += expf(sink(mi) - m); }
+            float inv_sum = empty ? 1.f : 1.f / sum;
+            lse(mi) = empty ? INFINITY : m + __logf(sum);
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= inv_sum; }
+        }
+        return lse;
+    };
 };
 
 }  // namespace FLASH_NAMESPACE

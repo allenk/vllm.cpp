@@ -3001,14 +3001,37 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
                                 std::is_same<TQ, __nv_bfloat16>::value &&
                                 std::is_same<TKV, __nv_bfloat16>::value &&
                                 out.dtype == DType::kBF16;
+  // LEARNED ATTENTION SINKS (PagedAttentionArgs::sinks, Flint). The vendored FA-2
+  // folds the sink term (flash.h sinks_ptr), and no other kernel in this file
+  // does, so a sink layer takes this lane for prefill and decode alike or is
+  // refused below. Head dim 128, any GQA-divisible topology, bf16 end to end, and
+  // either full attention or the causal LEFT window a sliding layer presents
+  // (FA-2's local mask would honour a right edge the causal bound excludes, the
+  // same reason the DFlash draft arm refuses it). Gated on the sinks pointer, so
+  // no model without sinks reaches it and their routing is unchanged.
+  const bool fa2_window_left_only =
+      !args.window_size.has_value() ||
+      (args.causal && args.window_size->left >= 0 && args.window_size->right == 0);
+  const bool fa2_sinks = args.sinks != nullptr && d == 128 && Fa2HeadDimBuilt(128) &&
+                         num_kv_heads > 0 && hq % num_kv_heads == 0 &&
+                         fa2_window_left_only && block_size % 16 == 0 &&
+                         block_table.stride[1] == 1 &&
+                         std::is_same<TQ, __nv_bfloat16>::value &&
+                         std::is_same<TKV, __nv_bfloat16>::value &&
+                         out.dtype == DType::kBF16;
 #else
   const bool fa2_prefill = false;
   const bool fa2_decode = false;
   const bool fa2_decode_qwen3 = false;
+  const bool fa2_sinks = false;
   (void)fa2_prefill;
   (void)fa2_decode;
   (void)fa2_decode_qwen3;
 #endif
+  VT_CHECK(args.sinks == nullptr || fa2_sinks,
+           "cuda paged_attention: attention sinks are folded only by the FA-2 lane "
+           "(bf16 query, KV and out; head_dim 128 compiled in VLLM_CPP_FA2_HEAD_DIMS; "
+           "full attention or a causal left window; page size a multiple of 16)");
   switch (out.dtype) {
     case DType::kF32:
       if (flash2vec) {
@@ -3040,7 +3063,26 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
       break;
     case DType::kBF16:
 #ifdef VLLM_CPP_FLASH_ATTN
-      if (fa2_prefill) {
+      if (fa2_sinks) {
+        // Every FA-2 launcher hands args.sinks to the kernel. Decode uses the
+        // group swap only without a window, as upstream mha_fwd_kvcache does: the
+        // swap aligns each query group as its own bottom-right row, which a local
+        // mask would read as different positions.
+        if (is_prefill) {
+          LaunchPrefillFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                               query_start_loc, args, hq, d, num_reqs, num_kv_heads, block_size);
+        } else if (fa2_spec_decode) {
+          LaunchSpecDecodeFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                  args, hq, d, num_reqs, num_kv_heads, block_size,
+                                  args.uniform_spec_query_len);
+        } else {
+          const bool gqa_swap =
+              qpk > 1 && !args.window_size.has_value() && Fa2DecodeGqaSwapEnabled();
+          LaunchDecodeVarlenFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                    query_start_loc, args, hq, d, num_reqs, num_kv_heads,
+                                    block_size, gqa_swap);
+        }
+      } else if (fa2_prefill) {
         LaunchPrefillFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
                              query_start_loc, args, hq, d, num_reqs, num_kv_heads, block_size);
       } else if (fa2_spec_decode) {

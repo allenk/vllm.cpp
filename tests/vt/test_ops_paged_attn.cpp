@@ -127,7 +127,8 @@ std::vector<float> ComposedPagedRef(const std::vector<float>& q, const std::vect
                                     const std::vector<int32_t>& seq_lens,
                                     const std::vector<int32_t>& qsl, int64_t hq, int64_t hk,
                                     int64_t d, int64_t block_size, float scale, bool causal,
-                                    std::optional<AttentionWindow> window = std::nullopt) {
+                                    std::optional<AttentionWindow> window = std::nullopt,
+                                    const std::vector<float>* sinks = nullptr) {
   const int64_t num_reqs = static_cast<int64_t>(seq_lens.size());
   const int64_t num_tokens = qsl.back();
   const int64_t qpk = hq / hk;
@@ -167,6 +168,8 @@ std::vector<float> ComposedPagedRef(const std::vector<float>& q, const std::vect
           sc[static_cast<size_t>(j - jmin)] = e;
           denom += e;
         }
+        // A learned sink joins the denominator only (PagedAttentionArgs::sinks).
+        if (sinks != nullptr) denom += std::exp((*sinks)[static_cast<size_t>(h)] - m);
         const float inv = 1.0f / denom;
         for (int64_t e = 0; e < d; ++e) {
           float a = 0.0f;
@@ -220,7 +223,7 @@ TEST_CASE("paged_attention anchor: single sequence agrees with dense vt::Attenti
 
   const int64_t max_blocks = num_blocks;
   std::vector<int32_t> block_table(static_cast<size_t>(max_blocks));
-  for (int64_t b = 0; b < max_blocks; ++b) block_table[static_cast<size_t>(b)] = b;  // identity
+  for (int64_t b = 0; b < max_blocks; ++b) block_table[static_cast<size_t>(b)] = static_cast<int32_t>(b);  // identity
   std::vector<int32_t> seq_lens = {static_cast<int32_t>(T)};
   std::vector<int32_t> qsl = {0, static_cast<int32_t>(T)};
 
@@ -268,7 +271,7 @@ TEST_CASE("paged_attention anchor on strided unbind-slice cache == dense") {
   vt::ReshapeAndCache(qq, tk, tv, tkc, tvc, ts);
 
   std::vector<int32_t> block_table(static_cast<size_t>(nb));
-  for (int64_t b = 0; b < nb; ++b) block_table[static_cast<size_t>(b)] = b;
+  for (int64_t b = 0; b < nb; ++b) block_table[static_cast<size_t>(b)] = static_cast<int32_t>(b);
   std::vector<int32_t> seq_lens = {static_cast<int32_t>(T)};
   std::vector<int32_t> qsl = {0, static_cast<int32_t>(T)};
   std::vector<float> paged(static_cast<size_t>(T * Hq * D), 0.0f);
@@ -585,6 +588,68 @@ TEST_CASE("paged_attention sliding-window decoder matches bottom-right causal ma
       CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-5));
     }
   }
+}
+
+// Learned attention sinks (PagedAttentionArgs::sinks; Flint's `softmax_type:
+// learnable`): one logit per query head joins the softmax denominator and
+// nothing else. Same ragged batch as the window test above, with and without a
+// causal window. The sinks span -1.5..+2 so some heads lose most of their mass,
+// and the output must move away from the sink-free reference: a kernel that
+// dropped the term would otherwise still look plausible.
+TEST_CASE("paged_attention learned sinks fold into the softmax denominator") {
+  const int64_t Hq = 8, Hk = 2, D = 8, block_size = 4;
+  const float scale = std::pow(static_cast<float>(D), -0.5f);
+  std::vector<int32_t> qsl = {0, 5, 6, 9};
+  std::vector<int32_t> seq_lens = {5, 9, 11};
+  const int64_t num_tokens = qsl.back();
+  const int64_t num_blocks = 12, max_blocks = 3;
+  std::vector<int32_t> block_table = {2, 3, 0, 4, 7, 8, 1, 9, 10};
+  auto q = RandF32(static_cast<size_t>(num_tokens * Hq * D), 3111);
+  auto kc = RandF32(static_cast<size_t>(num_blocks * block_size * Hk * D), 3112);
+  auto vc = RandF32(static_cast<size_t>(num_blocks * block_size * Hk * D), 3113);
+  std::vector<float> sinks(static_cast<size_t>(Hq));
+  for (int64_t h = 0; h < Hq; ++h) sinks[static_cast<size_t>(h)] = -1.5f + 0.5f * static_cast<float>(h);
+
+  Queue qq = Q();
+  Tensor tq = F32(q, {num_tokens, Hq, D});
+  Tensor tkc = Contig(kc.data(), DType::kF32, Cpu(), {num_blocks, block_size, Hk, D});
+  Tensor tvc = Contig(vc.data(), DType::kF32, Cpu(), {num_blocks, block_size, Hk, D});
+  Tensor tbt = I32(block_table, {3, max_blocks});
+  Tensor tsl = I32(seq_lens, {3});
+  Tensor tqsl = I32(qsl, {4});
+  Tensor tsinks = F32(sinks, {Hq});
+
+  for (const std::optional<AttentionWindow> window :
+       {std::optional<AttentionWindow>{}, std::optional<AttentionWindow>{AttentionWindow{3, 0}}}) {
+    CAPTURE(window.has_value());
+    const std::vector<float> ref = ComposedPagedRef(
+        q, kc, vc, block_table, max_blocks, seq_lens, qsl, Hq, Hk, D, block_size, scale,
+        /*causal=*/true, window, &sinks);
+    const std::vector<float> plain = ComposedPagedRef(
+        q, kc, vc, block_table, max_blocks, seq_lens, qsl, Hq, Hk, D, block_size, scale,
+        /*causal=*/true, window);
+    std::vector<float> got(ref.size(), 0.0f);
+    Tensor tout = F32(got, {num_tokens, Hq, D});
+    PagedAttentionArgs args{scale, true};
+    args.window_size = window;
+    args.sinks = &tsinks;
+    vt::PagedAttention(qq, tout, tq, tkc, tvc, tbt, tsl, tqsl, args);
+    double moved = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-5));
+      moved = std::max(moved, std::abs(static_cast<double>(ref[i]) - plain[i]));
+    }
+    CHECK(moved > 0.05);
+  }
+
+  // A sinks tensor that is not one f32 logit per query head is refused by name.
+  std::vector<float> short_sinks(static_cast<size_t>(Hq - 1), 0.0f);
+  Tensor tshort = F32(short_sinks, {Hq - 1});
+  std::vector<float> got(static_cast<size_t>(num_tokens * Hq * D), 0.0f);
+  Tensor tout = F32(got, {num_tokens, Hq, D});
+  PagedAttentionArgs bad{scale, true};
+  bad.sinks = &tshort;
+  CHECK_THROWS(vt::PagedAttention(qq, tout, tq, tkc, tvc, tbt, tsl, tqsl, bad));
 }
 
 // Port of test_sliding_window_encoder_backend_correctness. Non-causal encoder
@@ -1131,6 +1196,11 @@ TEST_CASE("paged_attention CUDA matches CPU at head_dim 256 (gate config, epl=8)
 // ===========================================================================
 #ifdef VLLM_CPP_FLASH_ATTN
 namespace {
+#ifdef _WIN32
+// POSIX setenv/unsetenv for the MSVC build; an empty value removes the variable.
+int setenv(const char* name, const char* value, int) { return _putenv_s(name, value); }
+int unsetenv(const char* name) { return _putenv_s(name, ""); }
+#endif
 // Set/restore an env var for the duration of a scope (exception-safe).
 struct EnvGuard {
   const char* name;
@@ -1558,10 +1628,11 @@ struct Fa2DecodeCase {
 
   std::vector<float> Reference(
       const std::vector<int32_t>& lengths,
-      std::optional<AttentionWindow> window = std::nullopt) const {
+      std::optional<AttentionWindow> window = std::nullopt,
+      const std::vector<float>* sinks = nullptr) const {
     return ComposedPagedRef(query_rounded, key_rounded, value_rounded,
                             block_table, max_blocks, lengths, qsl, hq, hk, d,
-                            block_size, scale, /*causal=*/true, window);
+                            block_size, scale, /*causal=*/true, window, sinks);
   }
 };
 
@@ -2322,6 +2393,232 @@ TEST_CASE("paged_attention CUDA FA-2 decode scratch is queue-owned and released"
   CHECK(vt::cuda::testing::Fa2DecodeScratchShapeCountForTesting(0, second_handle) == 1);
   gpu.DestroyQueue(second.q);
   CHECK(vt::cuda::testing::Fa2DecodeScratchShapeCountForTesting(0, second_handle) == 0);
+}
+
+// ─── LEARNED ATTENTION SINKS on the FA-2 lane (Flint) ─────────────────────────
+// PagedAttentionArgs::sinks reaches the vendored kernel as flash.h sinks_ptr: an
+// unsplit launch folds the sink into each row's denominator in the epilogue, a
+// split launch adds it once in the combine. The cases use Flint's attention shape
+// (32 query heads over 4 KV heads, head dim 128) and its two masks: full
+// attention, which decodes through the GQA group swap, and the sliding layers'
+// causal left window of 513 tokens, which decodes without it.
+namespace {
+
+std::vector<float> SpreadSinks(int64_t hq) {
+  std::vector<float> s(static_cast<size_t>(hq));
+  for (int64_t h = 0; h < hq; ++h)
+    s[static_cast<size_t>(h)] = -2.0f + 4.0f * static_cast<float>(h) / static_cast<float>(hq - 1);
+  return s;
+}
+
+struct SinkDecodeRun {
+  std::vector<uint16_t> out;
+  Fa2DecodeRunStats stats;
+};
+
+// One pure-decode batch of `c` through vt::PagedAttention; `sinks` nullptr runs
+// the sink-free op on the same inputs.
+SinkDecodeRun RunSinkDecode(Fa2DecodeCase& c, const std::vector<float>* sinks,
+                            std::optional<AttentionWindow> window) {
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard guard(gpu);
+  DeviceTensor query(gpu, guard.q, DType::kBF16, {c.batch, c.hq, c.d}, c.query_bf16.data());
+  DeviceTensor cache(gpu, guard.q, DType::kBF16,
+                     {static_cast<int64_t>(c.combined_cache.size())}, c.combined_cache.data());
+  Tensor key = c.CacheView(cache, 0);
+  Tensor value = c.CacheView(cache, 1);
+  DeviceTensor block_table(gpu, guard.q, DType::kI32, {c.batch, c.max_blocks},
+                           c.block_table.data());
+  DeviceTensor seq_lens(gpu, guard.q, DType::kI32, {c.batch}, c.seq_lens.data());
+  DeviceTensor qsl(gpu, guard.q, DType::kI32, {c.batch + 1}, c.qsl.data());
+  DeviceTensor out(gpu, guard.q, DType::kBF16, {c.batch, c.hq, c.d});
+  DeviceTensor dsinks(gpu, guard.q, DType::kF32, {c.hq},
+                      sinks != nullptr ? sinks->data() : nullptr);
+
+  vt::cuda::testing::ResetFa2DecodeDebugCounters();
+  PagedAttentionArgs args{c.scale, true};
+  args.window_size = window;
+  args.query_start_loc_host = c.qsl.data();
+  args.max_seq_len = static_cast<int>(c.max_blocks * c.block_size);
+  if (sinks != nullptr) args.sinks = &dsinks.tensor();
+  vt::PagedAttention(guard.q, out.tensor(), query.tensor(), key, value, block_table.tensor(),
+                     seq_lens.tensor(), qsl.tensor(), args);
+  SinkDecodeRun run;
+  run.out.assign(c.query_bf16.size(), 0);
+  out.Download(guard.q, run.out.data());
+  run.stats = Fa2DecodeRunStats{vt::cuda::testing::Fa2DecodeLaunchesForTesting(),
+                                vt::cuda::testing::Fa2DecodeSplitLaunchesForTesting(),
+                                vt::cuda::testing::Fa2DecodeNoSplitLaunchesForTesting(),
+                                vt::cuda::testing::Fa2DecodeSwapLaunchesForTesting()};
+  vt::cuda::testing::DisableFa2DecodeDebugCounters();
+  return run;
+}
+
+}  // namespace
+
+TEST_CASE("paged_attention CUDA FA-2 learned sinks d128 decode matches composed reference") {
+  if (!HasCuda() || !vt::cuda::Fa2HeadDimBuilt(128)) {
+    MESSAGE("no CUDA backend or no FA-2 head_dim 128 in this build; skipping sink decode parity");
+    return;
+  }
+  const std::vector<float> sinks = SpreadSinks(32);
+  uint64_t split_launches = 0;
+  for (const std::optional<AttentionWindow> window :
+       {std::optional<AttentionWindow>{}, std::optional<AttentionWindow>{AttentionWindow{512, 0}}}) {
+    for (const int batch : {1, 4, 8}) {
+      for (const int base_len : {5, 600, 2048}) {  // 2048 splits the KV axis
+        CAPTURE(window.has_value());
+        CAPTURE(batch);
+        CAPTURE(base_len);
+        std::vector<int32_t> lengths(static_cast<size_t>(batch));
+        for (int i = 0; i < batch; ++i) lengths[static_cast<size_t>(i)] = base_len + i * 37;
+        Fa2DecodeCase c(/*Hq=*/32, /*Hkv=*/4, std::move(lengths),
+                        8100U + static_cast<uint32_t>(batch * 31 + base_len),
+                        /*capacity_blocks=*/0, /*head_dim=*/128);
+        const SinkDecodeRun run = RunSinkDecode(c, &sinks, window);
+        CheckBf16AgainstReference(run.out, c.Reference(c.seq_lens, window, &sinks),
+                                  "FA2 sink decode");
+        CHECK(run.stats.launches == 1U);
+        // The swap packs a KV group's query heads into rows, which only full
+        // attention may do; the sink must still land on the right query head.
+        CHECK(run.stats.swap_launches == (window.has_value() ? 0U : 1U));
+        split_launches += run.stats.split_launches;
+      }
+    }
+  }
+  // At least one case went through the combine, where a split launch adds the sink.
+  CHECK(split_launches > 0);
+}
+
+// The sink plumbing must not touch the arithmetic of a launch whose sinks add
+// nothing: a sink of -inf contributes exp(-inf) = 0 to every denominator, so the
+// sink lane must reproduce the sink-free FA-2 lane BIT FOR BIT, unsplit and split,
+// prefill and decode. Full attention, where both lanes run the same launcher.
+TEST_CASE("paged_attention CUDA FA-2 sinks of -inf reproduce the sink-free lane bit for bit") {
+  if (!HasCuda() || !vt::cuda::Fa2HeadDimBuilt(128)) {
+    MESSAGE("no CUDA backend or no FA-2 head_dim 128 in this build; skipping sink inertness");
+    return;
+  }
+  const std::vector<float> none(32, -std::numeric_limits<float>::infinity());
+  for (const int base_len : {21, 2048}) {
+    CAPTURE(base_len);
+    Fa2DecodeCase c(/*Hq=*/32, /*Hkv=*/4, {base_len, base_len + 9}, 8300U + base_len,
+                    /*capacity_blocks=*/0, /*head_dim=*/128);
+    const SinkDecodeRun with = RunSinkDecode(c, &none, std::nullopt);
+    const SinkDecodeRun without = RunSinkDecode(c, nullptr, std::nullopt);
+    CHECK(with.stats.launches == 1U);
+    CHECK(without.stats.launches == 1U);
+    CHECK(with.stats.split_launches == without.stats.split_launches);
+    size_t mism = 0;
+    for (size_t i = 0; i < with.out.size(); ++i) mism += with.out[i] != without.out[i] ? 1 : 0;
+    CHECK(mism == 0);
+  }
+}
+
+TEST_CASE("paged_attention CUDA FA-2 learned sinks d128 prefill matches composed reference") {
+  if (!HasCuda() || !vt::cuda::Fa2HeadDimBuilt(128)) {
+    MESSAGE("no CUDA backend or no FA-2 head_dim 128 in this build; skipping sink prefill parity");
+    return;
+  }
+  const int64_t D = 128, block_size = 16, Hq = 32, Hk = 4;
+  const float scale = std::pow(static_cast<float>(D), -0.5f);
+  // A long prefill, a decode row and a context-bearing chunk: the mixed batch
+  // LaunchPaged sends to the prefill launcher.
+  const std::vector<int32_t> qsl = {0, 300, 301, 310};
+  const std::vector<int32_t> seq_lens = {300, 700, 710};
+  const int64_t num_tokens = 310, num_reqs = 3, max_blocks = 48, num_blocks = 96;
+  const int64_t page = Hk * D, within = block_size * page;
+  auto qf = RandF32(static_cast<size_t>(num_tokens * Hq * D), 8401);
+  auto kf = RandF32(static_cast<size_t>(num_blocks * within), 8402);
+  auto vf = RandF32(static_cast<size_t>(num_blocks * within), 8403);
+  std::vector<int32_t> block_table(static_cast<size_t>(num_reqs * max_blocks));
+  for (int64_t r = 0; r < num_reqs; ++r)
+    for (int64_t b = 0; b < max_blocks; ++b)
+      block_table[static_cast<size_t>(r * max_blocks + b)] =
+          static_cast<int32_t>((r * 13 + b * 7) % num_blocks);
+  std::vector<uint16_t> q_b(qf.size()), combined(static_cast<size_t>(num_blocks * 2 * within));
+  std::vector<float> q_r(qf.size()), k_r(kf.size()), v_r(vf.size());
+  for (size_t i = 0; i < qf.size(); ++i) {
+    q_b[i] = F32ToBf16Bits(qf[i]);
+    q_r[i] = Bf16BitsToF32(q_b[i]);
+  }
+  for (int64_t b = 0; b < num_blocks; ++b)
+    for (int64_t e = 0; e < within; ++e) {
+      const size_t src = static_cast<size_t>(b * within + e);
+      const uint16_t kb = F32ToBf16Bits(kf[src]), vb = F32ToBf16Bits(vf[src]);
+      combined[static_cast<size_t>((b * 2) * within + e)] = kb;
+      combined[static_cast<size_t>((b * 2 + 1) * within + e)] = vb;
+      k_r[src] = Bf16BitsToF32(kb);
+      v_r[src] = Bf16BitsToF32(vb);
+    }
+  const std::vector<float> sinks = SpreadSinks(Hq);
+  const std::vector<float> none(static_cast<size_t>(Hq), -std::numeric_limits<float>::infinity());
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  DeviceTensor dq(gpu, g.q, DType::kBF16, {num_tokens, Hq, D}, q_b.data());
+  DeviceTensor dcache(gpu, g.q, DType::kBF16, {num_blocks * 2 * within}, combined.data());
+  auto SliceView = [&](int which) {
+    Tensor t = dcache.tensor();
+    t.data = static_cast<char*>(t.data) +
+             static_cast<size_t>(which) * static_cast<size_t>(within) * vt::SizeOf(DType::kBF16);
+    t.rank = 4;
+    t.shape[0] = num_blocks;
+    t.shape[1] = block_size;
+    t.shape[2] = Hk;
+    t.shape[3] = D;
+    t.stride[0] = 2 * within;
+    t.stride[1] = Hk * D;
+    t.stride[2] = D;
+    t.stride[3] = 1;
+    return t;
+  };
+  Tensor kview = SliceView(0), vview = SliceView(1);
+  DeviceTensor dbt(gpu, g.q, DType::kI32, {num_reqs, max_blocks}, block_table.data());
+  DeviceTensor dsl(gpu, g.q, DType::kI32, {num_reqs}, seq_lens.data());
+  DeviceTensor dqsl(gpu, g.q, DType::kI32, {num_reqs + 1}, qsl.data());
+  DeviceTensor dsinks(gpu, g.q, DType::kF32, {Hq}, sinks.data());
+  DeviceTensor dnone(gpu, g.q, DType::kF32, {Hq}, none.data());
+  auto run = [&](std::optional<AttentionWindow> window, Tensor* sink_t) {
+    PagedAttentionArgs args{scale, true};
+    args.window_size = window;
+    args.query_start_loc_host = qsl.data();
+    args.max_seq_len = 720;
+    args.sinks = sink_t;
+    DeviceTensor dout(gpu, g.q, DType::kBF16, {num_tokens, Hq, D});
+    vt::PagedAttention(g.q, dout.tensor(), dq.tensor(), kview, vview, dbt.tensor(),
+                       dsl.tensor(), dqsl.tensor(), args);
+    std::vector<uint16_t> got(static_cast<size_t>(num_tokens * Hq * D), 0);
+    dout.Download(g.q, got.data());
+    return got;
+  };
+  for (const std::optional<AttentionWindow> window :
+       {std::optional<AttentionWindow>{}, std::optional<AttentionWindow>{AttentionWindow{63, 0}},
+        std::optional<AttentionWindow>{AttentionWindow{512, 0}}}) {
+    CAPTURE(window.has_value() ? window->left : -1);
+    const std::vector<float> ref = ComposedPagedRef(q_r, k_r, v_r, block_table, max_blocks,
+                                                    seq_lens, qsl, Hq, Hk, D, block_size, scale,
+                                                    /*causal=*/true, window, &sinks);
+    CheckBf16AgainstReference(run(window, &dsinks.tensor()), ref, "FA2 sink prefill");
+  }
+  // Inertness on the prefill launcher, as for decode above.
+  const std::vector<uint16_t> with = run(std::nullopt, &dnone.tensor());
+  const std::vector<uint16_t> without = run(std::nullopt, nullptr);
+  size_t mism = 0;
+  for (size_t i = 0; i < with.size(); ++i) mism += with[i] != without[i] ? 1 : 0;
+  CHECK(mism == 0);
+}
+
+// Sinks are folded by the FA-2 bf16 head-dim-128 lane only, so any other shape
+// must be refused rather than served by a kernel that drops the term.
+TEST_CASE("paged_attention CUDA refuses learned sinks outside the FA-2 lane") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping the sink refusal check");
+    return;
+  }
+  Fa2DecodeCase c(/*Hq=*/16, /*Hkv=*/2, {64, 80}, 8500U);  // head dim 256
+  const std::vector<float> sinks = SpreadSinks(16);
+  CHECK_THROWS(RunSinkDecode(c, &sinks, std::nullopt));
 }
 #else
 TEST_CASE("paged_attention CUDA FA-2 prefill (bf16 q/kv/out) matches f32 ref at head_dim 256") {

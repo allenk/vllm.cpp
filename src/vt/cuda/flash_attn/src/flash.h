@@ -140,6 +140,13 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+
+    // vllm.cpp addition (not in the pinned FA2): learned attention sinks with FA3's s_aux
+    // semantics. One f32 logit per QUERY head joins the softmax denominator only:
+    //   O = sum_j exp(S_j - m) V_j / (sum_j exp(S_j - m) + exp(sink - m)).
+    // nullptr, which every zero-initialised launch gets, leaves the kernels as they were.
+    // The split-KV path adds the sink once, in combine_attn_seqk_parallel.
+    void * __restrict__ sinks_ptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

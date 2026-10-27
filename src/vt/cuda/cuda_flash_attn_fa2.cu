@@ -462,6 +462,7 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.cu_seqlens_k = nullptr;               // paged: block_table + seqused_k drive K
   p.seqused_k = seq_lens.Ptr<int32_t>();  // per-request K length (BlockInfo::actual_seqlen_k)
   p.softmax_lse_ptr = softmax_lse;
+  p.sinks_ptr = args.sinks != nullptr ? args.sinks->data : nullptr;  // flash.h sinks_ptr
 
   p.b = static_cast<int>(num_reqs);
   p.h = static_cast<int>(hq);
@@ -1346,6 +1347,7 @@ void LaunchSpecDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& que
   p.softmax_lse_ptr = scratch.softmax_lse.ptr;
   p.softmax_lseaccum_ptr = scratch.softmax_lse_accum.ptr;
   p.oaccum_ptr = scratch.out_accum.ptr;
+  p.sinks_ptr = args.sinks != nullptr ? args.sinks->data : nullptr;  // flash.h sinks_ptr
 
   p.b = batch;
   p.h = heads;
@@ -1535,8 +1537,12 @@ void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   // TRUE GQA pure decode: one query token per request (max_seqlen_q==1) and
   // ngroups>1. groups==1 (MHA) has nothing to pack; multi-token would break the
   // "all seqlen_q rows are the same decode token" normalization.
+  // No swap under a window: each swapped row is bottom-right aligned as its own
+  // position, which a local mask would read as ngroups different positions
+  // (upstream mha_fwd_kvcache refuses the swap for a window the same way).
   const bool do_swap = gqa_swap && kv_heads > 0 && (heads % kv_heads == 0) &&
-                       query_groups > 1 && max_seqlen_q == 1;
+                       query_groups > 1 && max_seqlen_q == 1 &&
+                       !args.window_size.has_value();
 
   const auto stream_scratch = Fa2ScratchFor(query.device.index, s);
   std::lock_guard<std::mutex> submit_lock(stream_scratch->submit_mu);
@@ -1643,6 +1649,7 @@ void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.softmax_lse_ptr = scratch.softmax_lse.ptr;
   p.softmax_lseaccum_ptr = scratch.softmax_lse_accum.ptr;
   p.oaccum_ptr = scratch.out_accum.ptr;
+  p.sinks_ptr = args.sinks != nullptr ? args.sinks->data : nullptr;  // flash.h sinks_ptr
 
   p.b = batch;
   p.h = do_swap ? kv_heads : heads;               // swap packs groups into seqlen_q
@@ -1685,6 +1692,14 @@ void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
     p.is_causal = false;
     p.window_size_left = -1;
     p.window_size_right = -1;
+  } else if (args.window_size.has_value()) {
+    // A sliding layer's causal left window (the sinks lane admits right == 0
+    // only). Like the prefill launcher, a finite window takes the LOCAL
+    // specialization through the non-causal instantiation, because Is_causal
+    // compiles window_size_left away; n_block_min then skips the keys before it.
+    p.is_causal = false;
+    p.window_size_left = args.window_size->left;
+    p.window_size_right = args.window_size->right;
   } else {
     // Plain causal decode (NO group-swap normalization): vLLM passes causal=True to
     // flash_attn_varlen_func; with seqlen_q==1 the single query still sees the full
@@ -1705,11 +1720,11 @@ void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.num_splits = num_splits;
 
   RecordDecodeLaunch(num_splits > 1, inserted, do_swap);
-  if (!do_swap && args.causal) {
+  if (p.is_causal) {
     Fa2SplitKv<128, true>(p, s);
   } else {
     // Swap decode is normalized non-causal (like the d256 arm); a plain non-causal
-    // caller also lands here.
+    // caller and a windowed one (LOCAL_SWITCH) also land here.
     Fa2SplitKv<128, false>(p, s);
   }
   Check(cudaGetLastError(), "varlen decode splitkv dispatch launch");

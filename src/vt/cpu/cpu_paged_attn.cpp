@@ -123,6 +123,8 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
       args.window_size.has_value() ? args.window_size->left : -1;
   const int64_t window_right =
       args.window_size.has_value() ? args.window_size->right : -1;
+  // Learned attention sinks: one logit per query head, denominator only.
+  const float* sinks = args.sinks != nullptr ? args.sinks->Ptr<float>() : nullptr;
 
   const int32_t* qsl = query_start_loc.Ptr<int32_t>();
   const int32_t* slens = seq_lens.Ptr<int32_t>();
@@ -299,6 +301,7 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
             probs[static_cast<size_t>(j - jmin)] = e;
             denom += e;
           }
+          if (sinks != nullptr) denom += std::exp(sinks[h] - m);
           const float inv = 1.0f / denom;  // every valid decoder/encoder window has >= 1 key
           // Pass 3: weighted sum of V (f32 accumulation), stored at out's dtype.
           for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] = 0.0f;

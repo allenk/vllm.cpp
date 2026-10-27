@@ -2078,6 +2078,16 @@ struct PagedAttentionArgs {
   // verify (q <= 1 + 2K) on the split-KV DECODE lane instead of the
   // num_splits=1 prefill ladder (`include/vt/paged_attn_route.h`).
   int32_t uniform_spec_query_len = 0;
+  // OPTIONAL learned attention sinks (`softmax_type: learnable` in Flint, the
+  // `sinks` parameter of vLLM's Attention layer): an f32 [num_q_heads] tensor on
+  // the queue's device, one logit per QUERY head that joins the softmax
+  // denominator and nothing else:
+  //   out = sum_j exp(S_j - m) V_j / (sum_j exp(S_j - m) + exp(sink_h - m)),
+  // S_j = scale * q.k_j after the soft-cap, m = max_j S_j. nullptr (default)
+  // leaves every path unchanged. Implemented on CPU and on the CUDA FA-2 bf16
+  // head_dim-128 lane; every other backend and CUDA kernel refuses it rather than
+  // drop the term.
+  const Tensor* sinks = nullptr;
 };
 
 // Arguments for vt::MlaDecodeAttention (MLA campaign W4). Mirrors the scalar

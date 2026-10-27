@@ -941,6 +941,7 @@ bool PaGateOk(const Tensor& out, const Tensor& query, const Tensor& kc,
   if (!args.causal) return false;                      // folded to a constant
   if (args.logits_soft_cap > 0.0f) return false;       // not compiled
   if (args.kv_cache_dtype != vt::Fp8KVCacheDataType::kAuto) return false;
+  if (args.sinks != nullptr) return false;             // not compiled; the native kernel folds them
   if (out.dtype != DType::kBF16 || query.dtype != DType::kBF16 ||
       kc.dtype != DType::kBF16 || vc.dtype != DType::kBF16)
     return false;
