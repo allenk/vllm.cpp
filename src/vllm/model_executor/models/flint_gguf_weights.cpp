@@ -18,6 +18,7 @@
 #include "vllm/model_executor/models/flint_gguf_weights.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <set>
 #include <stdexcept>
@@ -25,6 +26,7 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
+#include "vllm/model_executor/models/flint_paged.h"
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -412,6 +414,23 @@ HfConfig FlintHfConfigFromGguf(const GgufFile& gguf) {
   for (int64_t l = 0; l < dense; ++l) mlp_only.push_back(l);
   raw["mlp_only_layers"] = std::move(mlp_only);
 
+  // The typed fields the shared CUDA blocks read (dense_attn::AttnBlock, the
+  // RoPE args), from the same keys as `raw` above. Full rotary on the layers
+  // that rotate at all; a NoPE layer is decided per layer by the forward.
+  c.head_dim = raw["head_dim"].get<int64_t>();
+  c.rotary_dim = c.head_dim;
+  c.rope_theta = raw["rope_theta"].get<double>();
+  c.rope_parameters.rope_theta = c.rope_theta;
+  c.rms_norm_eps = raw["rms_norm_eps"].get<double>();
+  c.sliding_window = raw["sliding_window"].get<int64_t>();
+  c.intermediate_size = ReqInt(gguf, p + "feed_forward_length");
+  c.num_experts = raw["num_experts"].get<int64_t>();
+  c.num_experts_per_tok = raw["num_experts_per_tok"].get<int64_t>();
+  c.moe_intermediate_size = raw["moe_intermediate_size"].get<int64_t>();
+  c.shared_expert_intermediate_size =
+      raw["shared_expert_intermediate_size"].get<int64_t>();
+  c.max_position_embeddings = ReqInt(gguf, p + "context_length");
+
   c.raw = std::move(raw);
   return c;
 }
@@ -536,6 +555,170 @@ FlintWeights LoadFlintFromGguf(const GgufFile& gguf, const HfConfig& config) {
       lw.moe.shared_expert.down_proj =
           OwnProjectionBf16(gguf, Blk(l, "ffn_down_shexp.weight"), shared_inter, h);
     }
+  }
+  return w;
+}
+
+// ---- the paged CUDA arm's loader: NVFP4 stays packed ----
+
+namespace {
+
+// Rows [row0, row0 + n) of an NVFP4 tensor as one Nvfp4Weight, in the file's
+// own [N=out, K=in] orientation, which is what the Marlin repack and
+// vt::MatmulNvfp4 read. `scale2` is the tensor's (or the expert's) f32 global.
+Nvfp4Weight OwnNvfp4Rows(const GgufTensorInfo& t, int64_t row0, int64_t n, int64_t k,
+                         float scale2) {
+  VT_CHECK(t.ggml_type == 40, "flint gguf: " + t.name + " is not NVFP4");
+  VT_CHECK(k % 64 == 0, "flint gguf: NVFP4 K must be whole 64-element blocks for " + t.name);
+  VT_CHECK(std::isfinite(scale2) && scale2 > 0.0F,
+           "flint gguf: bad global scale for " + t.name);
+  Nvfp4Weight w;
+  w.n = n;
+  w.k = k;
+  w.scale2 = scale2;
+  w.weight_global_scale_inv = 1.0F / scale2;
+  w.packed = MakeOwned(vt::DType::kI8, {n, k / 2});
+  w.scale = MakeOwned(vt::DType::kI8, {n, k / 16});
+  RepackGgufNvfp4Rows(t.data + static_cast<size_t>(row0 * (k / 64) * 36), n, k,
+                      reinterpret_cast<uint8_t*>(w.packed.bytes.data()),
+                      reinterpret_cast<uint8_t*>(w.scale.bytes.data()));
+  return w;
+}
+
+Nvfp4Weight OwnNvfp4(const GgufFile& g, const std::string& name, int64_t out, int64_t in) {
+  const GgufTensorInfo& t = g.Get(name);
+  VT_CHECK(t.shape.size() == 2 && t.shape[0] == out && t.shape[1] == in,
+           "flint gguf: " + name + " has the wrong NVFP4 geometry");
+  const std::vector<float> s = GlobalScales(g, t);
+  VT_CHECK(s.size() == 1, "flint gguf: " + name + " needs one global scale");
+  return OwnNvfp4Rows(t, 0, out, in, s[0]);
+}
+
+std::vector<Nvfp4Weight> OwnNvfp4Experts(const GgufFile& g, const std::string& name,
+                                         int64_t experts, int64_t out, int64_t in) {
+  const GgufTensorInfo& t = g.Get(name);
+  VT_CHECK(t.shape.size() == 3 && t.shape[0] == experts && t.shape[1] == out &&
+               t.shape[2] == in,
+           "flint gguf: " + name + " is not the [E, out, in] NVFP4 tower");
+  const std::vector<float> s = GlobalScales(g, t);
+  VT_CHECK(static_cast<int64_t>(s.size()) == experts,
+           "flint gguf: " + name + " needs one global scale per expert");
+  std::vector<Nvfp4Weight> w;
+  w.reserve(static_cast<size_t>(experts));
+  for (int64_t e = 0; e < experts; ++e)
+    w.push_back(OwnNvfp4Rows(t, e * out, out, in, s[static_cast<size_t>(e)]));
+  return w;
+}
+
+// Row-stacks NVFP4 weights into one operand (q|k|v). The per-16 scales are
+// relative to the global scale, so the stack is exact only when every part has
+// the same global; the converter writes one per layer for q, k and v, and any
+// other file is refused rather than rescaled.
+Nvfp4Weight StackNvfp4Rows(const std::vector<const Nvfp4Weight*>& parts, const char* what) {
+  Nvfp4Weight w;
+  w.k = parts.front()->k;
+  w.scale2 = parts.front()->scale2;
+  w.weight_global_scale_inv = parts.front()->weight_global_scale_inv;
+  for (const Nvfp4Weight* p : parts) {
+    VT_CHECK(p->k == w.k && p->scale2 == w.scale2,
+             std::string("flint gguf: the ") + what +
+                 " parts differ in K or global scale and cannot share one operand");
+    w.n += p->n;
+  }
+  w.packed = MakeOwned(vt::DType::kI8, {w.n, w.k / 2});
+  w.scale = MakeOwned(vt::DType::kI8, {w.n, w.k / 16});
+  size_t po = 0, so = 0;
+  for (const Nvfp4Weight* p : parts) {
+    std::memcpy(w.packed.bytes.data() + po, p->packed.bytes.data(), p->packed.bytes.size());
+    std::memcpy(w.scale.bytes.data() + so, p->scale.bytes.data(), p->scale.bytes.size());
+    po += p->packed.bytes.size();
+    so += p->scale.bytes.size();
+  }
+  return w;
+}
+
+OwnedTensor OwnBf16As(const GgufFile& g, const std::string& name,
+                      const std::vector<int64_t>& shape) {
+  const GgufTensorInfo& t = g.Get(name);
+  VT_CHECK(t.ggml_type == 30, "flint gguf: " + name + " is not BF16");
+  VT_CHECK(ShapeNumel(t.shape) == ShapeNumel(shape),
+           "flint gguf: element-count mismatch for " + name);
+  OwnedTensor o = MakeOwned(vt::DType::kBF16, shape);
+  std::memcpy(o.bytes.data(), t.data, o.bytes.size());
+  return o;
+}
+
+OwnedTensor OwnF32(const GgufFile& g, const std::string& name, int64_t n) {
+  const GgufTensorInfo& t = g.Get(name);
+  VT_CHECK(t.ggml_type == 0 && ShapeNumel(t.shape) == n,
+           "flint gguf: " + name + " is not F32 [" + std::to_string(n) + "]");
+  OwnedTensor o = MakeOwned(vt::DType::kF32, {n});
+  std::memcpy(o.bytes.data(), t.data, o.bytes.size());
+  return o;
+}
+
+}  // namespace
+
+FlintPagedWeights LoadFlintPagedFromGguf(const GgufFile& gguf, const HfConfig& config) {
+  VT_CHECK(IsFlintGguf(gguf),
+           "flint gguf: general.architecture must be '" + std::string(kFlintGgufArch) + "'");
+  const FlintParams p = ParseFlintParams(config);
+  const int64_t h = p.hidden_size, v = p.vocab_size, dh = p.head_dim;
+  const int64_t q = p.num_attention_heads * dh, kv = p.num_key_value_heads * dh;
+  const int64_t E = p.num_experts, inter = p.moe_intermediate_size;
+  const int64_t shared_inter = p.shared_expert_intermediate_size;
+  const int64_t dense_inter = ReqInt(gguf, "flint.feed_forward_length");
+
+  FlintPagedWeights w;
+  w.params = p;
+  w.embed_tokens = OwnBf16As(gguf, "token_embd.weight", {v, h});
+  w.final_norm = OwnNormBf16(gguf, "output_norm.weight", h);
+  {
+    const GgufTensorInfo& t = gguf.Get("output.weight");
+    VT_CHECK(t.shape.size() == 2 && t.shape[0] == v && t.shape[1] == h,
+             "flint gguf: output.weight is not [vocab, hidden]");
+    const std::vector<float> s = GlobalScales(gguf, t);
+    VT_CHECK(s.size() == 1, "flint gguf: output.weight needs one global scale");
+    // Global 1.0 here, the real one on the logits: e2m1 x e4m3 is exact in bf16.
+    const std::vector<uint16_t> dq =
+        DequantGgufRowToBf16(t.ggml_type, t.data, ShapeNumel(t.shape), 1.0F);
+    w.lm_head = MakeOwned(vt::DType::kBF16, {v, h});
+    std::memcpy(w.lm_head.bytes.data(), dq.data(), dq.size() * sizeof(uint16_t));
+    w.lm_head_scale = GgmlTypeNeedsGlobalScale(t.ggml_type) ? s[0] : 1.0F;
+  }
+
+  w.layers.resize(static_cast<size_t>(p.num_hidden_layers));
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
+    FlintPagedLayer& lw = w.layers[static_cast<size_t>(l)];
+    lw.sliding = p.IsSlidingLayer(l);
+    lw.rope = p.LayerHasRope(l);
+    lw.dense = p.IsDenseLayer(l);
+    lw.input_layernorm = OwnNormBf16(gguf, Blk(l, "attn_norm.weight"), h);
+    lw.post_attention_layernorm = OwnNormBf16(gguf, Blk(l, "ffn_norm.weight"), h);
+    {
+      const Nvfp4Weight wq = OwnNvfp4(gguf, Blk(l, "attn_q.weight"), q, h);
+      const Nvfp4Weight wk = OwnNvfp4(gguf, Blk(l, "attn_k.weight"), kv, h);
+      const Nvfp4Weight wv = OwnNvfp4(gguf, Blk(l, "attn_v.weight"), kv, h);
+      lw.attn.qkv_proj_fp4 = StackNvfp4Rows({&wq, &wk, &wv}, "q/k/v");
+    }
+    lw.attn.o_proj_fp4 = OwnNvfp4(gguf, Blk(l, "attn_output.weight"), h, q);
+    lw.attn.q_norm = OwnNormBf16(gguf, Blk(l, "attn_q_norm.weight"), dh);
+    lw.attn.k_norm = OwnNormBf16(gguf, Blk(l, "attn_k_norm.weight"), dh);
+    lw.sinks = OwnF32(gguf, Blk(l, "attn_sinks.weight"), p.num_attention_heads);
+    if (lw.dense) {
+      lw.mlp_gate = OwnNvfp4(gguf, Blk(l, "ffn_gate.weight"), dense_inter, h);
+      lw.mlp_up = OwnNvfp4(gguf, Blk(l, "ffn_up.weight"), dense_inter, h);
+      lw.mlp_down = OwnNvfp4(gguf, Blk(l, "ffn_down.weight"), h, dense_inter);
+      continue;
+    }
+    FlintPagedMoe& m = lw.moe;
+    m.router = OwnBf16As(gguf, Blk(l, "ffn_gate_inp.weight"), {E, h});
+    m.expert_gate = OwnNvfp4Experts(gguf, Blk(l, "ffn_gate_exps.weight"), E, inter, h);
+    m.expert_up = OwnNvfp4Experts(gguf, Blk(l, "ffn_up_exps.weight"), E, inter, h);
+    m.expert_down = OwnNvfp4Experts(gguf, Blk(l, "ffn_down_exps.weight"), E, h, inter);
+    m.shared_gate = OwnNvfp4(gguf, Blk(l, "ffn_gate_shexp.weight"), shared_inter, h);
+    m.shared_up = OwnNvfp4(gguf, Blk(l, "ffn_up_shexp.weight"), shared_inter, h);
+    m.shared_down = OwnNvfp4(gguf, Blk(l, "ffn_down_shexp.weight"), h, shared_inter);
   }
   return w;
 }

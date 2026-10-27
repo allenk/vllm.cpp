@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -525,17 +526,34 @@ inline StepInputs BuildStepInputs(Dev d, const std::vector<int32_t>& positions,
   return s;
 }
 
+// Per-layer attention variations a Qwen3-shaped block can carry (Flint). The
+// defaults are the plain Qwen3 layer, so every caller that passes none runs the
+// block exactly as before.
+//   * window: a sliding layer's causal left window (vLLM per_layer_sliding_window
+//     W becomes FlashAttention's (W-1, 0)).
+//   * sinks: learned attention sinks, one logit per query head
+//     (PagedAttentionArgs::sinks); held resident in f32.
+//   * rope: false for a NoPE layer (Flint's full-attention layers).
+struct AttnBlockLayerOpts {
+  std::optional<vt::AttentionWindow> window;
+  const OwnedTensor* sinks = nullptr;
+  bool rope = true;
+};
+
 // One Qwen3 dense self-attention block (qwen3.py::Qwen3Attention.forward). `dhn`
 // is the input-normed hidden [T,H] bf16; returns the o_proj output [T,H] bf16.
 inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg,
                       const Tensor& dhn, const StepInputs& si,
                       const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T,
-                      const TensorParallel* tp = nullptr) {
+                      const TensorParallel* tp = nullptr,
+                      const AttnBlockLayerOpts& layer_opts = {}) {
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
   const int64_t Dh = cfg.head_dim;
-  const int rot = static_cast<int>(cfg.rotary_dim);
+  // A NoPE layer skips the rotation and nothing else: rot == 0 is the path a
+  // model without rotary dims already takes.
+  const int rot = layer_opts.rope ? static_cast<int>(cfg.rotary_dim) : 0;
   // RoPE base/scaling now come from MakeRopeArgs(cfg) (llama3-aware); no local base.
   const float eps = static_cast<float>(cfg.rms_norm_eps);
   const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
@@ -732,9 +750,11 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
         Tensor k3v = k3;
         vt::RopeFromCache(d.q, q3, &k3v, si.rope_row_idx.t(), si.cos_sin_bf16.t(),
                           MakeRopeArgs(cfg));
-      } else {
+      } else if (rot > 0) {
         // DEFAULT (byte-identical, deterministic): in-place bf16 NeoX RoPE with
         // per-element fp64 cos/sin, mirroring vLLM's rotary_emb bf16 rounding.
+        // (vt::RopeNeox refuses rotary_dim 0, so every caller before the NoPE
+        // option already had rot > 0 here.)
         vt::RopeNeox(d.q, q3, k3, si.positions.t(), MakeRopeArgs(cfg));
       }
     }
@@ -786,6 +806,15 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   // lane consumes it (the d128 arms keep their q==1 gates), so every model on
   // this block routes exactly as before unless a d256 verify arrives.
   pa.uniform_spec_query_len = meta.uniform_spec_query_len;
+  pa.window_size = layer_opts.window;
+  Tensor sinks_t;
+  if (layer_opts.sinks != nullptr) {
+    // f32 sinks upload as they are (vLLM keeps them f32); bf16 ones widen.
+    sinks_t = layer_opts.sinks->dtype == DType::kF32
+                  ? ResidentWeight(d, *layer_opts.sinks, {Hq})
+                  : ResidentWeightF32(d, *layer_opts.sinks, {Hq});
+    pa.sinks = &sinks_t;
+  }
   ApplyKvCacheQuant(pa, kv);
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);

@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -41,9 +42,13 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/models/flint_paged.h"  // the paged CUDA arm
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
+#include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::DeviceTokenIdsScope
+#include "vllm/platforms/interface.h"
+#include "vt/backend.h"
 
 namespace vllm {
 
@@ -578,16 +583,34 @@ inline constexpr ModelInfo kFlintInfo{
     .score_type = "bi-encoder",
 };
 
+// Holds ONE of the two arms: the bf16 reference weights (CPU, the oracle) or
+// the paged CUDA weights (flint_paged.h) with that arm's decode graph.
 class FlintLoadedModel final : public LoadedModel {
  public:
   FlintLoadedModel(const ModelRegistration& registration, FlintWeights weights)
       : LoadedModel(registration), weights_(std::move(weights)) {}
+  FlintLoadedModel(const ModelRegistration& registration, FlintPagedWeights paged)
+      : LoadedModel(registration),
+        paged_(std::make_unique<FlintPagedWeights>(std::move(paged))) {}
 
   const FlintWeights& weights() const { return weights_; }
+  const FlintPagedWeights* paged() const { return paged_.get(); }
+  std::unique_ptr<FlintPagedDecodeGraph>& decode_graph() { return decode_graph_; }
 
  private:
   FlintWeights weights_;
+  std::unique_ptr<FlintPagedWeights> paged_;
+  std::unique_ptr<FlintPagedDecodeGraph> decode_graph_;
 };
+
+// The paged arm serves a GGUF on a CUDA engine. VT_FLINT_PAGED=0 keeps the
+// bf16 reference there (for the oracle comparisons); it expands the 40B to
+// bf16 on the host, about 80 GB.
+bool UsePagedArm(const ModelSource& source) {
+  const char* e = std::getenv("VT_FLINT_PAGED");
+  return source.kind == ModelSource::Kind::kGguf && source.device == vt::DeviceType::kCUDA &&
+         !(e != nullptr && e[0] == '0');
+}
 
 std::unique_ptr<LoadedModel> LoadFlintForCausalLM(
     const ModelRegistration& registration, const HfConfig& config,
@@ -600,6 +623,10 @@ std::unique_ptr<LoadedModel> LoadFlintForCausalLM(
       throw std::runtime_error(
           "FlintForCausalLM: the model source says GGUF but carries no "
           "file. See .agents/specs/flint-gguf-arm.md");
+    }
+    if (UsePagedArm(source)) {
+      return std::make_unique<FlintLoadedModel>(
+          registration, LoadFlintPagedFromGguf(*source.gguf, config));
     }
     return std::make_unique<FlintLoadedModel>(
         registration, LoadFlintFromGguf(*source.gguf, config));
@@ -619,14 +646,49 @@ std::unique_ptr<LoadedModel> LoadFlintForCausalLM(
 
 void PrepareFlintForCausalLM(LoadedModel& model, const HfConfig& config,
                              vt::Queue& queue) {
-  (void)model;
   (void)config;
-  (void)queue;
+  auto& flint = ModelAs<FlintLoadedModel>(model, "FlintForCausalLM");
+  // The MoE Marlin arenas are built here, before any step, so no allocation
+  // lands inside a decode-graph capture.
+  if (flint.paged() != nullptr) PrepareFlintPaged(*flint.paged(), queue);
 }
 
 ForwardLogits ForwardFlintForCausalLM(LoadedModel& model,
                                       const ModelForwardInput& input) {
   auto& flint = ModelAs<FlintLoadedModel>(model, "FlintForCausalLM");
+  if (const FlintPagedWeights* paged = flint.paged(); paged != nullptr) {
+    // The async runner's device-resident input ids, for the duration of this
+    // forward (the embed reads them; null on every other path).
+    const detail::DeviceTokenIdsScope device_ids_scope(
+        input.device_token_ids, static_cast<int64_t>(input.token_ids.size()));
+    const auto& platform = platforms::GetPlatform(input.queue.device.type);
+    if (input.pure_decode && platform.support_static_graph_mode() &&
+        !platform.static_graph_requires_opt_in()) {
+      if (!flint.decode_graph()) {
+        flint.decode_graph() = std::make_unique<FlintPagedDecodeGraph>(
+            *paged, input.config, input.queue, input.gdn_state_slots);
+      }
+      return flint.decode_graph()->Step(input.token_ids, input.positions,
+                                        input.attn_meta, input.attn_kv);
+    }
+    ForwardLogits logits = FlintPagedModel::ForwardDevice(
+        input.token_ids, input.positions, input.attn_meta, input.attn_kv,
+        *paged, input.config, input.queue, input.logits_indices);
+    if (input.gather_logits) return logits;
+    std::vector<float> host(static_cast<size_t>(logits.rows * logits.vocab));
+    vt::Backend& b = vt::GetBackend(input.queue.device.type);
+    b.Copy(input.queue, host.data(), logits.device_tensor.data,
+           host.size() * sizeof(float));
+    b.Synchronize(input.queue);
+    return HostLogits(std::move(host), input.config.vocab_size);
+  }
+  // The reference reads the HOST token ids, which the asynchronous CUDA runner
+  // leaves stale on decode rows.
+  if (input.host_token_ids_stale) {
+    throw std::runtime_error(
+        "FlintForCausalLM: the reference forward reads host token ids, which this "
+        "runner left stale; serve the GGUF with the paged arm (unset VT_FLINT_PAGED)");
+  }
   if (input.attn_meta.num_reqs != 1) {
     throw std::runtime_error(
         "FlintForCausalLM: the CPU reference forward serves exactly ONE "
@@ -644,9 +706,13 @@ const ModelFactory kFlintFactory{
     .load_weights = &LoadFlintForCausalLM,
     .prepare = &PrepareFlintForCausalLM,
     .forward = &ForwardFlintForCausalLM,
-    .make_kv_cache = &MakeFlintKVCache,
+    // One full-attention group for every layer, the window applied in the
+    // kernel (flint_paged.h). MakeFlintKVCache's two groups would need the
+    // runner to forward the sliding group's block table and slot mapping,
+    // which it does not do for any model.
+    .make_kv_cache = &MakeFlintPagedKVCache,
     .is_dense_model = false,
-    .consumes_device_token_ids = false,
+    .consumes_device_token_ids = true,
     .streams_routed_experts = false,
 };
 

@@ -877,6 +877,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/flint.cpp
   src/vllm/model_executor/models/flint_weights.cpp
   src/vllm/model_executor/models/flint_gguf_weights.cpp
+  src/vllm/model_executor/models/flint_paged.cpp
   src/vllm/model_executor/models/qwen4_exp_ple.cpp
   src/vllm/model_executor/models/qwen4_exp.cpp
   src/vllm/model_executor/models/qwen4_exp_weights.cpp
