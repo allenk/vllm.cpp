@@ -2720,6 +2720,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     if (AsyncDeviceInputs* dev = get_or_create_async_device_inputs();
         dev != nullptr) {
       replay_last_sampled_ops(*dev);
+      begin_step_uploads(*dev);
       const int64_t num_tokens =
           static_cast<int64_t>(step.input_token_ids.size());
       VT_CHECK(num_tokens <= dev->input_ids_capacity,
@@ -2750,6 +2751,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       // which is reason A on any verify step — see the block above the #ifdef.
       stage_upload(*dev, dev->cu_num_logits, cu_num_logits_host,
                    static_cast<int64_t>(num_reqs) + 1);
+      end_step_uploads(*dev);
       vt::cuda::LaunchCombineSampledAndDraftTokens(
           queue_, dev->input_ids, /*idx_mapping=*/nullptr, dev->last_sampled,
           dev->query_start_loc, dev->seq_lens, dev->prefill_len,
@@ -5246,6 +5248,12 @@ GPUModelRunner::~GPUModelRunner() {
                        async_device_inputs_->cu_num_logits}) {
       if (p != nullptr) b.Free(p);
     }
+    for (int r = 0; r < AsyncDeviceInputs::kUploadRegions; ++r) {
+      if (async_device_inputs_->upload_pinned[r] != nullptr)
+        b.FreePinned(async_device_inputs_->upload_pinned[r]);
+      if (async_device_inputs_->upload_done[r].handle != nullptr)
+        b.DestroyEvent(async_device_inputs_->upload_done[r]);
+    }
   }
 }
 
@@ -5481,21 +5489,58 @@ GPUModelRunner::get_or_create_async_device_inputs() {
 
 void GPUModelRunner::stage_upload(AsyncDeviceInputs& dev, int32_t* dst,
                                   const int32_t* src, int64_t count) {
-  (void)dev;
   if (count <= 0) return;
-  // Copied straight from the caller's PAGEABLE host buffer, deliberately: for a
-  // pageable source the driver stages the bytes before cudaMemcpyAsync returns,
-  // so the caller may reuse or destroy that buffer immediately, while the copy
-  // itself stays ordered on the queue.
-  //
-  // A shared PINNED staging buffer would be the usual optimization and is WRONG
-  // here: pinned copies are truly asynchronous, so the next upload's memcpy into
-  // the shared buffer could overwrite bytes an in-flight DMA had not yet read,
-  // and with a depth-2 scheduler that window spans steps. Making that safe needs
-  // per-upload regions plus an event per step; these arrays are a few kilobytes
-  // on the front of a step, so the staged pageable copy is the better trade.
-  vt::GetBackend(queue_.device.type)
-      .Copy(queue_, dst, src, static_cast<size_t>(count) * sizeof(int32_t));
+  vt::Backend& b = vt::GetBackend(queue_.device.type);
+  const size_t bytes = static_cast<size_t>(count) * sizeof(int32_t);
+  // Inside a step: copy into this step's own pinned region, which no other
+  // upload shares and which is not refilled until the event behind these
+  // copies has fired (begin_step_uploads), so the DMA may run whenever the
+  // queue reaches it.
+  if (dev.upload_region >= 0 && dev.upload_used + count <= dev.upload_capacity) {
+    int32_t* stage = dev.upload_pinned[dev.upload_region] + dev.upload_used;
+    std::memcpy(stage, src, bytes);
+    dev.upload_used += count;
+    b.Copy(queue_, dst, stage, bytes);
+    return;
+  }
+  // Otherwise from the caller's PAGEABLE buffer: the driver stages the bytes
+  // before cudaMemcpyAsync returns, so the caller may reuse the buffer at once.
+  // A SHARED pinned buffer would be wrong here: the next upload's memcpy could
+  // overwrite bytes a still-queued DMA had not read, and with a depth-2
+  // scheduler that window spans steps.
+  b.Copy(queue_, dst, src, bytes);
+}
+
+void GPUModelRunner::begin_step_uploads(AsyncDeviceInputs& dev) {
+  vt::Backend& b = vt::GetBackend(queue_.device.type);
+  if (dev.upload_capacity == 0) {
+    // Every upload execute_model makes in one step, at the batch bound.
+    dev.upload_capacity = dev.input_ids_capacity + 3 * (int64_t{dev.max_reqs} + 1) +
+                          int64_t{dev.max_reqs} +
+                          int64_t{dev.max_reqs} * dev.draft_stride;
+    for (int r = 0; r < AsyncDeviceInputs::kUploadRegions; ++r) {
+      dev.upload_pinned[r] = static_cast<int32_t*>(
+          b.AllocPinned(static_cast<size_t>(dev.upload_capacity) * sizeof(int32_t)));
+      dev.upload_done[r] = b.CreateEvent(/*blocking=*/true);
+    }
+  }
+  const int r = (dev.upload_last + 1) % AsyncDeviceInputs::kUploadRegions;
+  if (dev.upload_pending[r]) {
+    // Three steps back on a depth-2 scheduler: those copies ran long ago.
+    b.SynchronizeEvent(dev.upload_done[r]);
+    dev.upload_pending[r] = false;
+  }
+  dev.upload_region = r;
+  dev.upload_used = 0;
+}
+
+void GPUModelRunner::end_step_uploads(AsyncDeviceInputs& dev) {
+  if (dev.upload_region < 0) return;
+  vt::Backend& b = vt::GetBackend(queue_.device.type);
+  b.RecordEvent(dev.upload_done[dev.upload_region], queue_);
+  dev.upload_pending[dev.upload_region] = true;
+  dev.upload_last = dev.upload_region;
+  dev.upload_region = -1;
 }
 
 void GPUModelRunner::replay_last_sampled_ops(AsyncDeviceInputs& dev) {

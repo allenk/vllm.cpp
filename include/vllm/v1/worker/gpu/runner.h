@@ -1036,10 +1036,8 @@ class GPUModelRunner final : public ModelRunnerBase {
   //    on-queue instead), which lets the drain MOVE past the bulk host prep.
   //
   // Sized once from the batch bound; all zero-initialized. The per-step uploads
-  // copy from the caller's pageable host buffers on purpose (see stage_upload).
-  //
-  // Sized once from the batch bound; all zero-initialized. The per-step uploads
-  // copy from the caller's pageable host buffers on purpose (see stage_upload).
+  // of execute_model copy through the pinned region ring below; the others copy
+  // from the caller's pageable host buffers (see stage_upload).
   struct AsyncDeviceInputs {
     int32_t* last_sampled = nullptr;     // [max_num_reqs], AUTHORITATIVE
     int32_t* prefill_len = nullptr;      // [max_num_reqs]
@@ -1090,6 +1088,21 @@ class GPUModelRunner final : public ModelRunnerBase {
     int32_t draft_stride = 0;            // == InputBatch::num_speculative_steps
     int64_t input_ids_capacity = 0;      // elements in `input_ids`
     int32_t max_reqs = 0;
+    // Pinned staging for execute_model's per-step uploads, one region per step
+    // in a ring (begin_step_uploads / end_step_uploads). A pageable H2D on
+    // Windows waits for the queue to reach it and then for the driver: measured
+    // as 150-290 us of GPU idle in front of every decode step. A region is
+    // refilled only after the event recorded behind its copies, so a depth-2
+    // scheduler's still-queued copies never read bytes a later step wrote.
+    // Freed in ~GPUModelRunner after the drain, like the buffers above.
+    static constexpr int kUploadRegions = 3;
+    int32_t* upload_pinned[kUploadRegions] = {};
+    vt::Event upload_done[kUploadRegions] = {};
+    bool upload_pending[kUploadRegions] = {};
+    int64_t upload_capacity = 0;  // int32 elements per region, 0 until first use
+    int upload_region = -1;       // the region being filled, -1 outside a step
+    int upload_last = -1;         // the region the previous step filled
+    int64_t upload_used = 0;
   };
   std::unique_ptr<AsyncDeviceInputs> async_device_inputs_;
   // Allocate on first use, or return nullptr when the mirror is not engaged
@@ -1115,9 +1128,15 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Push the recorded InputBatch structural edits (seed/move/swap) to the device
   // mirror in stream order, then clear the log. No-op without a mirror.
   void replay_last_sampled_ops(AsyncDeviceInputs& dev);
-  // Upload `src` into `dst` through the pinned staging buffer on the main queue.
+  // Upload `src` into `dst` on the main queue: through the current pinned
+  // region between begin_step_uploads and end_step_uploads, from the pageable
+  // source otherwise (or when the region is full).
   void stage_upload(AsyncDeviceInputs& dev, int32_t* dst, const int32_t* src,
                     int64_t count);
+  // Open the next pinned region for this step's uploads, first waiting out the
+  // copies that last read it; end_step_uploads records the event behind them.
+  void begin_step_uploads(AsyncDeviceInputs& dev);
+  void end_step_uploads(AsyncDeviceInputs& dev);
   // Assemble the [num_reqs, vocab] logits the sampler runs on (the three-case
   // device/host gather from the stashed forward result) and apply the grammar
   // bitmask, IN the exact order the sync path uses. Shared by sample_tokens and
