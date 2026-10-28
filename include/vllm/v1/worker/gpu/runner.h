@@ -1088,21 +1088,29 @@ class GPUModelRunner final : public ModelRunnerBase {
     int32_t draft_stride = 0;            // == InputBatch::num_speculative_steps
     int64_t input_ids_capacity = 0;      // elements in `input_ids`
     int32_t max_reqs = 0;
+    // ONE device allocation holding query_start_loc, seq_lens, prefill_len,
+    // cu_num_logits, draft_tokens and input_ids in that order (each at a
+    // 16-byte boundary); those six pointers point into it. A step's uploads are
+    // written into a pinned region laid out the same way and land with ONE copy
+    // (end_step_uploads): five separate small copies left the GPU idle between
+    // them on Windows, each a submission of its own.
+    int32_t* upload_block = nullptr;
     // Pinned staging for execute_model's per-step uploads, one region per step
     // in a ring (begin_step_uploads / end_step_uploads). A pageable H2D on
     // Windows waits for the queue to reach it and then for the driver: measured
     // as 150-290 us of GPU idle in front of every decode step. A region is
-    // refilled only after the event recorded behind its copies, so a depth-2
-    // scheduler's still-queued copies never read bytes a later step wrote.
+    // refilled only after the event recorded behind its copy, so a depth-2
+    // scheduler's still-queued copy never reads bytes a later step wrote.
     // Freed in ~GPUModelRunner after the drain, like the buffers above.
     static constexpr int kUploadRegions = 3;
     int32_t* upload_pinned[kUploadRegions] = {};
     vt::Event upload_done[kUploadRegions] = {};
     bool upload_pending[kUploadRegions] = {};
-    int64_t upload_capacity = 0;  // int32 elements per region, 0 until first use
+    int64_t upload_capacity = 0;  // int32 elements in upload_block and each region
     int upload_region = -1;       // the region being filled, -1 outside a step
     int upload_last = -1;         // the region the previous step filled
-    int64_t upload_used = 0;
+    int64_t upload_lo = 0;        // [lo, hi): the elements this step wrote
+    int64_t upload_hi = 0;
   };
   std::unique_ptr<AsyncDeviceInputs> async_device_inputs_;
   // Allocate on first use, or return nullptr when the mirror is not engaged

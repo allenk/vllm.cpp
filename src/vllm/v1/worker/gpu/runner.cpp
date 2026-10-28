@@ -5235,17 +5235,12 @@ GPUModelRunner::~GPUModelRunner() {
     // queue and because deleting it would make the free below depend on a line
     // thirty lines away for its safety.
     b.Synchronize(queue_);
-    // `draft_tokens` and `cu_num_logits` are in the list because they are in the
-    // struct; see the struct's declaration for why A2-4 must not move a free
-    // here by moving a wait.
+    // `draft_tokens` and `cu_num_logits` live in `upload_block` with the other
+    // per-step uploads and are freed with it, here; see the struct's
+    // declaration for why A2-4 must not move a free here by moving a wait.
     for (int32_t* p : {async_device_inputs_->last_sampled,
-                       async_device_inputs_->prefill_len,
-                       async_device_inputs_->query_start_loc,
-                       async_device_inputs_->seq_lens,
-                       async_device_inputs_->input_ids,
                        async_device_inputs_->ops,
-                       async_device_inputs_->draft_tokens,
-                       async_device_inputs_->cu_num_logits}) {
+                       async_device_inputs_->upload_block}) {
       if (p != nullptr) b.Free(p);
     }
     for (int r = 0; r < AsyncDeviceInputs::kUploadRegions; ++r) {
@@ -5451,27 +5446,42 @@ GPUModelRunner::get_or_create_async_device_inputs() {
     return static_cast<int32_t*>(p);
   };
   dev->last_sampled = alloc_i32(reqs);
-  dev->prefill_len = alloc_i32(reqs);
-  dev->query_start_loc = alloc_i32(static_cast<int64_t>(reqs) + 1);
-  // SPEC-DFLASH2 A2-3 REPAIR (#2911): the same shape as query_start_loc, and
-  // allocated unconditionally for the same reason — on a decode step it holds
-  // the arange a null used to stand for, so the arm has one expression for
-  // every step instead of one that is only correct while the veto stands.
-  dev->cu_num_logits = alloc_i32(static_cast<int64_t>(reqs) + 1);
-  dev->seq_lens = alloc_i32(reqs);
-  dev->input_ids = alloc_i32(toks);
   dev->ops = alloc_i32(4LL * reqs);
-  // SPEC-DFLASH2 A2-3 (#2911): the device mirror of the per-req_state draft
-  // buffer. Sized by the req_state POOL for the reason the header states — the
-  // kernel's row read is unbounded — and allocated once, freed only in the
-  // destructor, so no later wave can free it by moving a wait. Nothing is
-  // allocated without a speculator: `num_speculative_steps` is 0 and both the
-  // pointer and the stride stay at their inert defaults.
+  // The per-step uploads share one block, in the order the struct lists, each
+  // field at a 16-byte boundary.
+  //
+  // SPEC-DFLASH2 A2-3 REPAIR (#2911): cu_num_logits has the same shape as
+  // query_start_loc, and is laid out unconditionally for the same reason — on a
+  // decode step it holds the arange a null used to stand for, so the arm has one
+  // expression for every step instead of one that is only correct while the
+  // veto stands.
+  //
+  // SPEC-DFLASH2 A2-3 (#2911): draft_tokens is the device mirror of the
+  // per-req_state draft buffer. Sized by the req_state POOL for the reason the
+  // header states — the kernel's row read is unbounded — and allocated once,
+  // freed only in the destructor, so no later wave can free it by moving a wait.
+  // Nothing is laid out without a speculator: `num_speculative_steps` is 0 and
+  // both the pointer and the stride stay at their inert defaults.
   dev->draft_stride = input_batch_.num_speculative_steps;
-  if (dev->draft_stride > 0) {
-    dev->draft_tokens =
-        alloc_i32(static_cast<int64_t>(reqs) * dev->draft_stride);
-  }
+  const auto field = [](int64_t count) { return (count + 3) & ~int64_t{3}; };
+  const int64_t qsl_elems = field(static_cast<int64_t>(reqs) + 1);
+  const int64_t req_elems = field(reqs);
+  const int64_t draft_elems =
+      dev->draft_stride > 0 ? field(static_cast<int64_t>(reqs) * dev->draft_stride) : 0;
+  dev->upload_capacity = 2 * qsl_elems + 2 * req_elems + draft_elems + toks;
+  dev->upload_block = alloc_i32(dev->upload_capacity);
+  int32_t* next = dev->upload_block;
+  const auto take = [&next](int64_t elems) {
+    int32_t* p = next;
+    next += elems;
+    return p;
+  };
+  dev->query_start_loc = take(qsl_elems);
+  dev->seq_lens = take(req_elems);
+  dev->prefill_len = take(req_elems);
+  dev->cu_num_logits = take(qsl_elems);
+  if (dev->draft_stride > 0) dev->draft_tokens = take(draft_elems);
+  dev->input_ids = take(toks);
 
   // The mirror starts from whatever the host array already holds. In production
   // that is all zeros (no request has been admitted yet), but seeding from the
@@ -5492,15 +5502,17 @@ void GPUModelRunner::stage_upload(AsyncDeviceInputs& dev, int32_t* dst,
   if (count <= 0) return;
   vt::Backend& b = vt::GetBackend(queue_.device.type);
   const size_t bytes = static_cast<size_t>(count) * sizeof(int32_t);
-  // Inside a step: copy into this step's own pinned region, which no other
-  // upload shares and which is not refilled until the event behind these
-  // copies has fired (begin_step_uploads), so the DMA may run whenever the
-  // queue reaches it.
-  if (dev.upload_region >= 0 && dev.upload_used + count <= dev.upload_capacity) {
-    int32_t* stage = dev.upload_pinned[dev.upload_region] + dev.upload_used;
-    std::memcpy(stage, src, bytes);
-    dev.upload_used += count;
-    b.Copy(queue_, dst, stage, bytes);
+  // Inside a step, for a field of `upload_block`: into this step's own pinned
+  // region at the field's offset, which no other step shares and which is not
+  // refilled until the event behind its copy has fired (begin_step_uploads).
+  // end_step_uploads copies the step's whole span at once, so nothing between
+  // here and there may read the destination (the combine comes after it).
+  if (dev.upload_region >= 0 && dst >= dev.upload_block &&
+      dst + count <= dev.upload_block + dev.upload_capacity) {
+    const int64_t off = dst - dev.upload_block;
+    std::memcpy(dev.upload_pinned[dev.upload_region] + off, src, bytes);
+    dev.upload_lo = std::min(dev.upload_lo, off);
+    dev.upload_hi = std::max(dev.upload_hi, off + count);
     return;
   }
   // Otherwise from the caller's PAGEABLE buffer: the driver stages the bytes
@@ -5513,11 +5525,8 @@ void GPUModelRunner::stage_upload(AsyncDeviceInputs& dev, int32_t* dst,
 
 void GPUModelRunner::begin_step_uploads(AsyncDeviceInputs& dev) {
   vt::Backend& b = vt::GetBackend(queue_.device.type);
-  if (dev.upload_capacity == 0) {
-    // Every upload execute_model makes in one step, at the batch bound.
-    dev.upload_capacity = dev.input_ids_capacity + 3 * (int64_t{dev.max_reqs} + 1) +
-                          int64_t{dev.max_reqs} +
-                          int64_t{dev.max_reqs} * dev.draft_stride;
+  if (dev.upload_pinned[0] == nullptr) {
+    // A mirror of upload_block per region.
     for (int r = 0; r < AsyncDeviceInputs::kUploadRegions; ++r) {
       dev.upload_pinned[r] = static_cast<int32_t*>(
           b.AllocPinned(static_cast<size_t>(dev.upload_capacity) * sizeof(int32_t)));
@@ -5531,12 +5540,20 @@ void GPUModelRunner::begin_step_uploads(AsyncDeviceInputs& dev) {
     dev.upload_pending[r] = false;
   }
   dev.upload_region = r;
-  dev.upload_used = 0;
+  dev.upload_lo = dev.upload_capacity;
+  dev.upload_hi = 0;
 }
 
 void GPUModelRunner::end_step_uploads(AsyncDeviceInputs& dev) {
   if (dev.upload_region < 0) return;
   vt::Backend& b = vt::GetBackend(queue_.device.type);
+  // The span between the fields carries the region's stale tails; every
+  // consumer reads a field only up to this step's count.
+  if (dev.upload_hi > dev.upload_lo) {
+    b.Copy(queue_, dev.upload_block + dev.upload_lo,
+           dev.upload_pinned[dev.upload_region] + dev.upload_lo,
+           static_cast<size_t>(dev.upload_hi - dev.upload_lo) * sizeof(int32_t));
+  }
   b.RecordEvent(dev.upload_done[dev.upload_region], queue_);
   dev.upload_pending[dev.upload_region] = true;
   dev.upload_last = dev.upload_region;
