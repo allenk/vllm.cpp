@@ -143,7 +143,7 @@ void ResetStepInputStats();
 //     #1179 and #323. The HOST arm IS reached, and its own reach is bounded
 //     rather than claimed whole: `qwen3_5.cpp`'s `StageStepInputs` routes both
 //     Qwen3.5 decode drivers through it whenever `dbuf` is set, which is
-//     `VT_ASYNC_EXECUTOR=1` (default OFF, `docs/ENVIRONMENT.md`) or a
+//     `VT_ASYNC_EXECUTOR` (default ON for CUDA, `docs/ENVIRONMENT.md`) or a
 //     speculative verify step. `tests/vllm/models/test_qwen3_5_decode_graph_seam.cpp`
 //     holds that call site with a mutation that reds only the reachability case.
 //

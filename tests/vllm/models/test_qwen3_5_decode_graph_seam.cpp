@@ -635,9 +635,10 @@ TEST_CASE("A capture that FAILS reaches the caller; Qwen3_5DenseDecodeGraph neve
 // `vt::PersistentStepInput`.
 //
 // IT SETS `VT_ASYNC_EXECUTOR=1`, and that is a limit stated rather than hidden.
-// The persistent device input path is behind that lever (default OFF) plus the
-// speculative-decode arm, so on a default text-decode step the driver holds no
-// `StepDevInputs` at all and stages nothing. What this case therefore proves is
+// The persistent device input path is behind that lever (default ON only for a
+// CUDA queue, and these cases run on the CPU harness) plus the speculative-decode
+// arm, so with the lever off a text-decode step holds no `StepDevInputs` at all
+// and stages nothing. What this case therefore proves is
 // that the production `Step` REACHES the capability on the configuration that
 // has persistent device inputs — not that every step does. The lever is read
 // once into `Impl::dbuf` at construction, so it is set before the driver is
@@ -894,10 +895,12 @@ TEST_CASE("W6: two spec shapes of EQUAL S and different q get two graphs") {
 //
 //     const bool dbuf = impl_->dbuf || spec_step;              // qwen3_5.cpp
 //
-// with `impl_->dbuf` false unless `VT_ASYNC_EXECUTOR=1` and `spec_step` false on
-// every non-speculative step -- and the #1380 capture pre-grow living INSIDE
-// `if (dbuf)`. So the default server captures over a pool nobody prepared, and
-// #1380's own failure comes back by the one route its fix does not cover.
+// with `impl_->dbuf` false unless `VT_ASYNC_EXECUTOR=1`, then an opt-in, and
+// `spec_step` false on every non-speculative step -- and the #1380 capture pre-grow
+// living INSIDE `if (dbuf)`. So the default server captured over a pool nobody
+// prepared, and #1380's own failure came back by the one route its fix did not
+// cover. Since 2026-10-29 the lever is on by default for CUDA, so that lane is
+// `VT_ASYNC_EXECUTOR=0` now, and the cases below pin it.
 //
 // WHAT THESE CASES ASSERT, and why it is not the call. `CHECK(pre-grow was
 // called)` is a transcription: it stays green when the demand profile is wrong,
@@ -1293,8 +1296,10 @@ TEST_CASE("#2029: a NON-speculative Qwen3_5DenseDecodeGraph capture allocates no
   const dense::Qwen3_5DenseWeights w = dense::MakeWeights(c);
   REQUIRE_MESSAGE(vt::GraphCaptureEnabled(),
                   "this gate needs the CAPTURING lane; VLLM_CPP_CUDAGRAPH=0 is set");
-  REQUIRE_MESSAGE(std::getenv("VT_ASYNC_EXECUTOR") == nullptr,
-                  "this gate is about the DEFAULT lane; VT_ASYNC_EXECUTOR is set");
+  // The single-slot lane #2029 failed on: VT_ASYNC_EXECUTOR=0 on CUDA, and
+  // the unset default on this CPU harness. Pinned so the lane does not move
+  // with the device default. Set before the driver reads it at construction.
+  const ScopedEnv single_slot("VT_ASYNC_EXECUTOR", "0");
 
   StaticGraphCpu harness;
   vt::Queue q = Q();
@@ -1303,7 +1308,7 @@ TEST_CASE("#2029: a NON-speculative Qwen3_5DenseDecodeGraph capture allocates no
 
   // COLD: the one eager run at this shape, and the step whose per-class peak the
   // driver records as `s.demand`. `num_spec_decodes` is 0, so `spec_step` is
-  // false and this is the lane the default server is on.
+  // false and this is the single-slot lane.
   graph.Step({11}, {0}, DecodeAttnMeta(0), DecodeGdnMeta(), pool.attn_kv,
              pool.gdn_state);
   REQUIRE_FALSE(graph.captured());
@@ -1335,8 +1340,10 @@ TEST_CASE("#2029: a NON-speculative Qwen3_5DecodeGraph capture allocates nothing
   const Qwen3_5MoeWeights w = MakeWeights(c);
   REQUIRE_MESSAGE(vt::GraphCaptureEnabled(),
                   "this gate needs the CAPTURING lane; VLLM_CPP_CUDAGRAPH=0 is set");
-  REQUIRE_MESSAGE(std::getenv("VT_ASYNC_EXECUTOR") == nullptr,
-                  "this gate is about the DEFAULT lane; VT_ASYNC_EXECUTOR is set");
+  // The single-slot lane #2029 failed on: VT_ASYNC_EXECUTOR=0 on CUDA, and
+  // the unset default on this CPU harness. Pinned so the lane does not move
+  // with the device default. Set before the driver reads it at construction.
+  const ScopedEnv single_slot("VT_ASYNC_EXECUTOR", "0");
 
   StaticGraphCpu harness;
   vt::Queue q = Q();

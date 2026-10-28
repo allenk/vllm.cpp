@@ -40,6 +40,23 @@ inline bool AsyncRunnerFlagIsOn(const char* env_value) {
   return env_value == nullptr || env_value[0] != '0';
 }
 
+// Pure predicate for VT_ASYNC_EXECUTOR, the decode-graph overlap lever. Two sides
+// read it and they must agree: the runner skips its pre-forward drain after a
+// graphed decode step, and each decode-graph driver that hands out its slot's
+// logits as a non-owning view (qwen3_5.cpp, flint_paged.cpp) keeps two slots per
+// padded size and stages its step inputs outside the replay. A runner that skips
+// the drain over a driver holding one slot is the hazard VT_ASYNC_EXECUTOR_NO_DBUF
+// exists to show, so both sides parse through this one function.
+//
+// Unset follows `cuda`: ON for a CUDA device, where the overlap is measured
+// (35B NVFP4 +1-2 %, Flint even) and the async gates pass; OFF elsewhere, where
+// the runner never skips the drain and a second slot would only cost memory. A
+// '0'-leading value is OFF and any other value is ON, the house convention above.
+inline bool AsyncExecutorFlagIsOn(const char* env_value, bool cuda) {
+  if (env_value == nullptr) return cuda;
+  return env_value[0] != '0';
+}
+
 }  // namespace vllm::v1
 
 #endif  // VLLM_V1_WORKER_GPU_ASYNC_RUNNER_FLAG_H_

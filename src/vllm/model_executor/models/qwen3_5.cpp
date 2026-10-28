@@ -14,6 +14,7 @@
 #include "vllm/model_executor/expert_streamer.h"
 #include "vllm/model_executor/expert_slot_cache.h"
 #include "vllm/model_executor/expert_stream_seam.h"  // MODEL-TEXT-GLM-MOE-DSA W3 (#2214): the lifted lane
+#include "vllm/v1/worker/gpu/async_runner_flag.h"  // VT_ASYNC_EXECUTOR parse shared with the runner
 #include "vllm/v1/worker/gpu/cudagraph_dispatch.h"  // W6 (#1374) slot-key + dispatch counters
 #include "vllm/model_executor/models/qwen3_5.h"
 
@@ -11303,14 +11304,17 @@ void BuildPaddedDecode(int64_t S, const std::vector<int32_t>& tok,
 // The 2-slot parity ring is RETAINED: the depth-2 loop enqueues sample(i-1) AFTER
 // forward(i) (core.cpp step_with_batch_queue), so the persistent logits MUST double-
 // buffer or forward(i+1) overwrites logits(i) before sample(i) reads them; the ring
-// also gives each slot's pinned inputs a 2-step reuse window. DEFAULT OFF:
-// unset/anything-but-"1" ⇒ single-slot (slot[0]), no staging, no events — byte-
-// identical to the pre-lever baked-H2D driver. VT_ASYNC_EXECUTOR_NO_DBUF=1 is a TEST-
-// ONLY escape hatch that forces the ring OFF while the runner still skips the drain,
-// so the gate SEES the logits/input hazard in a RED arm. Production never sets it.
-static bool DecodeGraphDoubleBufferEnabled() {
-  const char* v = std::getenv("VT_ASYNC_EXECUTOR");
-  if (v == nullptr || v[0] != '1' || v[1] != '\0') return false;
+// also gives each slot's pinned inputs a 2-step reuse window. DEFAULT ON for a
+// CUDA queue, through the runner's own parse (AsyncExecutorFlagIsOn), so the ring
+// is on exactly when the runner skips its drain. VT_ASYNC_EXECUTOR=0 ⇒ single-slot
+// (slot[0]), no staging, no events — byte-identical to the pre-lever baked-H2D
+// driver. VT_ASYNC_EXECUTOR_NO_DBUF=1 is a TEST-ONLY escape hatch that forces the
+// ring OFF while the runner still skips the drain, so the gate SEES the logits/input
+// hazard in a RED arm. Production never sets it.
+static bool DecodeGraphDoubleBufferEnabled(vt::DeviceType device) {
+  if (!v1::AsyncExecutorFlagIsOn(std::getenv("VT_ASYNC_EXECUTOR"),
+                                 device == vt::DeviceType::kCUDA))
+    return false;
   const char* nod = std::getenv("VT_ASYNC_EXECUTOR_NO_DBUF");
   if (nod != nullptr && nod[0] == '1' && nod[1] == '\0') return false;
   return true;
@@ -11540,7 +11544,7 @@ struct Qwen3_5DecodeGraph::Impl {
               !vllm::platforms::GetPlatform(queue.device.type)
                    .static_graph_requires_opt_in(config.architectures) &&
               b.SupportsGraphCapture();
-    dbuf = enabled && DecodeGraphDoubleBufferEnabled();
+    dbuf = enabled && DecodeGraphDoubleBufferEnabled(queue.device.type);
     poison = enabled && std::getenv("VT_ASYNC_EXECUTOR_POISON") != nullptr;
   }
   ~Impl() {
@@ -12177,7 +12181,7 @@ struct Qwen3_5DenseDecodeGraph::Impl {
               !vllm::platforms::GetPlatform(queue.device.type)
                    .static_graph_requires_opt_in(config.architectures) &&
               b.SupportsGraphCapture();
-    dbuf = enabled && DecodeGraphDoubleBufferEnabled();
+    dbuf = enabled && DecodeGraphDoubleBufferEnabled(queue.device.type);
     poison = enabled && std::getenv("VT_ASYNC_EXECUTOR_POISON") != nullptr;
   }
   ~Impl() {

@@ -31,3 +31,20 @@ TEST_CASE(
   CHECK_FALSE(AsyncRunnerFlagIsOn("0abc"));
   CHECK_FALSE(AsyncRunnerFlagIsOn("00"));
 }
+
+TEST_CASE(
+    "VT_ASYNC_EXECUTOR defaults ON for CUDA only; '0' rolls back, '1' opts in") {
+  using vllm::v1::AsyncExecutorFlagIsOn;
+  // Unset follows the device: the runner and the drivers both pass whether
+  // they run on CUDA, so they cannot disagree about the default.
+  CHECK(AsyncExecutorFlagIsOn(nullptr, true));
+  CHECK_FALSE(AsyncExecutorFlagIsOn(nullptr, false));
+  // An explicit value wins on every device, so the pre-flip opt-in still works.
+  CHECK(AsyncExecutorFlagIsOn("1", true));
+  CHECK(AsyncExecutorFlagIsOn("1", false));
+  CHECK(AsyncExecutorFlagIsOn("", true));
+  CHECK(AsyncExecutorFlagIsOn("on", false));
+  CHECK_FALSE(AsyncExecutorFlagIsOn("0", true));
+  CHECK_FALSE(AsyncExecutorFlagIsOn("0", false));
+  CHECK_FALSE(AsyncExecutorFlagIsOn("00", true));
+}

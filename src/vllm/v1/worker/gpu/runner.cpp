@@ -3201,8 +3201,8 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     // sampler, so it drains exactly as before. The reset runs on BOTH paths: on the
     // skip path it releases the no-op-deleter view and clears req_ids/discard for
     // this step's stash WITHOUT touching the still-live, still-referenced slot
-    // buffer. Inert unless VT_ASYNC_EXECUTOR=1 (async_executor() default OFF), where
-    // skip_drain is always false and the block is byte-identical to the drain.
+    // buffer. VT_ASYNC_EXECUTOR=0 (async_executor() is ON by default on CUDA) makes
+    // skip_drain always false, and the block is byte-identical to the drain.
     const bool skip_drain = async_executor() && exec_state_.logits.on_device() &&
                             exec_state_.logits.non_owning_view;
     if (skip_drain && std::getenv("VT_ASYNC_EXECUTOR_TRACE") != nullptr) {
@@ -5410,18 +5410,20 @@ bool GPUModelRunner::async_device_mirror() const {
 }
 
 // VT_ASYNC_EXECUTOR (decode-graph slot double-buffer, ENG-ASYNC-SCHED c16/c32
-// overlap unlock). DEFAULT OFF — an opt-in speed lever. Engages only where the
+// overlap unlock). DEFAULT ON for CUDA, "0" rolls back to the drain; the parse is
+// AsyncExecutorFlagIsOn (async_runner_flag.h), the one the double-buffering
+// decode-graph drivers use, so the two sides agree. Engages only where the
 // depth-2 moved drain and the decode graph both exist: the device mirror path on
 // a real CUDA GPU. On the CPU backend / mirror-OFF path the drain does not move
-// and there is no decode graph, so the lever is inert. Memoized. Reading a plain
-// "not 0" env keeps a value of "1" the canonical enable; anything else (unset,
-// "0") leaves the drain in place, which is byte-identical production.
+// and there is no decode graph, so the lever is inert. Memoized. The drain is
+// skipped only after a step whose logits are a non-owning slot view, which only
+// the double-buffering drivers return; every other step drains as before.
 bool GPUModelRunner::async_executor() const {
   if (async_executor_cached_ >= 0) return async_executor_cached_ != 0;
   bool on = false;
 #ifdef VLLM_CPP_CUDA
-  const char* value = std::getenv("VT_ASYNC_EXECUTOR");
-  on = value != nullptr && value[0] == '1' && value[1] == '\0' &&
+  on = AsyncExecutorFlagIsOn(std::getenv("VT_ASYNC_EXECUTOR"),
+                             queue_.device.type == vt::DeviceType::kCUDA) &&
        async_device_mirror();
 #endif
   async_executor_cached_ = on ? 1 : 0;

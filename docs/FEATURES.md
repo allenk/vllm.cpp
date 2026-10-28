@@ -75,7 +75,7 @@ by #2794 (goldens predate the pin) and #2817 (the advance).
 | Priority scheduling | ◐ gating (`--scheduling-policy priority` reaches the server; scheduler-unit tests only, no engine-level priority-vs-FCFS gate exists yet, #534) | ✅ | ✅ | ☐ |
 | LPM cache-aware admission | ✅ | ☐ | ✅ | ☐ |
 | In-batch prefix de-prioritization | ✅ | ☐ | ✅ | ☐ |
-| Async / overlap scheduling | ✅ default on (UAF-safe drain; device token-ids mirror on gate + classic-dense; the decode graph declines while the mirror is live (#323 fix, eager fallback); opt-in `VT_ASYNC_EXECUTOR` out-of-capture H2D staging) | ✅ | ✅ | ☐ |
+| Async / overlap scheduling | ✅ default on (UAF-safe drain; device token-ids mirror on gate + classic-dense; the decode graph declines while the mirror is live (#323 fix, eager fallback); `VT_ASYNC_EXECUTOR` out-of-capture H2D staging, default on for CUDA) | ✅ | ✅ | ☐ |
 | CUDA graph decode capture | ◐ per-family | ✅ | ✅ | ✅ |
 | Partial-prefill concurrency | ☐ | ✅ | ✅ | ☐ |
 | Cascade attention | ☐ | ✅ | ◐ | ☐ |

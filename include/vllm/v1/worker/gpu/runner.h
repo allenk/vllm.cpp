@@ -1123,14 +1123,15 @@ class GPUModelRunner final : public ModelRunnerBase {
   // flip (ROW-SERVE-ASYNC-LLM P0); VT_ASYNC_DEVICE_MIRROR=0 is the rollback.
   bool async_device_mirror() const;
   mutable int async_device_mirror_cached_ = -1;  // -1 unknown, 0 no, 1 yes
-  // VT_ASYNC_EXECUTOR (default OFF): the decode-graph slot double-buffer lever.
+  // VT_ASYNC_EXECUTOR (default ON for CUDA, "0" rolls back; AsyncExecutorFlagIsOn):
+  // the decode-graph slot double-buffer lever.
   // When on AND the previous step's stashed logits are a NON-owning decode-graph
   // slot view (non_owning_view), the depth-2 drain before the forward is skipped —
   // hazard-A (the eager owning-logits reset UAF) is absent for a slot view, and
   // hazard-C (the persistent decode-graph host inputs being overwritten while the
   // previous replay still reads them) is instead guarded inside the model by a
-  // 2-slot parity ring + per-slot reuse event. OFF routes through today's single-
-  // slot code with the drain intact (byte-identical). Memoized like the mirror.
+  // 2-slot parity ring + per-slot reuse event. "0" routes through the single-slot
+  // code with the drain intact (byte-identical). Memoized like the mirror.
   bool async_executor() const;
   mutable int async_executor_cached_ = -1;  // -1 unknown, 0 no, 1 yes
   // Push the recorded InputBatch structural edits (seed/move/swap) to the device

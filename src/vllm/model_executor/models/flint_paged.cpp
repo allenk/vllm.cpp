@@ -38,6 +38,7 @@
 #include "vllm/platforms/interface.h"
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/v1/worker/gpu/async_runner_flag.h"
 #include "vt/backend.h"
 #include "vt/breakable_graph.h"
 #include "vt/ops.h"
@@ -605,14 +606,16 @@ ForwardLogits ViewDeviceLogits(void* base, vt::Device device, int64_t rows, int6
   return fl;
 }
 
-// VT_ASYNC_EXECUTOR=1 (qwen3_5.cpp DecodeGraphDoubleBufferEnabled): the runner
-// skips its pre-forward drain after a graphed step, and its depth-2 loop enqueues
+// VT_ASYNC_EXECUTOR, on by default for a CUDA queue (qwen3_5.cpp
+// DecodeGraphDoubleBufferEnabled, the runner's parse): the runner skips its
+// pre-forward drain after a graphed step, and its depth-2 loop enqueues
 // sample(i-1) after forward(i), so each padded size keeps two independent slots
 // and alternates them; otherwise replay i+1 would overwrite logits i before they
 // are sampled. VT_ASYNC_EXECUTOR_NO_DBUF=1 is the same test-only escape hatch.
-bool DecodeGraphDoubleBufferEnabled() {
-  const char* v = std::getenv("VT_ASYNC_EXECUTOR");
-  if (v == nullptr || v[0] != '1' || v[1] != '\0') return false;
+bool DecodeGraphDoubleBufferEnabled(vt::DeviceType device) {
+  if (!v1::AsyncExecutorFlagIsOn(std::getenv("VT_ASYNC_EXECUTOR"),
+                                 device == vt::DeviceType::kCUDA))
+    return false;
   const char* nod = std::getenv("VT_ASYNC_EXECUTOR_NO_DBUF");
   return !(nod != nullptr && nod[0] == '1' && nod[1] == '\0');
 }
@@ -743,7 +746,7 @@ struct FlintPagedDecodeGraph::Impl {
               platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
               !platforms::GetPlatform(queue.device.type).static_graph_requires_opt_in() &&
               b.SupportsGraphCapture();
-    dbuf = DecodeGraphDoubleBufferEnabled();
+    dbuf = DecodeGraphDoubleBufferEnabled(queue.device.type);
     if (enabled && weights.params.hidden_size % 8 == 0)
       prologue = PrologueKernels(Dev{b, queue});
   }
