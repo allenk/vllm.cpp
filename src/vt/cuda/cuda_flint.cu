@@ -239,7 +239,9 @@ union Bf16x8 {
 
 // One block per row; thread i owns the 8-element vectors i, i + 256, ... and keeps
 // its f32 sums s in registers, so the output comes from the unrounded s while the
-// residual is stored rounded, as the Triton kernel does.
+// residual is stored rounded, as the Triton kernel does. kStore: the residual is
+// written with x and not read (the first layer).
+template <bool kStore>
 __global__ void AddRmsNormKernel(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* x,
                                  __nv_bfloat16* residual, const __nv_bfloat16* __restrict__ w,
                                  int hidden, float eps) {
@@ -256,7 +258,9 @@ __global__ void AddRmsNormKernel(__nv_bfloat16* __restrict__ out, const __nv_bfl
     a.raw = xv[v];
 #pragma unroll
     for (int k = 0; k < 8; ++k) s[j][k] = __bfloat162float(a.h[k]);
-    if (residual != nullptr) {
+    if constexpr (kStore) {
+      reinterpret_cast<uint4*>(residual + base)[v] = a.raw;
+    } else if (residual != nullptr) {
       auto* rv = reinterpret_cast<uint4*>(residual + base);
       Bf16x8 r;
       r.raw = rv[v];
@@ -296,18 +300,32 @@ __global__ void AddRmsNormKernel(__nv_bfloat16* __restrict__ out, const __nv_bfl
   }
 }
 
-void AddRmsNormLaunch(Queue& q, void* out, const void* x, void* residual, const void* w,
+template <bool kStore>
+void LaunchAddRmsNorm(Queue& q, void* out, const void* x, void* residual, const void* w,
                       int64_t rows, int64_t hidden, float eps) {
   if (hidden % 8 != 0 || hidden > 8 * kNormThreads * kNormMaxVec) {
     throw std::runtime_error("flint cuda: add_rms_norm needs hidden % 8 == 0 and hidden <= 8192");
   }
+  if (kStore && residual == nullptr) {
+    throw std::runtime_error("flint cuda: rms_norm_store_residual needs a residual");
+  }
   if (rows == 0) return;
-  AddRmsNormKernel<<<static_cast<unsigned>(rows), kNormThreads, 0,
-                     static_cast<cudaStream_t>(q.handle)>>>(
+  AddRmsNormKernel<kStore><<<static_cast<unsigned>(rows), kNormThreads, 0,
+                             static_cast<cudaStream_t>(q.handle)>>>(
       static_cast<__nv_bfloat16*>(out), static_cast<const __nv_bfloat16*>(x),
       static_cast<__nv_bfloat16*>(residual), static_cast<const __nv_bfloat16*>(w),
       static_cast<int>(hidden), eps);
   Check(cudaGetLastError(), "add_rms_norm launch");
+}
+
+void AddRmsNormLaunch(Queue& q, void* out, const void* x, void* residual, const void* w,
+                      int64_t rows, int64_t hidden, float eps) {
+  LaunchAddRmsNorm<false>(q, out, x, residual, w, rows, hidden, eps);
+}
+
+void RmsNormStoreResidualLaunch(Queue& q, void* out, const void* x, void* residual,
+                                const void* w, int64_t rows, int64_t hidden, float eps) {
+  LaunchAddRmsNorm<true>(q, out, x, residual, w, rows, hidden, eps);
 }
 
 // Grid-stride over 8-element vectors of the [rows, d] output.
@@ -345,8 +363,77 @@ void RoutedSiluAndMulLaunch(Queue& q, void* out, const void* gu, int64_t rows, i
   Check(cudaGetLastError(), "routed_silu_and_mul launch");
 }
 
-const FlintDeviceKernels kFlintKernels = {&QkNormRopeKvCacheLaunch, &SigmoidTopKLaunch,
-                                          &AddRmsNormLaunch, &RoutedSiluAndMulLaunch};
+void* DeviceAlias(void* pinned) {
+  void* dev = nullptr;
+  if (cudaHostGetDevicePointer(&dev, pinned, 0) != cudaSuccess) {
+    (void)cudaGetLastError();  // not mapped: clear the sticky error, report "no alias"
+    return nullptr;
+  }
+  return dev;
+}
+
+constexpr int kPrologueThreads = 256;
+
+// One block per row. Thread 0 resolves the row's id and copies its scalars; the
+// block copies the row's block-table entries and then its embedding row.
+__global__ void DecodePrologueKernel(char* __restrict__ block, FlintStepLayout lay,
+                                     int32_t* __restrict__ positions, int64_t* __restrict__ slots,
+                                     int32_t* __restrict__ block_table,
+                                     int32_t* __restrict__ seq_lens,
+                                     int32_t* __restrict__ query_start_loc,
+                                     __nv_bfloat16* __restrict__ hidden_out,
+                                     const __nv_bfloat16* __restrict__ embed, int rows, int cols,
+                                     int hidden, int vocab) {
+  const int r = static_cast<int>(blockIdx.x);
+  auto* hdr = reinterpret_cast<FlintStepHeader*>(block);
+  __shared__ int32_t id;
+  if (threadIdx.x == 0) {
+    int32_t t = r < hdr->override_count ? hdr->override_ids[r]
+                                        : reinterpret_cast<const int32_t*>(block + lay.token_ids)[r];
+    if (t < 0 || t >= vocab) {
+      hdr->bad_row = r;
+      hdr->bad_id = t;
+      __threadfence_system();
+      t = t < 0 ? 0 : vocab - 1;  // keep the gather in bounds, as vt::Embedding does
+    }
+    id = t;
+    positions[r] = reinterpret_cast<const int32_t*>(block + lay.positions)[r];
+    seq_lens[r] = reinterpret_cast<const int32_t*>(block + lay.seq_lens)[r];
+    slots[r] = reinterpret_cast<const int64_t*>(block + lay.slots)[r];
+    const auto* qsl = reinterpret_cast<const int32_t*>(block + lay.query_start_loc);
+    query_start_loc[r] = qsl[r];
+    if (r == rows - 1) query_start_loc[rows] = qsl[rows];
+  }
+  const auto* bt = reinterpret_cast<const int32_t*>(block + lay.block_table) +
+                   static_cast<int64_t>(r) * cols;
+  for (int c = static_cast<int>(threadIdx.x); c < cols; c += kPrologueThreads)
+    block_table[static_cast<int64_t>(r) * cols + c] = bt[c];
+  __syncthreads();
+  const auto* src = reinterpret_cast<const uint4*>(embed + static_cast<int64_t>(id) * hidden);
+  auto* dst = reinterpret_cast<uint4*>(hidden_out + static_cast<int64_t>(r) * hidden);
+  for (int v = static_cast<int>(threadIdx.x); v < hidden / 8; v += kPrologueThreads) dst[v] = src[v];
+}
+
+void DecodePrologueLaunch(Queue& q, void* block, int32_t* positions, int64_t* slots,
+                          int32_t* block_table, int32_t* seq_lens, int32_t* query_start_loc,
+                          void* hidden_out, const void* embed, int64_t rows, int64_t cols,
+                          int64_t hidden, int64_t vocab) {
+  if (hidden % 8 != 0) throw std::runtime_error("flint cuda: decode_prologue needs hidden % 8 == 0");
+  if (vocab <= 0) throw std::runtime_error("flint cuda: decode_prologue with an empty vocabulary");
+  if (rows == 0) return;
+  DecodePrologueKernel<<<static_cast<unsigned>(rows), kPrologueThreads, 0,
+                         static_cast<cudaStream_t>(q.handle)>>>(
+      static_cast<char*>(block), MakeFlintStepLayout(rows, cols), positions, slots, block_table,
+      seq_lens, query_start_loc, static_cast<__nv_bfloat16*>(hidden_out),
+      static_cast<const __nv_bfloat16*>(embed), static_cast<int>(rows), static_cast<int>(cols),
+      static_cast<int>(hidden), static_cast<int>(vocab));
+  Check(cudaGetLastError(), "decode_prologue launch");
+}
+
+const FlintDeviceKernels kFlintKernels = {
+    &QkNormRopeKvCacheLaunch, &SigmoidTopKLaunch,      &AddRmsNormLaunch,
+    &RmsNormStoreResidualLaunch, &RoutedSiluAndMulLaunch, &DeviceAlias,
+    &DecodePrologueLaunch};
 
 struct Registrar {
   Registrar() {

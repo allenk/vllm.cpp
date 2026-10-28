@@ -15,11 +15,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -202,6 +204,19 @@ DBuf DenseMlp(Dev d, const FlintPagedLayer& lw, const Tensor& x) {
 const flint::FlintDeviceKernels* FusedKernels(Dev d) {
   static const bool on = [] {
     const char* e = std::getenv("VT_FLINT_FUSED");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  if (!on || d.q.device.type != vt::DeviceType::kCUDA || !flint::FlintDeviceKernelsAvailable())
+    return nullptr;
+  return flint::FlintDevice();
+}
+
+// The decode graph's prologue (flint_device.h decode_prologue), or nullptr. It
+// only moves bytes, so it does not follow VT_FLINT_FUSED; VT_FLINT_GRAPH_PROLOGUE=0
+// keeps the per-input staged copies and the embedding outside the graph.
+const flint::FlintDeviceKernels* PrologueKernels(Dev d) {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FLINT_GRAPH_PROLOGUE");
     return !(e != nullptr && e[0] == '0');
   }();
   if (!on || d.q.device.type != vt::DeviceType::kCUDA || !flint::FlintDeviceKernelsAvailable())
@@ -415,13 +430,21 @@ DBuf MoeBlock(Dev d, const FlintPagedMoe& m, const FlintParams& p, const Tensor&
 #endif
 }
 
+bool FusedNorm(const flint::FlintDeviceKernels* fk, const Tensor& x, const Tensor& w) {
+  return fk != nullptr && x.dtype == DType::kBF16 && w.dtype == DType::kBF16 && x.IsContiguous();
+}
+
 // res := bf16(x + res); out = RMSNorm(x + res) * w. With the glue kernels this is
 // vLLM's Flint fused_add_rms_norm (the norm taken from the unrounded f32 sum, one
 // launch); without them the shared vt::RmsNorm, which normalises the rounded res.
+// `first`: the residual stream starts at this norm. The fused kernel then stores x
+// as the residual (vLLM's `residual = hidden_states`); the composed fallback adds
+// into the residual ForwardLayers zeroed for it.
 void AddRmsNorm(Dev d, DBuf& out, const Tensor& x, DBuf& res, const Tensor& w, float eps,
-                const flint::FlintDeviceKernels* fk) {
-  if (fk != nullptr && x.dtype == DType::kBF16 && w.dtype == DType::kBF16 && x.IsContiguous()) {
-    fk->add_rms_norm(d.q, out.ptr(), x.data, res.ptr(), w.data, x.shape[0], x.shape[1], eps);
+                const flint::FlintDeviceKernels* fk, bool first = false) {
+  if (FusedNorm(fk, x, w)) {
+    (first ? fk->rms_norm_store_residual : fk->add_rms_norm)(
+        d.q, out.ptr(), x.data, res.ptr(), w.data, x.shape[0], x.shape[1], eps);
     return;
   }
   vt::RmsNorm(d.q, out.t(), x, w, vt::RmsNormArgs{eps, false}, &res.t());
@@ -433,12 +456,13 @@ void AddRmsNorm(Dev d, DBuf& out, const Tensor& x, DBuf& res, const Tensor& w, f
 void RunLayer(Dev d, const FlintPagedLayer& lw, const FlintParams& p, const HfConfig& cfg,
               Tensor& hidden, std::shared_ptr<void>& hidden_hold, DBuf& res,
               const StepInputs& si, const CommonAttentionMetadata& meta,
-              const PagedKvCache& kv, int64_t T, const flint::FlintDeviceKernels* fk) {
+              const PagedKvCache& kv, int64_t T, const flint::FlintDeviceKernels* fk,
+              bool first) {
   const int64_t H = p.hidden_size;
   const float eps = static_cast<float>(p.rms_norm_eps);
   Tensor w_in = ResidentWeight(d, lw.input_layernorm, {H});
   DBuf normed(d, DType::kBF16, {T, H});
-  AddRmsNorm(d, normed, hidden, res, w_in, eps, fk);
+  AddRmsNorm(d, normed, hidden, res, w_in, eps, fk, first);
 
   DBuf attn = Attention(d, lw, p, cfg, normed.t(), si, meta, kv, T, fk);
 
@@ -460,12 +484,16 @@ void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>&
     d.b.Copy(d.q, dp + s * rb, sp + static_cast<size_t>(idx[s]) * rb, rb);
 }
 
-// The embedding stays outside the decode graph: vt::Embedding reports bad ids
-// through a device flag it copies back with an event per call (and allocates on
-// a ring slot's first use), which a capture cannot hold.
+// vt::Embedding stays outside the decode graph: it reports bad ids through a
+// device flag it copies back with an event per call (and allocates on a ring
+// slot's first use), which a capture cannot hold. Inside the graph the decode
+// prologue gathers the rows instead.
+Tensor EmbedTable(Dev d, const FlintPagedWeights& w) {
+  return ResidentWeight(d, w.embed_tokens, {w.params.vocab_size, w.params.hidden_size});
+}
+
 void EmbedInto(Dev d, DBuf& hidden, const Tensor& ids, const FlintPagedWeights& w) {
-  Tensor table = ResidentWeight(d, w.embed_tokens, {w.params.vocab_size, w.params.hidden_size});
-  vt::Embedding(d.q, hidden.t(), table, ids);
+  vt::Embedding(d.q, hidden.t(), EmbedTable(d, w), ids);
 }
 
 void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
@@ -499,8 +527,12 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in, const std::vector<int32_t>& p
            "flint paged: only the materialized residual-norm policy is wired");
 
   DBuf res(d, DType::kBF16, {T, H});
-  res.Zero(d);
   const flint::FlintDeviceKernels* fk = FusedKernels(d);
+  // The first layer's fused norm writes the residual; only the composed one adds
+  // into it.
+  if (w.layers.empty() ||
+      !FusedNorm(fk, hidden_in, ResidentWeight(d, w.layers.front().input_layernorm, {H})))
+    res.Zero(d);
   StepInputs built;
   if (persistent == nullptr) {
     built = BuildStepInputs(d, positions, meta, cfg);
@@ -515,7 +547,7 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in, const std::vector<int32_t>& p
   std::shared_ptr<void> hidden_hold;
   for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
     RunLayer(d, w.layers[static_cast<size_t>(l)], p, cfg, hidden, hidden_hold, res, si, meta,
-             kv[static_cast<size_t>(l)], T, fk);
+             kv[static_cast<size_t>(l)], T, fk, /*first=*/l == 0);
   }
   DBuf normed(d, DType::kBF16, {T, H});
   AddRmsNorm(d, normed, hidden, res, ResidentWeight(d, w.final_norm, {H}), eps, fk);
@@ -678,9 +710,19 @@ ForwardLogits FlintPagedModel::ForwardDevice(const std::vector<int32_t>& token_i
 
 // ─── FlintPagedDecodeGraph ────────────────────────────────────────────────────
 // The Qwen3MoeDecodeGraph driver (qwen3_moe.cpp) with Flint's forward in the
-// captured region: the embedding runs outside, the MoE arenas and dense Marlin
-// residents are built before capture, and the FA-2 decode scratch (keyed by
-// shape and split count) is filled by an eager forward right before each capture.
+// captured region: the MoE arenas and dense Marlin residents are built before
+// capture, and the FA-2 decode scratch (keyed by shape and split count) is filled
+// by an eager forward right before each capture.
+//
+// The step's inputs reach the graph through its first node, the decode prologue:
+// the host writes them into the slot's pinned step block and the prologue reads
+// it in place, so a replay is the only thing the step submits. In front of each
+// replay there used to be ten small operations of Flint's (seven staged copies;
+// the embedding's flag memset, gather and flag copy back), and on Windows the GPU
+// idled between them and the runner's uploads: median 240 us and p90 1.4 ms per
+// decode step at c=1, although the host had issued all of it milliseconds early.
+// Without the prologue (VT_FLINT_GRAPH_PROLOGUE=0, or no device alias for pinned
+// memory) the copies and the embedding stay outside the graph as before.
 //
 // The DevicePool needs the 35B driver's discipline (qwen3_5.cpp #1380 / #2274),
 // which Qwen3MoeDecodeGraph does not carry: a capture must be served entirely
@@ -702,6 +744,8 @@ struct FlintPagedDecodeGraph::Impl {
               !platforms::GetPlatform(queue.device.type).static_graph_requires_opt_in() &&
               b.SupportsGraphCapture();
     dbuf = DecodeGraphDoubleBufferEnabled();
+    if (enabled && weights.params.hidden_size % 8 == 0)
+      prologue = PrologueKernels(Dev{b, queue});
   }
   ~Impl() {
     Backend& b = vt::GetBackend(queue.device.type);
@@ -725,26 +769,36 @@ struct FlintPagedDecodeGraph::Impl {
     vt::BreakableGraph graph;
     DevicePool::StepDemand demand;                  // the cold step's pool demand
     std::vector<std::pair<size_t, void*>> pinned;  // blocks the captured graph baked
-    // Device step inputs the captured graph reads, refreshed before every replay
-    // from pinned staging (an async DMA, outside the graph). From FlintInputPool so
-    // retaining them never empties a size class the captured scratch needs.
+    // Device step inputs the captured graph reads, refreshed every step by the
+    // prologue inside the graph, or without it by staged copies before the replay.
+    // From FlintInputPool so retaining them never empties a size class the
+    // captured scratch needs.
     std::unique_ptr<StepInputs> dev;
+    // With the prologue: the pinned step block it reads, and that block's device
+    // alias. Otherwise the per-input staged cells.
+    void* block = nullptr;
+    void* block_dev = nullptr;
+    flint::FlintStepLayout layout{};
     vt::PersistentStepInput in_positions, in_slots, in_block_table, in_seq_lens, in_qsl;
-    // Recorded after each staging; the next refresh of this slot waits on it, so
-    // the pinned block is not rewritten while the previous upload may still be
-    // queued behind a running replay (the async runner overlaps steps).
+    // Recorded after the last use of this slot's pinned staging (the copies, or
+    // the replay whose prologue reads the step block); the next refresh of this
+    // slot waits on it, so the staging is not rewritten while that use may still
+    // be queued (the async runner overlaps steps).
     vt::Event staged{};
     bool staged_pending = false;
     int fa_cols = -1;
     bool warm = false;
     int64_t replays = 0;
 
-    // Waits out an upload still reading the pinned staging before freeing it.
+    // Waits out a use still reading the pinned staging before freeing it.
     void UnbindInputs(Backend& b) {
       if (staged_pending) {
         b.SynchronizeEvent(staged);
         staged_pending = false;
       }
+      if (block != nullptr) b.FreePinned(block);
+      block = nullptr;
+      block_dev = nullptr;
       in_positions.Unbind();
       in_slots.Unbind();
       in_block_table.Unbind();
@@ -780,13 +834,82 @@ struct FlintPagedDecodeGraph::Impl {
     }
     const auto cols = static_cast<size_t>(s.attn_meta.block_table_num_cols);
     const auto rows = static_cast<size_t>(S);
+    if (s.staged.handle == nullptr) s.staged = d.b.CreateEvent(/*blocking=*/true);
+    s.staged_pending = false;
+    if (prologue != nullptr && EmbedTable(d, weights).dtype == DType::kBF16) {
+      s.layout = flint::MakeFlintStepLayout(S, static_cast<int64_t>(cols));
+      s.block = d.b.AllocPinned(s.layout.bytes);
+      s.block_dev = prologue->device_alias(s.block);
+      if (s.block_dev != nullptr) {
+        std::memset(s.block, 0, s.layout.bytes);
+        static_cast<flint::FlintStepHeader*>(s.block)->bad_row = -1;
+        return;
+      }
+      d.b.FreePinned(s.block);
+      s.block = nullptr;
+    }
     s.in_positions.Bind(d.b, s.dev->positions.ptr(), sizeof(int32_t) * rows);
     s.in_slots.Bind(d.b, s.dev->slot_mapping.ptr(), sizeof(int64_t) * rows);
     s.in_block_table.Bind(d.b, s.dev->block_table.ptr(), sizeof(int32_t) * rows * cols);
     s.in_seq_lens.Bind(d.b, s.dev->seq_lens.ptr(), sizeof(int32_t) * rows);
     s.in_qsl.Bind(d.b, s.dev->query_start_loc.ptr(), sizeof(int32_t) * (rows + 1));
-    if (s.staged.handle == nullptr) s.staged = d.b.CreateEvent(/*blocking=*/true);
-    s.staged_pending = false;
+  }
+
+  // Writes this step's padded inputs into the slot's step block once the replay
+  // that last read it has run, and raises an id that replay found out of range
+  // (vt::Embedding's contract, which also reports at the following call).
+  void StageBlock(Dev d, SizeSlot& s, int64_t S, const detail::DeviceTokenIds& ov) {
+    if (s.staged_pending) {
+      d.b.SynchronizeEvent(s.staged);
+      s.staged_pending = false;
+    }
+    auto* base = static_cast<char*>(s.block);
+    auto* hdr = static_cast<flint::FlintStepHeader*>(s.block);
+    if (hdr->bad_row >= 0) {
+      const int32_t id = hdr->bad_id;
+      hdr->bad_row = -1;
+      throw std::runtime_error("flint decode: embedding id " + std::to_string(id) +
+                               " out of range [0, " +
+                               std::to_string(weights.params.vocab_size) + ")");
+    }
+    const auto& am = s.attn_meta;
+    const auto rows = static_cast<size_t>(S);
+    VT_CHECK(s.token_ids.size() == rows && s.positions.size() == rows &&
+                 am.seq_lens.size() == rows && am.query_start_loc.size() == rows + 1 &&
+                 am.slot_mapping.size() == rows &&
+                 am.block_table_tensor.size() ==
+                     rows * static_cast<size_t>(am.block_table_num_cols),
+             "flint decode: the padded step inputs do not match the slot's step block");
+    VT_CHECK(ov.ids == nullptr || ov.count <= S,
+             "flint decode: the runner's device ids are longer than this step's padded input");
+    const flint::FlintStepLayout& l = s.layout;
+    hdr->override_ids = ov.ids;
+    hdr->override_count = ov.ids != nullptr ? static_cast<int32_t>(ov.count) : 0;
+    std::memcpy(base + l.token_ids, s.token_ids.data(), rows * sizeof(int32_t));
+    std::memcpy(base + l.positions, s.positions.data(), rows * sizeof(int32_t));
+    std::memcpy(base + l.seq_lens, am.seq_lens.data(), rows * sizeof(int32_t));
+    std::memcpy(base + l.query_start_loc, am.query_start_loc.data(), (rows + 1) * sizeof(int32_t));
+    std::memcpy(base + l.slots, am.slot_mapping.data(), rows * sizeof(int64_t));
+    std::memcpy(base + l.block_table, am.block_table_tensor.data(),
+                am.block_table_tensor.size() * sizeof(int32_t));
+  }
+
+  // The prologue over the slot's step block (eagerly, or as the captured graph's
+  // first node).
+  void LaunchPrologue(Dev d, SizeSlot& s, int64_t S) {
+    StepInputs& si = *s.dev;
+    prologue->decode_prologue(
+        d.q, s.block_dev, static_cast<int32_t*>(si.positions.ptr()),
+        static_cast<int64_t*>(si.slot_mapping.ptr()), static_cast<int32_t*>(si.block_table.ptr()),
+        static_cast<int32_t*>(si.seq_lens.ptr()), static_cast<int32_t*>(si.query_start_loc.ptr()),
+        s.hidden->ptr(), EmbedTable(d, weights).data, S, s.attn_meta.block_table_num_cols,
+        weights.params.hidden_size, weights.params.vocab_size);
+  }
+
+  // The step block is free to rewrite once the work queued so far has run.
+  void MarkStaged(Dev d, SizeSlot& s) {
+    d.b.RecordEvent(s.staged, d.q);
+    s.staged_pending = true;
   }
 
   // Copies this step's padded host inputs into the slot's device buffers.
@@ -810,6 +933,7 @@ struct FlintPagedDecodeGraph::Impl {
   int64_t max_num_reqs = 0;
   bool enabled = false;
   bool dbuf = false;  // two slots per size, alternated (VT_ASYNC_EXECUTOR=1)
+  const flint::FlintDeviceKernels* prologue = nullptr;
   // With dbuf off only slot[0] is used and slot[1] stays empty.
   struct SlotRing {
     SizeSlot slot[2];
@@ -863,8 +987,13 @@ ForwardLogits FlintPagedDecodeGraph::Step(const std::vector<int32_t>& token_ids,
   s.Refresh(ptok, ppos, pam);
   s.fa_cols = cols;
   const detail::DeviceTokenIds ov = detail::TakeDeviceTokenIds();
-  s.ids.Ensure(d, S);
-  s.ids.Refresh(d, s.token_ids, ov.ids, ov.count);
+  // The embedding outside the graph: the cold step, and every step without the
+  // prologue.
+  const auto embed_outside = [&] {
+    s.ids.Ensure(d, S);
+    s.ids.Refresh(d, s.token_ids, ov.ids, ov.count);
+    EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights);
+  };
   if (cols_changed) {
     if (s.graph.captured()) {
       s.graph.Reset();
@@ -876,9 +1005,15 @@ ForwardLogits FlintPagedDecodeGraph::Step(const std::vector<int32_t>& token_ids,
   }
 
   if (s.graph.captured()) {
-    impl_->StageInputs(d, s);
-    EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights);
-    s.graph.Replay(impl_->queue);
+    if (s.block != nullptr) {
+      impl_->StageBlock(d, s, S, ov);
+      s.graph.Replay(impl_->queue);
+      impl_->MarkStaged(d, s);
+    } else {
+      impl_->StageInputs(d, s);
+      embed_outside();
+      s.graph.Replay(impl_->queue);
+    }
     ++s.replays;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, V);
@@ -890,8 +1025,13 @@ ForwardLogits FlintPagedDecodeGraph::Step(const std::vector<int32_t>& token_ids,
     // them, and the scratch pool grown to the cold step's demand (a no-op once the
     // free list is deep enough).
     if (s.dev == nullptr) impl_->BindInputs(d, s, S);
-    impl_->StageInputs(d, s);
-    EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights);
+    if (s.block != nullptr) {
+      impl_->StageBlock(d, s, S, ov);
+      impl_->LaunchPrologue(d, s, S);
+    } else {
+      impl_->StageInputs(d, s);
+      embed_outside();
+    }
     // This step's logits come from an EAGER forward over the same inputs, and the
     // capture after it only records. The order is what makes the capture safe:
     // the FA-2 decode scratch is keyed by the split count, which follows the
@@ -908,9 +1048,12 @@ ForwardLogits FlintPagedDecodeGraph::Step(const std::vector<int32_t>& token_ids,
       // kFull: a decode capture is one segment with attention inside, vLLM's
       // FULL decode graph.
       vt::GraphCaptureScope scope(b, impl_->queue, s.graph, vt::GraphCaptureMode::kFull);
+      if (s.block != nullptr) impl_->LaunchPrologue(d, s, S);
       lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv, impl_->weights,
                          impl_->config, kNoGather, s.dev.get());
     }
+    // After the eager prologue's read of the step block (the capture ran nothing).
+    if (s.block != nullptr) impl_->MarkStaged(d, s);
     if (!s.graph.captured()) {
       s.warm = false;
       if (s.graph.capture_failed()) {
@@ -943,7 +1086,7 @@ ForwardLogits FlintPagedDecodeGraph::Step(const std::vector<int32_t>& token_ids,
   // Cold size: one eager step warms the pool, the residents and the FA-2 scratch
   // for S; the next step at this size captures.
   s.hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{S, H});
-  EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights);
+  embed_outside();
   DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv, impl_->weights,
                           impl_->config, kNoGather);
   s.warm = true;

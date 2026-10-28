@@ -5,11 +5,41 @@
 // composes the shared ops instead.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "vt/device.h"  // vt::Queue
 
 namespace vllm::flint {
+
+// One decode step's inputs for the decode graph's prologue, in pinned host
+// memory the prologue reads through unified addressing: this header, then the
+// arrays at the FlintStepLayout offsets for the slot's (rows, cols).
+struct FlintStepHeader {
+  int32_t bad_row;         // -1, or written by the prologue: a row whose id is out of range
+  int32_t bad_id;          // that id (clamped for the gather)
+  int32_t override_count;  // rows [0, override_count) read their id from override_ids
+  int32_t reserved;
+  const int32_t* override_ids;  // the runner's device input ids, or null
+};
+
+struct FlintStepLayout {
+  size_t token_ids, positions, seq_lens, query_start_loc, slots, block_table, bytes;
+};
+
+inline FlintStepLayout MakeFlintStepLayout(int64_t rows, int64_t cols) {
+  const auto r = static_cast<size_t>(rows);
+  const auto up = [](size_t x) { return (x + 15) & ~size_t{15}; };
+  FlintStepLayout l{};
+  l.token_ids = up(sizeof(FlintStepHeader));
+  l.positions = up(l.token_ids + r * sizeof(int32_t));
+  l.seq_lens = up(l.positions + r * sizeof(int32_t));
+  l.query_start_loc = up(l.seq_lens + r * sizeof(int32_t));
+  l.slots = up(l.query_start_loc + (r + 1) * sizeof(int32_t));
+  l.block_table = up(l.slots + r * sizeof(int64_t));
+  l.bytes = up(l.block_table + r * static_cast<size_t>(cols) * sizeof(int32_t));
+  return l;
+}
 
 struct FlintDeviceKernels {
   // vLLM models/flint/ops/qk_norm_rope.py, `_qk_norm_rope_cache_kernel`, with its
@@ -45,6 +75,11 @@ struct FlintDeviceKernels {
   // (contiguous), w [hidden]; hidden % 8 == 0 and <= 8192. out may alias x.
   void (*add_rms_norm)(vt::Queue&, void* out, const void* x, void* residual, const void* w,
                        int64_t rows, int64_t hidden, float eps);
+  // The first layer's form, vLLM's `residual = hidden_states` followed by the norm
+  // without a residual: residual := x unchanged, out = bf16(x * rsqrt(mean(x^2) +
+  // eps) * w). Saves zeroing a residual to add into (a memset node in the graph).
+  void (*rms_norm_store_residual)(vt::Queue&, void* out, const void* x, void* residual,
+                                  const void* w, int64_t rows, int64_t hidden, float eps);
   // vLLM csrc/activation_kernels.cu act_and_mul<silu>, what fused_marlin_moe runs
   // between the routed w13 and w2 GEMMs: out = bf16(bf16(silu(g)) * u), the SiLU
   // rounded to bf16 BEFORE the product (silu_kernel returns the element type);
@@ -52,6 +87,21 @@ struct FlintDeviceKernels {
   // silu_and_mul instead, bf16(silu(g) * u) with one rounding (vt::SiluAndMul).
   //   gu [rows, 2 d] bf16 (gate half, then up half), out [rows, d]; d % 8 == 0.
   void (*routed_silu_and_mul)(vt::Queue&, void* out, const void* gu, int64_t rows, int64_t d);
+  // The device address of a pinned host block (what decode_prologue reads), or
+  // nullptr when this device cannot read it in place.
+  void* (*device_alias)(void* pinned);
+  // The decode graph's first node. Copies one step's inputs from `block` (the
+  // device alias of a pinned FlintStepHeader block laid out by
+  // MakeFlintStepLayout(rows, cols)) into the device buffers the captured layers
+  // read, and gathers each row's bf16 embedding: the id is override_ids[row] for
+  // row < override_count, else the block's own. An id outside [0, vocab) is
+  // clamped and reported in the header (bad_row / bad_id), which the host reads
+  // once the step has run. Inside the graph, so a replay makes no copy of its own.
+  //   embed [vocab, hidden] bf16, hidden_out [rows, hidden] bf16; hidden % 8 == 0
+  void (*decode_prologue)(vt::Queue&, void* block, int32_t* positions, int64_t* slots,
+                          int32_t* block_table, int32_t* seq_lens, int32_t* query_start_loc,
+                          void* hidden_out, const void* embed, int64_t rows, int64_t cols,
+                          int64_t hidden, int64_t vocab);
 };
 
 // The kCUDA table, or throws when nothing registered it.

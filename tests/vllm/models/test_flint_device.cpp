@@ -329,6 +329,45 @@ TEST_CASE("flint add_rms_norm matches the host model of vLLM's fused add + RMSNo
   }
 }
 
+TEST_CASE("flint rms_norm_store_residual is add_rms_norm over a zeroed residual") {
+  if (!HasFlintKernels()) {
+    MESSAGE("no CUDA backend or no kFlint kernels; skipping");
+    return;
+  }
+  // The first layer's norm: the residual becomes x (not read first), and the
+  // output is bit-identical to adding x into zeros. No -0 in x, where the two
+  // would differ by the sign of a zero.
+  const float eps = 1e-6f;
+  const int64_t R = 5, H = 2048;
+  const size_t n = static_cast<size_t>(R * H);
+  std::vector<uint16_t> x(n), w(static_cast<size_t>(H)), junk(n, 0x7fc0u);
+  {
+    const auto fx = Rand(n, 61, -3.f, 3.f);
+    const auto fw = Rand(w.size(), 62, 0.2f, 2.f);
+    for (size_t i = 0; i < n; ++i) x[i] = vt::F32ToBF16(fx[i]);
+    for (size_t i = 0; i < w.size(); ++i) w[i] = vt::F32ToBF16(fw[i]);
+  }
+  const std::vector<uint16_t> zeros(n, 0);
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  vt::Queue q = b.CreateQueue();
+  {
+    Buf dx(b, q, x.data(), n * 2), dw(b, q, w.data(), w.size() * 2);
+    Buf dres_store(b, q, junk.data(), n * 2), dres_add(b, q, zeros.data(), n * 2);
+    Buf dout_store(b, q, nullptr, n * 2), dout_add(b, q, nullptr, n * 2);
+    vllm::flint::FlintDevice()->rms_norm_store_residual(q, dout_store.p, dx.p, dres_store.p, dw.p,
+                                                        R, H, eps);
+    vllm::flint::FlintDevice()->add_rms_norm(q, dout_add.p, dx.p, dres_add.p, dw.p, R, H, eps);
+    std::vector<uint16_t> out_store(n), out_add(n), res_store(n);
+    b.Copy(q, out_store.data(), dout_store.p, n * 2);
+    b.Copy(q, out_add.data(), dout_add.p, n * 2);
+    b.Copy(q, res_store.data(), dres_store.p, n * 2);
+    b.Synchronize(q);
+    CHECK(res_store == x);
+    CHECK(out_store == out_add);
+  }
+  b.DestroyQueue(q);
+}
+
 TEST_CASE("flint routed_silu_and_mul rounds the SiLU to bf16 before the product") {
   if (!HasFlintKernels()) {
     MESSAGE("no CUDA backend or no kFlint kernels; skipping");
@@ -375,5 +414,107 @@ TEST_CASE("flint routed_silu_and_mul rounds the SiLU to bf16 before the product"
     CHECK(distinct > 0);
     CHECK(distinct_matched * 100 >= distinct * 99);
   }
+  b.DestroyQueue(q);
+}
+
+TEST_CASE("flint decode_prologue copies the step block and gathers the embedding rows") {
+  if (!HasFlintKernels()) {
+    MESSAGE("no CUDA backend or no kFlint kernels; skipping");
+    return;
+  }
+  using vllm::flint::FlintStepHeader;
+  using vllm::flint::FlintStepLayout;
+  // Five padded rows, the first three real decode rows whose ids come from the
+  // runner's device buffer; row 3 carries an out-of-range id on the second pass.
+  const int64_t rows = 5, cols = 7, hidden = 64, vocab = 50, real = 3;
+  std::vector<uint16_t> embed(static_cast<size_t>(vocab * hidden));
+  {
+    const auto f = Rand(embed.size(), 51, -2.f, 2.f);
+    for (size_t i = 0; i < f.size(); ++i) embed[i] = vt::F32ToBF16(f[i]);
+  }
+  const std::vector<int32_t> host_ids = {11, 12, 13, 7, 0};
+  const std::vector<int32_t> dev_ids = {41, 3, 29};
+  std::vector<int32_t> pos(rows), seq(rows), qsl(rows + 1), bt(static_cast<size_t>(rows * cols));
+  std::vector<int64_t> slots(rows);
+  for (int64_t r = 0; r < rows; ++r) {
+    pos[r] = static_cast<int32_t>(100 + r);
+    seq[r] = static_cast<int32_t>(101 + r);
+    slots[r] = r < real ? 1000 + r : -1;
+  }
+  std::iota(qsl.begin(), qsl.end(), 0);
+  std::iota(bt.begin(), bt.end(), 500);
+
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  vt::Queue q = b.CreateQueue();
+  const FlintStepLayout l = vllm::flint::MakeFlintStepLayout(rows, cols);
+  void* block = b.AllocPinned(l.bytes);
+  void* block_dev = vllm::flint::FlintDevice()->device_alias(block);
+  REQUIRE(block_dev != nullptr);
+  {
+    auto* base = static_cast<char*>(block);
+    std::memset(base, 0, l.bytes);
+    std::memcpy(base + l.token_ids, host_ids.data(), rows * 4);
+    std::memcpy(base + l.positions, pos.data(), rows * 4);
+    std::memcpy(base + l.seq_lens, seq.data(), rows * 4);
+    std::memcpy(base + l.query_start_loc, qsl.data(), (rows + 1) * 4);
+    std::memcpy(base + l.slots, slots.data(), rows * 8);
+    std::memcpy(base + l.block_table, bt.data(), bt.size() * 4);
+    Buf dembed(b, q, embed.data(), embed.size() * 2), dids(b, q, dev_ids.data(), dev_ids.size() * 4);
+    Buf dpos(b, q, nullptr, rows * 4), dseq(b, q, nullptr, rows * 4);
+    Buf dqsl(b, q, nullptr, (rows + 1) * 4), dslots(b, q, nullptr, rows * 8);
+    Buf dbt(b, q, nullptr, bt.size() * 4), dhid(b, q, nullptr, static_cast<size_t>(rows * hidden) * 2);
+    auto* hdr = static_cast<FlintStepHeader*>(block);
+    const auto run = [&] {
+      vllm::flint::FlintDevice()->decode_prologue(
+          q, block_dev, static_cast<int32_t*>(dpos.p), static_cast<int64_t*>(dslots.p),
+          static_cast<int32_t*>(dbt.p), static_cast<int32_t*>(dseq.p),
+          static_cast<int32_t*>(dqsl.p), dhid.p, dembed.p, rows, cols, hidden, vocab);
+      b.Synchronize(q);
+    };
+    const auto hidden_rows = [&] {
+      std::vector<uint16_t> h(static_cast<size_t>(rows * hidden));
+      b.Copy(q, h.data(), dhid.p, h.size() * 2);
+      b.Synchronize(q);
+      return h;
+    };
+    const auto expect_row = [&](const std::vector<uint16_t>& h, int64_t r, int32_t id) {
+      CHECK(std::memcmp(h.data() + r * hidden, embed.data() + static_cast<int64_t>(id) * hidden,
+                        static_cast<size_t>(hidden) * 2) == 0);
+    };
+
+    hdr->bad_row = -1;
+    hdr->override_ids = static_cast<const int32_t*>(dids.p);
+    hdr->override_count = static_cast<int32_t>(real);
+    run();
+    CHECK(hdr->bad_row == -1);
+    std::vector<int32_t> gpos(rows), gseq(rows), gqsl(rows + 1), gbt(bt.size());
+    std::vector<int64_t> gslots(rows);
+    b.Copy(q, gpos.data(), dpos.p, rows * 4);
+    b.Copy(q, gseq.data(), dseq.p, rows * 4);
+    b.Copy(q, gqsl.data(), dqsl.p, (rows + 1) * 4);
+    b.Copy(q, gslots.data(), dslots.p, rows * 8);
+    b.Copy(q, gbt.data(), dbt.p, bt.size() * 4);
+    b.Synchronize(q);
+    CHECK(gpos == pos);
+    CHECK(gseq == seq);
+    CHECK(gqsl == qsl);
+    CHECK(gslots == slots);
+    CHECK(gbt == bt);
+    const auto h = hidden_rows();
+    for (int64_t r = 0; r < rows; ++r) expect_row(h, r, r < real ? dev_ids[r] : host_ids[r]);
+
+    // Without the device ids every row takes the block's own; an id outside the
+    // vocabulary is clamped for the gather and reported in the header.
+    hdr->override_ids = nullptr;
+    hdr->override_count = 0;
+    const int32_t bad = 77;
+    std::memcpy(base + l.token_ids + 3 * 4, &bad, 4);
+    run();
+    CHECK(hdr->bad_row == 3);
+    CHECK(hdr->bad_id == bad);
+    const auto h2 = hidden_rows();
+    for (int64_t r = 0; r < rows; ++r) expect_row(h2, r, r == 3 ? vocab - 1 : host_ids[r]);
+  }
+  b.FreePinned(block);
   b.DestroyQueue(q);
 }
