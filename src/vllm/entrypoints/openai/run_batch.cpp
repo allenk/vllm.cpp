@@ -85,7 +85,8 @@ RunBatch::RunBatch(OpenAIServingChat* chat, OpenAIServingModels* models)
     : chat_(chat), models_(models) {}
 
 BatchRequestOutput RunBatch::DispatchChat(const std::string& custom_id,
-                                          const nlohmann::json& body) {
+                                          const nlohmann::json& body,
+                                          const nlohmann::ordered_json* ordered_body) {
   // Mirrors run_request(openai_serving_chat.create_chat_completion, ...):
   // check_type_for_url validates the body as a ChatCompletionRequest
   // (run_batch.py:175-176); a validation failure surfaces through
@@ -103,6 +104,9 @@ BatchRequestOutput RunBatch::DispatchChat(const std::string& custom_id,
     return MakeErrorResponseRow(custom_id,
                                 std::string("Invalid request body: ") + e.what(),
                                 "BadRequestError", 400);
+  }
+  if (request.tools.has_value() && ordered_body != nullptr) {
+    KeepToolParameterOrder(*ordered_body, *request.tools);
   }
 
   // check_model (chat_completion/serving.py; api_server.cpp:186-190).
@@ -180,7 +184,15 @@ BatchRequestOutput RunBatch::RunLine(const std::string& request_json) {
            s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
   };
   if (url == "/v1/chat/completions") {
-    return DispatchChat(custom_id, body);
+    const nlohmann::ordered_json ordered_line = nlohmann::ordered_json::parse(
+        request_json, nullptr, /*allow_exceptions=*/false);
+    const nlohmann::ordered_json* ordered_body = nullptr;
+    if (ordered_line.is_object()) {
+      if (auto it = ordered_line.find("body"); it != ordered_line.end()) {
+        ordered_body = &*it;
+      }
+    }
+    return DispatchChat(custom_id, body, ordered_body);
   }
   // Registered endpoint keys (run_batch.py:732-777) whose serving handler is not
   // wired here yet -> the "does not support endpoint" error (handler_getter ->

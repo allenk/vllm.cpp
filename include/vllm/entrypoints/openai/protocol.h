@@ -121,11 +121,19 @@ struct ResponseFormat {
 // Ported from: vllm/entrypoints/openai/engine/protocol.py:246
 // (FunctionDefinition). `parameters` is the JSON-Schema object for the
 // function's arguments (upstream dict[str,Any]|None). `strict` / `defer_loading`
-// are parsed-and-ignored at T0 (deferred).
+// reach the chat template only (model_dump keeps them when set); nothing else
+// reads them yet.
 struct FunctionDefinition {
   std::string name;
   std::optional<std::string> description;
   std::optional<nlohmann::json> parameters;
+  // `parameters` again, in the key order the request wrote it. nlohmann::json
+  // sorts object keys while upstream's dict keeps the client's order, and that
+  // order reaches the prompt wherever a template serializes the schema.
+  // Filled by KeepToolParameterOrder; empty when only parsed json was at hand.
+  std::optional<nlohmann::ordered_json> parameters_in_order;
+  std::optional<bool> strict;
+  std::optional<bool> defer_loading;
 };
 
 // Ported from: vllm/entrypoints/openai/chat_completion/protocol.py:165
@@ -583,6 +591,12 @@ void from_json(const nlohmann::json& j, CompletionRequest& r);
 void from_json(const nlohmann::json& j, ChatMessage& m);
 void from_json(const nlohmann::json& j, ChatCompletionToolsParam& t);
 void from_json(const nlohmann::json& j, ChatCompletionRequest& r);
+
+// Fills each tool's FunctionDefinition::parameters_in_order from `body`, the
+// same request parsed as ordered_json (tools matched by position, as from_json
+// read them). A non-object body or a missing `tools` array leaves them empty.
+void KeepToolParameterOrder(const nlohmann::ordered_json& body,
+                            std::vector<ChatCompletionToolsParam>& tools);
 
 void to_json(nlohmann::json& j, const UsageInfo& u);
 void to_json(nlohmann::json& j, const ErrorInfo& e);

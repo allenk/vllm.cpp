@@ -332,6 +332,12 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
     return MakeError(400, "BadRequestError",
                      std::string("Invalid request: ") + e.what());
   }
+  if (request.tools.has_value()) {
+    KeepToolParameterOrder(
+        nlohmann::ordered_json::parse(request_body, nullptr,
+                                      /*allow_exceptions=*/false),
+        *request.tools);
+  }
   // SERVE-REQUEST-LENGTH-GUARD (#1541). The measured quantity is the SUM of the
   // message texts, because that is what the chat template concatenates into the
   // one prompt the tokenizer then sees. `content` carries the joined text spans
@@ -1489,6 +1495,10 @@ ApiServer::DispatchResult ApiServer::handle_tokenize(
       if (auto it = body.find("tools");
           it != body.end() && it->is_array()) {
         tools = it->get<std::vector<ChatCompletionToolsParam>>();
+        KeepToolParameterOrder(
+            nlohmann::ordered_json::parse(request_body, nullptr,
+                                          /*allow_exceptions=*/false),
+            tools);
       }
     } catch (const std::exception& e) {
       return MakeError(400, "BadRequestError",

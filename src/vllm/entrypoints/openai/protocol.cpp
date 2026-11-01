@@ -512,6 +512,24 @@ void from_json(const nlohmann::json& j, ChatCompletionToolsParam& t) {
     if (auto p = fn.find("parameters"); p != fn.end() && !p->is_null()) {
       t.function.parameters = *p;
     }
+    GetOpt(fn, "strict", t.function.strict);
+    GetOpt(fn, "defer_loading", t.function.defer_loading);
+  }
+}
+
+void KeepToolParameterOrder(const nlohmann::ordered_json& body,
+                            std::vector<ChatCompletionToolsParam>& tools) {
+  if (!body.is_object()) return;
+  const auto wire = body.find("tools");
+  if (wire == body.end() || !wire->is_array()) return;
+  for (size_t i = 0; i < tools.size() && i < wire->size(); ++i) {
+    const nlohmann::ordered_json& tool = (*wire)[i];
+    if (!tool.is_object()) continue;
+    const auto fn = tool.find("function");
+    if (fn == tool.end() || !fn->is_object()) continue;
+    const auto p = fn->find("parameters");
+    if (p == fn->end() || p->is_null()) continue;
+    tools[i].function.parameters_in_order = *p;
   }
 }
 

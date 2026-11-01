@@ -99,8 +99,11 @@ class RunBatch {
   BatchRequestOutput RunLine(const std::string& request_json);
 
  private:
+  // `ordered_body` is the same body parsed as ordered_json, for the tools'
+  // key order (KeepToolParameterOrder); null when it is not at hand.
   BatchRequestOutput DispatchChat(const std::string& custom_id,
-                                  const nlohmann::json& body);
+                                  const nlohmann::json& body,
+                                  const nlohmann::ordered_json* ordered_body = nullptr);
 
   OpenAIServingChat* chat_;
   OpenAIServingModels* models_;

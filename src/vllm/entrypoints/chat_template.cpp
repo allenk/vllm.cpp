@@ -91,7 +91,14 @@ nlohmann::ordered_json BuildMessages(
     // matches transformers' dict shape exactly).
     if (m.tool_call_id.has_value()) o["tool_call_id"] = *m.tool_call_id;
     if (m.name.has_value()) o["name"] = *m.name;
-    if (m.reasoning.has_value()) o["reasoning"] = *m.reasoning;
+    if (m.reasoning.has_value()) {
+      o["reasoning"] = *m.reasoning;
+      // An assistant turn also carries it as `reasoning_content`, the name
+      // templates read (Flint, GLM): pinned vLLM sets both "for interleaved
+      // thinking" and "to keep compatibility" (renderers/chat_utils/
+      // chat_message.py:631-635).
+      if (m.role == "assistant") o["reasoning_content"] = *m.reasoning;
+    }
     if (m.tool_calls.has_value()) {
       nlohmann::ordered_json calls = nlohmann::ordered_json::array();
       for (size_t i = 0; i < m.tool_calls->size(); ++i) {
@@ -123,8 +130,14 @@ nlohmann::ordered_json BuildMessages(
 
 // Rebuild the OpenAI tool JSON objects the request carried, exposed to the
 // template as `tools` exactly as transformers' apply_chat_template(tools=...)
-// sees them:
-//   {"type": <t>, "function": {"name": .., "description"?: .., "parameters"?: ..}}
+// sees them from upstream, which passes [tool.model_dump() for tool in
+// request.tools] (renderers/online_renderer.py):
+//   {"type": <t>, "function": {"name": .., "description": .. | null,
+//                              "parameters": .. | null, "strict"?: ..,
+//                              "defer_loading"?: ..}}
+// description and parameters are dumped even when unset; strict and
+// defer_loading only when set (FunctionDefinition._serialize). A template that
+// serializes the function object (Flint: `fn | tojson`) shows the difference.
 nlohmann::ordered_json BuildTools(
     const std::vector<openai::ChatCompletionToolsParam>& tools) {
   nlohmann::ordered_json arr = nlohmann::ordered_json::array();
@@ -133,13 +146,23 @@ nlohmann::ordered_json BuildTools(
     fn["name"] = t.function.name;
     if (t.function.description.has_value()) {
       fn["description"] = *t.function.description;
+    } else {
+      fn["description"] = nullptr;
     }
-    if (t.function.parameters.has_value()) {
-      // parameters is a plain nlohmann::json (unordered). Round-trip through a
-      // string to land it in ordered_json without an implicit cross-container
-      // conversion.
+    if (t.function.parameters_in_order.has_value()) {
+      fn["parameters"] = *t.function.parameters_in_order;
+    } else if (t.function.parameters.has_value()) {
+      // Only the parsed json is at hand, so its keys come out sorted. Round-trip
+      // through a string to land it in ordered_json without an implicit
+      // cross-container conversion.
       fn["parameters"] =
           nlohmann::ordered_json::parse(t.function.parameters->dump());
+    } else {
+      fn["parameters"] = nullptr;
+    }
+    if (t.function.strict.has_value()) fn["strict"] = *t.function.strict;
+    if (t.function.defer_loading.has_value()) {
+      fn["defer_loading"] = *t.function.defer_loading;
     }
     nlohmann::ordered_json tool = nlohmann::ordered_json::object();
     tool["type"] = t.type;

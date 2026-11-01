@@ -428,7 +428,14 @@ vllm::entrypoints::openai::ChatCompletionRequest ParseChatRequest(
                                 e.what());
   }
   try {
-    return j.get<vllm::entrypoints::openai::ChatCompletionRequest>();
+    auto request = j.get<vllm::entrypoints::openai::ChatCompletionRequest>();
+    if (request.tools.has_value()) {
+      vllm::entrypoints::openai::KeepToolParameterOrder(
+          nlohmann::ordered_json::parse(request_json, nullptr,
+                                        /*allow_exceptions=*/false),
+          *request.tools);
+    }
+    return request;
   } catch (const std::exception& e) {
     throw std::invalid_argument(std::string("invalid chat request: ") +
                                 e.what());

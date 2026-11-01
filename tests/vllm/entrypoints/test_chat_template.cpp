@@ -1147,3 +1147,58 @@ TEST_CASE("chat_template: tojson takes ensure_ascii, off by default as in transf
         "{\"k\": \"\xc3\xa9\xe6\x9d\xb1\"}|{\"k\": \"\xc3\xa9\xe6\x9d\xb1\"}|"
         "{\"k\": \"\\u00e9\\ud83d\\ude00\"}");
 }
+
+namespace {
+// The server's two parses of one body: from_json (sorted keys) for every
+// field, and ordered_json for the order of the tools' schemas.
+vllm::entrypoints::openai::ChatCompletionRequest ParseLikeTheServer(
+    const std::string& wire) {
+  vllm::entrypoints::openai::ChatCompletionRequest request;
+  from_json(nlohmann::json::parse(wire), request);
+  if (request.tools.has_value()) {
+    vllm::entrypoints::openai::KeepToolParameterOrder(
+        nlohmann::ordered_json::parse(wire), *request.tools);
+  }
+  return request;
+}
+}  // namespace
+
+TEST_CASE("chat_template: tools reach the template as upstream's model_dump") {
+  const auto request = ParseLikeTheServer(
+      R"({"messages": [], "tools": [)"
+      R"({"type": "function", "function": {"name": "a", "strict": true,)"
+      R"( "parameters": {"type": "object", "properties": {"z": {}, "b": {}}}}},)"
+      R"({"type": "function", "function": {"name": "b"}}]})");
+  const std::string out = apply_chat_template(
+      "{% for t in tools %}{{ t.function | tojson }}\n{% endfor %}", {}, false, "", "",
+      *request.tools);
+  // description and parameters are always dumped; strict only when set; the
+  // schema keeps the request's key order (type before properties, z before b).
+  CHECK(out ==
+        "{\"name\": \"a\", \"description\": null, \"parameters\": {\"type\": \"object\", "
+        "\"properties\": {\"z\": {}, \"b\": {}}}, \"strict\": true}\n"
+        "{\"name\": \"b\", \"description\": null, \"parameters\": null}\n");
+}
+
+// Flint's chat template, byte-exact from the published checkpoint
+// (tests/fixtures/flint_chat_template.jinja), against the prompts transformers
+// renders for the same requests after the conversions pinned vLLM applies
+// first (tests/fixtures/flint_chat_template_goldens.json records the generator
+// and both conversions). The requests are parsed as the server parses them.
+TEST_CASE("chat_template: Flint renders the prompts transformers renders") {
+  const std::string tmpl = ReadFixture("flint_chat_template.jinja");
+  const nlohmann::ordered_json goldens =
+      nlohmann::ordered_json::parse(ReadFixture("flint_chat_template_goldens.json"));
+  REQUIRE(goldens.at("cases").size() >= 10);
+  for (const nlohmann::ordered_json& c : goldens.at("cases")) {
+    const std::string name = c.at("name").get<std::string>();
+    nlohmann::ordered_json body = {{"messages", c.at("messages")}};
+    if (c.contains("tools")) body["tools"] = c.at("tools");
+    const auto request = ParseLikeTheServer(body.dump());
+    std::string out;
+    REQUIRE_NOTHROW(out = apply_chat_template(
+                        tmpl, request.messages, c.at("add_generation_prompt").get<bool>(),
+                        "", "", request.tools.value_or(std::vector<ChatCompletionToolsParam>{})));
+    CHECK_MESSAGE(out == c.at("expected").get<std::string>(), name);
+  }
+}

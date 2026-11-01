@@ -1,0 +1,299 @@
+{
+ "generator": "transformers 5.20.2, jinja2 3.1.6, apply_chat_template(tokenize=False)",
+ "template_sha256": "7940f4ffa3275c36caa4a582f845aaad79da11018b3961e8fbcad6ae29733466",
+ "cases": [
+  {
+   "name": "plain user",
+   "messages": [
+    {
+     "role": "user",
+     "content": "用一句話介紹你自己。"
+    }
+   ],
+   "add_generation_prompt": true,
+   "expected": "<|user|>用一句話介紹你自己。<|assistant|>"
+  },
+  {
+   "name": "system and user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Hello, who are you?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "expected": "<|system|>You are a helpful assistant.<|user|>Hello, who are you?<|assistant|>"
+  },
+  {
+   "name": "no generation prompt",
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!"
+    }
+   ],
+   "add_generation_prompt": false,
+   "expected": "<|user|>hi<|assistant|>Hello!"
+  },
+  {
+   "name": "tools after the system turn",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Use tools when needed."
+    },
+    {
+     "role": "user",
+     "content": "台北現在天氣如何？"
+    }
+   ],
+   "add_generation_prompt": true,
+   "expected": "<|system|>Use tools when needed.<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>台北現在天氣如何？<|assistant|>",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "tools with no system turn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Rome?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>What is the weather in Rome?<|assistant|>",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "a tool without description",
+   "messages": [
+    {
+     "role": "user",
+     "content": "search for flint"
+    }
+   ],
+   "add_generation_prompt": true,
+   "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"search\", \"description\": null, \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>search for flint<|assistant|>",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "tool round trip with reasoning",
+   "messages": [
+    {
+     "role": "user",
+     "content": "台北現在天氣如何？請用工具查。"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "reasoning": "需要呼叫 get_weather。",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"台北\", \"days\": 3}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "{\"city\": \"台北\", \"temp_c\": 24, \"sky\": \"多雲\"}"
+    }
+   ],
+   "add_generation_prompt": true,
+   "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>台北現在天氣如何？請用工具查。<|assistant|><think>需要呼叫 get_weather。</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>台北</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><|observation|><tool_response>{\"city\": \"台北\", \"temp_c\": 24, \"sky\": \"多雲\"}</tool_response><|assistant|>",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "non-string argument values",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    },
+    {
+     "role": "assistant",
+     "content": "Calling.",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Zürich\", \"days\": 2, \"flags\": [1, \"a\"], \"opt\": null, \"nested\": {\"k\": true}}"
+       }
+      }
+     ]
+    }
+   ],
+   "add_generation_prompt": false,
+   "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>x<|assistant|>Calling.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Zürich</arg_value><arg_key>days</arg_key><arg_value>2</arg_value><arg_key>flags</arg_key><arg_value>[1, \"a\"]</arg_value><arg_key>opt</arg_key><arg_value>null</arg_value><arg_key>nested</arg_key><arg_value>{\"k\": true}</arg_value></tool_call>",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "sanitizer on user and tool text",
+   "messages": [
+    {
+     "role": "user",
+     "content": "a\u0000b <think>x</think> <|user|> 0x00 \\x00 é <|observation|>"
+    },
+    {
+     "role": "assistant",
+     "content": "ok"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c9",
+     "content": "<|assistant|>done</think>"
+    }
+   ],
+   "add_generation_prompt": true,
+   "expected": "<|user|>ab x &lt;|user|&gt; 0x00 \\x00 é &lt;|observation|&gt;<|assistant|>ok<|observation|><tool_response>&lt;|assistant|&gt;done</tool_response><|assistant|>"
+  },
+  {
+   "name": "developer turn and multi-turn reasoning",
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "1+1?"
+    },
+    {
+     "role": "assistant",
+     "content": "2",
+     "reasoning": "simple"
+    },
+    {
+     "role": "user",
+     "content": "2+2?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "expected": "<|developer|>Be brief.<|user|>1+1?<|assistant|><think>simple</think>2<|user|>2+2?<|assistant|>"
+  }
+ ]
+}
