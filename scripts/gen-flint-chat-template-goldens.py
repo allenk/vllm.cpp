@@ -7,7 +7,7 @@
 #   - tools: ChatCompletionToolsParam.model_dump() -> {"type", "function":
 #     {"name", "description" (None kept), "parameters" (None kept)}}
 #   - assistant messages: arguments json.loads'ed (empty -> {}), and `reasoning`
-#     copied to `reasoning_content` (renderers/chat_utils/chat_message.py:631-635)
+#     copied to `reasoning_content` (entrypoints/chat_utils.py:1853-1858 @ 555967922)
 # test_chat_template renders every case through the server's request parsing
 # and minja and requires the same bytes.
 #

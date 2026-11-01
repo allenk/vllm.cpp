@@ -95,8 +95,8 @@ nlohmann::ordered_json BuildMessages(
       o["reasoning"] = *m.reasoning;
       // An assistant turn also carries it as `reasoning_content`, the name
       // templates read (Flint, GLM): pinned vLLM sets both "for interleaved
-      // thinking" and "to keep compatibility" (renderers/chat_utils/
-      // chat_message.py:631-635).
+      // thinking" and "to keep compatibility" (entrypoints/chat_utils.py:1853-1858
+      // @ 555967922).
       if (m.role == "assistant") o["reasoning_content"] = *m.reasoning;
     }
     if (m.tool_calls.has_value()) {
@@ -131,7 +131,7 @@ nlohmann::ordered_json BuildMessages(
 // Rebuild the OpenAI tool JSON objects the request carried, exposed to the
 // template as `tools` exactly as transformers' apply_chat_template(tools=...)
 // sees them from upstream, which passes [tool.model_dump() for tool in
-// request.tools] (renderers/online_renderer.py):
+// request.tools] (renderers/online_renderer.py:152 @ 555967922):
 //   {"type": <t>, "function": {"name": .., "description": .. | null,
 //                              "parameters": .. | null, "strict"?: ..,
 //                              "defer_loading"?: ..}}
