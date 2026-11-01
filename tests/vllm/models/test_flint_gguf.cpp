@@ -29,6 +29,7 @@
 #include <nlohmann/json.hpp>
 #include <doctest/doctest.h>
 
+#include "vllm/model_executor/model_loader/gguf_generation_config.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/model_executor/models/flint.h"
@@ -108,6 +109,21 @@ TEST_CASE("flint gguf: the config builder maps the file's own metadata") {
     CHECK(p.IsSlidingLayer(l) == !full);
     CHECK(p.LayerHasRope(l) == p.IsSlidingLayer(l));
   }
+
+  // The stop ids and sampling defaults ride in the same header and are
+  // applied after every GGUF builder, not by it (gguf_generation_config.h).
+  // The checkpoint's generation_config.json: eos_token_id
+  // [150001, 150003, 150005, 150018], temperature 1.0, top_p 0.95, top_k 20.
+  CHECK(config.generation_config_eos_ids.empty());
+  HfConfig with_gen = config;
+  vllm::ApplyGgufGenerationConfig(gguf, with_gen);
+  CHECK(with_gen.generation_config_eos_ids ==
+        std::vector<int32_t>{150001, 150003, 150005, 150018});
+  CHECK(with_gen.generation_config_sampling.temperature == 1.0);
+  CHECK(with_gen.generation_config_sampling.top_p == 0.95);
+  CHECK(with_gen.generation_config_sampling.top_k == 20);
+  CHECK_FALSE(with_gen.generation_config_sampling.repetition_penalty.has_value());
+  CHECK_FALSE(with_gen.generation_config_sampling.max_new_tokens.has_value());
 }
 
 // The `flint` pre-tokenizer mapping: our Encode must reproduce the ORACLE'S

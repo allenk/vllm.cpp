@@ -30,6 +30,7 @@
 #include "vllm/model_executor/weight_offloader.h"
 #include "vllm/model_executor/expert_stream_seam.h"  // MODEL-TEXT-GLM-MOE-DSA W3 (#2214): the load-time slot-capacity refusal
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
+#include "vllm/model_executor/model_loader/gguf_generation_config.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/clip_mmproj_gguf.h"  // LOAD-GGUF-MMPROJ, #821
@@ -1313,7 +1314,14 @@ HfConfig HfConfigFromGgufDispatch(const vllm::GgufFile& gguf) {
   }
   const std::string arch = std::get<std::string>(arch_kv->v);
   for (const GgufArchArm& arm : kGgufArchArms) {
-    if (arch == arm.arch) return arm.build(gguf);
+    if (arch == arm.arch) {
+      // Every arm, after its builder: the stop ids and sampling defaults a
+      // safetensors load takes from the sibling generation_config.json come
+      // out of the file's own metadata (see gguf_generation_config.h).
+      HfConfig config = arm.build(gguf);
+      vllm::ApplyGgufGenerationConfig(gguf, config);
+      return config;
+    }
   }
   // KNOWN architectures whose GGUF arm is OWED, not absent. Each refuses with
   // the message its OWN model writes, so the reader lands in the translation

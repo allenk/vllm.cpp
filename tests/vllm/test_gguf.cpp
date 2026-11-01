@@ -19,7 +19,9 @@
 #endif
 
 #include "gguf_builder.h"
+#include "vllm/model_executor/model_loader/gguf_generation_config.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/transformers_utils/hf_config.h"
 
 namespace {
 
@@ -682,3 +684,85 @@ TEST_CASE("gguf: SourceOfSpan names the OWNING shard's fd and that shard's own o
   CHECK(none.fd == -1);
 }
 #endif  // !_WIN32
+
+// ApplyGgufGenerationConfig: a GGUF's own stop ids and sampling defaults fill
+// the two HfConfig fields a safetensors load takes from generation_config.json.
+namespace {
+vllm::HfConfig ApplyTo(const std::string& gguf_bytes, vllm::HfConfig config = {}) {
+  TempFile tf(gguf_bytes);
+  vllm::GgufFile g = vllm::GgufFile::Open(tf.path());
+  vllm::ApplyGgufGenerationConfig(g, config);
+  return config;
+}
+}  // namespace
+
+TEST_CASE("gguf generation config: eog ids and sampling keys fill an empty config") {
+  gguf_test::GgufModelBuilder b;
+  // Flint's published values, written out of order and with a duplicate:
+  // the list is a set, sorted like the sibling generation_config.json read.
+  b.AddKv(gguf_test::I32ArrayKv("tokenizer.ggml.eog_token_ids",
+                                {150018, 150001, 150005, 150003, 150001}));
+  b.AddKv(gguf_test::F32Kv("general.sampling.temp", 1.0f));
+  b.AddKv(gguf_test::F32Kv("general.sampling.top_p", 0.95f));
+  b.AddKv(gguf_test::U32Kv("general.sampling.top_k", 20));
+  b.AddKv(gguf_test::F32Kv("general.sampling.min_p", 0.05f));
+  // A different knob from repetition_penalty (a window, not the whole
+  // sequence), so it must NOT be mapped onto it.
+  b.AddKv(gguf_test::F32Kv("general.sampling.penalty_repeat", 1.1f));
+  const vllm::HfConfig c = ApplyTo(b.Build());
+  CHECK(c.generation_config_eos_ids ==
+        std::vector<int32_t>{150001, 150003, 150005, 150018});
+  const vllm::GenerationConfigSampling& s = c.generation_config_sampling;
+  CHECK(s.temperature == 1.0);
+  // The f32 0.95f is 0.949999988; the double handed on is the decimal the
+  // checkpoint wrote, the same value a JSON 0.95 parses to.
+  CHECK(s.top_p == 0.95);
+  CHECK(s.min_p == 0.05);
+  CHECK(s.top_k == 20);
+  CHECK_FALSE(s.repetition_penalty.has_value());
+  CHECK_FALSE(s.max_new_tokens.has_value());
+}
+
+TEST_CASE("gguf generation config: what the architecture's builder set is kept") {
+  gguf_test::GgufModelBuilder b;
+  b.AddKv(gguf_test::I32ArrayKv("tokenizer.ggml.eog_token_ids", {150001, 150003}));
+  b.AddKv(gguf_test::F32Kv("general.sampling.temp", 1.0f));
+  b.AddKv(gguf_test::F32Kv("general.sampling.top_p", 0.95f));
+  vllm::HfConfig built;
+  built.generation_config_eos_ids = {7};
+  built.generation_config_sampling.temperature = 0.6;
+  const vllm::HfConfig c = ApplyTo(b.Build(), built);
+  CHECK(c.generation_config_eos_ids == std::vector<int32_t>{7});
+  CHECK(c.generation_config_sampling.temperature == 0.6);
+  CHECK(c.generation_config_sampling.top_p == 0.95);
+}
+
+TEST_CASE("gguf generation config: absent or wrong-typed keys leave fields unset") {
+  SUBCASE("no keys at all") {
+    gguf_test::GgufModelBuilder b;
+    b.AddKv(gguf_test::StrKv("general.architecture", "qwen35"));
+    const vllm::HfConfig c = ApplyTo(b.Build());
+    CHECK(c.generation_config_eos_ids.empty());
+    CHECK_FALSE(c.generation_config_sampling.temperature.has_value());
+    CHECK_FALSE(c.generation_config_sampling.top_p.has_value());
+    CHECK_FALSE(c.generation_config_sampling.top_k.has_value());
+    CHECK_FALSE(c.generation_config_sampling.min_p.has_value());
+  }
+  SUBCASE("wrong types are skipped, never thrown") {
+    gguf_test::GgufModelBuilder b;
+    // Not an array; a string temperature; a float top_k.
+    b.AddKv(gguf_test::U32Kv("tokenizer.ggml.eog_token_ids", 150001));
+    b.AddKv(gguf_test::StrKv("general.sampling.temp", "1.0"));
+    b.AddKv(gguf_test::F32Kv("general.sampling.top_k", 20.0f));
+    const vllm::HfConfig c = ApplyTo(b.Build());
+    CHECK(c.generation_config_eos_ids.empty());
+    CHECK_FALSE(c.generation_config_sampling.temperature.has_value());
+    CHECK_FALSE(c.generation_config_sampling.top_k.has_value());
+  }
+  SUBCASE("a negative id is dropped and the rest are kept") {
+    gguf_test::GgufModelBuilder b;
+    b.AddKv(gguf_test::I32ArrayKv("tokenizer.ggml.eog_token_ids", {-1, 150001}));
+    const vllm::HfConfig c = ApplyTo(b.Build());
+    CHECK(c.generation_config_eos_ids == std::vector<int32_t>{150001});
+  }
+}

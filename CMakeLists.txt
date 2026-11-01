@@ -804,6 +804,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/model_loader/read_only_file_mapping.cpp
   src/vllm/model_executor/model_loader/safetensors_reader.cpp
   src/vllm/model_executor/model_loader/gguf_reader.cpp
+  src/vllm/model_executor/model_loader/gguf_generation_config.cpp
   src/vllm/model_executor/model_loader/gguf_dequant.cpp
   src/vllm/model_executor/model_loader/gguf_keep_quant.cpp
   src/vllm/model_executor/model_loader/gguf_device_fit.cpp
