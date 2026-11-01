@@ -1097,3 +1097,53 @@ TEST_CASE("chat_template: one prompt fn renders correctly from many threads at "
     CHECK(errors[t] == 0);
   }
 }
+
+// ─── Jinja2 behaviour the Flint template needs ───────────────────────────────
+// A `-` on a tag strips the whitespace run that touches it and nothing else:
+// Jinja2 does text.rstrip() / text.lstrip(). Blank lines and indentation
+// further inside the text stay.
+TEST_CASE("chat_template: '-' whitespace control strips only the run at the tag") {
+  CHECK(apply_chat_template("A\n\nB\n\n{%- if true %}x{% endif %}", {}, false) ==
+        "A\n\nBx");
+  CHECK(apply_chat_template("{% if true -%}\n\n  a\n\n  b{% endif %}", {}, false) ==
+        "a\n\n  b");
+  CHECK(apply_chat_template("{{- 'p' -}}\n  q\n  r\n{{- 's' }}", {}, false) == "pq\n  rs");
+}
+
+TEST_CASE("chat_template: the replace filter is Python's str.replace") {
+  CHECK(apply_chat_template("{{ 'a-b-c' | replace('-', '+') }}", {}, false) == "a+b+c");
+  CHECK(apply_chat_template("{{ 'a-b-c' | replace('-', '+', 1) }}", {}, false) == "a+b-c");
+  // str(s) first, as do_replace does.
+  CHECK(apply_chat_template("{{ 12 | replace('1', 'x') }}", {}, false) == "x2");
+  // An empty `old` inserts at every code-point boundary, both ends included.
+  CHECK(apply_chat_template("{{ 'ab' | replace('', '.') }}", {}, false) == ".a.b.");
+  CHECK(apply_chat_template("{{ '\xc3\xa9' | replace('', '.') }}", {}, false) ==
+        ".\xc3\xa9.");
+  // The method form shares the semantics.
+  CHECK(apply_chat_template("{{ 'ab'.replace('', '.') }}", {}, false) == ".a.b.");
+  CHECK(apply_chat_template("{{ 'aaa'.replace('a', 'b', 2) }}", {}, false) == "bba");
+}
+
+TEST_CASE("chat_template: string literals decode Python escapes") {
+  // "\x00" is NUL, not the three characters x00.
+  const std::string nul = apply_chat_template("{{ 'a\\x00b' }}", {}, false);
+  CHECK(nul == std::string("a\0b", 3));
+  CHECK(apply_chat_template("{{ 'x\\x00y0x00' | replace('\\x00', '') }}", {}, false) ==
+        "xy0x00");
+  // \x, \u, \U and octal name code points, written as UTF-8.
+  CHECK(apply_chat_template("{{ '\\xe9|\\u00e9|\\U0001F600|\\101' }}", {}, false) ==
+        "\xc3\xa9|\xc3\xa9|\xf0\x9f\x98\x80|A");
+  CHECK(apply_chat_template("{{ '\\a\\v\\'\\\"' }}", {}, false) == "\a\v'\"");
+  // Any other escape keeps its backslash.
+  CHECK(apply_chat_template("{{ '\\s\\d' }}", {}, false) == "\\s\\d");
+  CHECK_THROWS_AS(apply_chat_template("{{ '\\x0' }}", {}, false), ChatTemplateError);
+}
+
+TEST_CASE("chat_template: tojson takes ensure_ascii, off by default as in transformers") {
+  const std::string tmpl = "{{ {'k': '\xc3\xa9\xe6\x9d\xb1'} | tojson }}|"
+                           "{{ {'k': '\xc3\xa9\xe6\x9d\xb1'} | tojson(ensure_ascii=False) }}|"
+                           "{{ {'k': '\xc3\xa9\xf0\x9f\x98\x80'} | tojson(ensure_ascii=True) }}";
+  CHECK(apply_chat_template(tmpl, {}, false) ==
+        "{\"k\": \"\xc3\xa9\xe6\x9d\xb1\"}|{\"k\": \"\xc3\xa9\xe6\x9d\xb1\"}|"
+        "{\"k\": \"\\u00e9\\ud83d\\ude00\"}");
+}

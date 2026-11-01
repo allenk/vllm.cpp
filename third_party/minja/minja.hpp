@@ -74,9 +74,12 @@ private:
   Value(const std::shared_ptr<CallableType> & callable) : object_(std::make_shared<ObjectType>()), callable_(callable) {}
 
   /* Python-style string repr */
-  static void dump_string(const json & primitive, std::ostringstream & out, char string_quote = '\'') {
+  static void dump_string(const json & primitive, std::ostringstream & out, char string_quote = '\'', bool ensure_ascii = false) {
     if (!primitive.is_string()) throw std::runtime_error("Value is not a string: " + primitive.dump());
-    auto s = primitive.dump();
+    // LOCAL MODIFICATION (vllm.cpp): ensure_ascii, for tojson(ensure_ascii=...).
+    // nlohmann's ensure_ascii escapes exactly as Python's json.dumps does
+    // (lower-case \uXXXX, surrogate pairs above the BMP).
+    auto s = primitive.dump(-1, ' ', ensure_ascii);
     if (string_quote == '"' || s.find('\'') != std::string::npos) {
       out << s;
       return;
@@ -95,7 +98,7 @@ private:
     }
     out << string_quote;
   }
-  void dump(std::ostringstream & out, int indent = -1, int level = 0, bool to_json = false) const {
+  void dump(std::ostringstream & out, int indent = -1, int level = 0, bool to_json = false, bool ensure_ascii = false) const {
     auto print_indent = [&](int level) {
       if (indent > 0) {
           out << "\n";
@@ -116,7 +119,7 @@ private:
       print_indent(level + 1);
       for (size_t i = 0; i < array_->size(); ++i) {
         if (i) print_sub_sep();
-        (*array_)[i].dump(out, indent, level + 1, to_json);
+        (*array_)[i].dump(out, indent, level + 1, to_json, ensure_ascii);
       }
       print_indent(level);
       out << "]";
@@ -126,12 +129,12 @@ private:
       for (auto begin = object_->begin(), it = begin; it != object_->end(); ++it) {
         if (it != begin) print_sub_sep();
         if (it->first.is_string()) {
-          dump_string(it->first, out, string_quote);
+          dump_string(it->first, out, string_quote, ensure_ascii);
         } else {
           out << string_quote << it->first.dump() << string_quote;
         }
         out << ": ";
-        it->second.dump(out, indent, level + 1, to_json);
+        it->second.dump(out, indent, level + 1, to_json, ensure_ascii);
       }
       print_indent(level);
       out << "}";
@@ -142,7 +145,7 @@ private:
     } else if (is_string() && !to_json) {
       dump_string(primitive_, out, string_quote);
     } else {
-      out << primitive_.dump();
+      out << primitive_.dump(-1, ' ', ensure_ascii);
     }
   }
 
@@ -445,9 +448,9 @@ public:
     throw std::runtime_error("get<T> not defined for this value type: " + dump());
   }
 
-  std::string dump(int indent=-1, bool to_json=false) const {
+  std::string dump(int indent=-1, bool to_json=false, bool ensure_ascii=false) const {
     std::ostringstream out;
-    dump(out, indent, 0, to_json);
+    dump(out, indent, 0, to_json, ensure_ascii);
     return out.str();
   }
 
@@ -1566,6 +1569,57 @@ static std::string html_escape(const std::string & s) {
   return result;
 }
 
+// LOCAL MODIFICATION (vllm.cpp), see third_party/README.md.
+// Python's str.replace(old, new, count), which both `s.replace(...)` and
+// Jinja2's `replace` filter are: a negative count replaces every occurrence,
+// and an empty `old` inserts `new` at each code-point boundary, both ends
+// included, up to `count` times.
+static std::string python_replace(const std::string & s, const std::string & old_s,
+                                  const std::string & new_s, int64_t count) {
+  if (count < 0) count = std::numeric_limits<int64_t>::max();
+  std::string out;
+  if (old_s.empty()) {
+    for (size_t i = 0; i <= s.size(); ++i) {
+      const bool boundary = i == s.size() || (static_cast<unsigned char>(s[i]) & 0xC0) != 0x80;
+      if (boundary && count > 0) {
+        out += new_s;
+        --count;
+      }
+      if (i < s.size()) out += s[i];
+    }
+    return out;
+  }
+  size_t pos = 0;
+  while (count > 0) {
+    const size_t hit = s.find(old_s, pos);
+    if (hit == std::string::npos) break;
+    out.append(s, pos, hit - pos);
+    out += new_s;
+    pos = hit + old_s.size();
+    --count;
+  }
+  out.append(s, pos, std::string::npos);
+  return out;
+}
+
+static void append_utf8(std::string & out, uint32_t cp) {
+  if (cp < 0x80) {
+    out += static_cast<char>(cp);
+  } else if (cp < 0x800) {
+    out += static_cast<char>(0xC0 | (cp >> 6));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else if (cp < 0x10000) {
+    out += static_cast<char>(0xE0 | (cp >> 12));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else {
+    out += static_cast<char>(0xF0 | (cp >> 18));
+    out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  }
+}
+
 class MethodCallExpr : public Expression {
     std::shared_ptr<Expression> object;
     std::shared_ptr<VariableExpr> method;
@@ -1685,15 +1739,8 @@ public:
             vargs.expectArgs("replace method", {2, 3}, {0, 0});
             auto before = vargs.args[0].get<std::string>();
             auto after = vargs.args[1].get<std::string>();
-            auto count = vargs.args.size() == 3 ? vargs.args[2].get<int64_t>()
-                                                : str.length();
-            size_t start_pos = 0;
-            while ((start_pos = str.find(before, start_pos)) != std::string::npos &&
-                  count-- > 0) {
-              str.replace(start_pos, before.length(), after);
-              start_pos += after.length();
-            }
-            return str;
+            auto count = vargs.args.size() == 3 ? vargs.args[2].get<int64_t>() : -1;
+            return python_replace(str, before, after, count);
           }
         }
         throw std::runtime_error("Unknown method: " + method->get_name());
@@ -1808,6 +1855,25 @@ private:
     }
 
     std::unique_ptr<std::string> parseString() {
+      // LOCAL MODIFICATION (vllm.cpp): Jinja2's lexer decodes a string literal
+      // with Python's unicode-escape codec (lexer.py: .encode("ascii", "backslashreplace")
+      // .decode("unicode-escape")). \xhh, \uXXXX, \UXXXXXXXX and one to three
+      // octal digits name a code point, written here as UTF-8 ("\x00" is NUL,
+      // not the text "x00"); \a \b \f \n \r \t \v \\ \' \" are the usual
+      // characters; a backslash before a newline joins the lines; any other
+      // escape keeps its backslash.
+      auto hexDigits = [&](int digits, const char * form) -> uint32_t {
+        uint32_t v = 0;
+        for (int i = 0; i < digits; ++i) {
+          ++it;
+          if (it == end || !std::isxdigit(static_cast<unsigned char>(*it))) {
+            throw std::runtime_error(std::string("truncated ") + form + " escape in a string literal");
+          }
+          const char c = *it;
+          v = v * 16 + static_cast<uint32_t>(c <= '9' ? c - '0' : std::tolower(static_cast<unsigned char>(c)) - 'a' + 10);
+        }
+        return v;
+      };
       auto doParse = [&](char quote) -> std::unique_ptr<std::string> {
         if (it == end || *it != quote) return nullptr;
         std::string result;
@@ -1821,13 +1887,40 @@ private:
               case 't': result += '\t'; break;
               case 'b': result += '\b'; break;
               case 'f': result += '\f'; break;
+              case 'a': result += '\a'; break;
+              case 'v': result += '\v'; break;
               case '\\': result += '\\'; break;
-              default:
-                if (*it == quote) {
-                  result += quote;
-                } else {
-                  result += *it;
+              case '\'': result += '\''; break;
+              case '"': result += '"'; break;
+              case '\n': break;
+              case '\r':
+                if (std::next(it) != end && *std::next(it) == '\n') ++it;
+                break;
+              case 'x': append_utf8(result, hexDigits(2, "\\xXX")); break;
+              case 'u': append_utf8(result, hexDigits(4, "\\uXXXX")); break;
+              case 'U': {
+                const uint32_t cp = hexDigits(8, "\\UXXXXXXXX");
+                if (cp > 0x10FFFF) throw std::runtime_error("\\U escape out of range in a string literal");
+                append_utf8(result, cp);
+                break;
+              }
+              case 'N':
+                throw std::runtime_error("\\N{...} escapes are not supported in a string literal");
+              case '0': case '1': case '2': case '3':
+              case '4': case '5': case '6': case '7': {
+                uint32_t v = static_cast<uint32_t>(*it - '0');
+                for (int i = 1; i < 3; ++i) {
+                  const auto next = std::next(it);
+                  if (next == end || *next < '0' || *next > '7') break;
+                  ++it;
+                  v = v * 8 + static_cast<uint32_t>(*it - '0');
                 }
+                append_utf8(result, v);
+                break;
+              }
+              default:
+                result += '\\';
+                result += *it;
                 break;
             }
           } else if (*it == '\\') {
@@ -2676,9 +2769,16 @@ private:
               SpaceHandling post_space = it != end ? (*it)->pre_space : SpaceHandling::Keep;
 
               auto text = text_token->text;
+              // LOCAL MODIFICATION (vllm.cpp): a `-` strips the whitespace run
+              // touching the tag, Jinja2's text.rstrip() / text.lstrip(). Upstream
+              // used std::regex "\s+$" and "^\s+", and MSVC's std::regex lets `$`
+              // and `^` match at every line break, so a Windows build also ate
+              // one newline from every blank line and the indentation of every
+              // line in the text node. Same character set as ECMAScript `\s`.
+              static const char * const kJinjaSpace = " \t\n\r\v\f";
               if (post_space == SpaceHandling::Strip) {
-                static std::regex trailing_space_regex(R"(\s+$)");
-                text = std::regex_replace(text, trailing_space_regex, "");
+                const auto last = text.find_last_not_of(kJinjaSpace);
+                text.erase(last == std::string::npos ? 0 : last + 1);
               } else if (options.lstrip_blocks && it != end &&
                          !dynamic_cast<ExpressionTemplateToken*>((*it).get())) {
                 // LOCAL MODIFICATION (vllm.cpp): Jinja2's lstrip_blocks strips
@@ -2695,8 +2795,7 @@ private:
                 }
               }
               if (pre_space == SpaceHandling::Strip) {
-                static std::regex leading_space_regex(R"(^\s+)");
-                text = std::regex_replace(text, leading_space_regex, "");
+                text.erase(0, text.find_first_not_of(kJinjaSpace));
               } else if (options.trim_blocks && (it - 1) != begin && !dynamic_cast<ExpressionTemplateToken*>((*(it - 2)).get())) {
                 if (!text.empty() && text[0] == '\n') {
                   text.erase(0, 1);
@@ -2821,8 +2920,21 @@ inline std::shared_ptr<Context> Context::builtins() {
   globals.set("raise_exception", simple_function("raise_exception", { "message" }, [](const std::shared_ptr<Context> &, Value & args) -> Value {
     throw std::runtime_error(args.at("message").get<std::string>());
   }));
-  globals.set("tojson", simple_function("tojson", { "value", "indent" }, [](const std::shared_ptr<Context> &, Value & args) {
-    return Value(args.at("value").dump(args.get<int64_t>("indent", -1), /* to_json= */ true));
+  // LOCAL MODIFICATION (vllm.cpp): transformers replaces Jinja2's tojson with
+  // json.dumps(x, ensure_ascii=False, indent=None, ...)
+  // (utils/chat_template_utils.py), so templates may pass ensure_ascii, and
+  // leaving it out keeps non-ASCII text as is.
+  globals.set("tojson", simple_function("tojson", { "value", "indent", "ensure_ascii" }, [](const std::shared_ptr<Context> &, Value & args) {
+    return Value(args.at("value").dump(args.get<int64_t>("indent", -1), /* to_json= */ true,
+                                       args.get<bool>("ensure_ascii", false)));
+  }));
+  // LOCAL MODIFICATION (vllm.cpp): Jinja2's do_replace (filters.py) without
+  // autoescape: str(s).replace(str(old), str(new), count), count None meaning all.
+  globals.set("replace", simple_function("replace", { "s", "old", "new", "count" }, [](const std::shared_ptr<Context> &, Value & args) {
+    const int64_t count = args.contains("count") && !args.at("count").is_null()
+                              ? args.at("count").get<int64_t>() : -1;
+    return Value(python_replace(args.at("s").to_str(), args.at("old").to_str(),
+                                args.at("new").to_str(), count));
   }));
   globals.set("items", simple_function("items", { "object" }, [](const std::shared_ptr<Context> &, Value & args) {
     auto items = Value::array();
