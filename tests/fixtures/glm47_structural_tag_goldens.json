@@ -1,0 +1,794 @@
+{
+ "generator": "xgrammar 0.2.3 get_model_structural_tag(model='glm_4_7', reasoning=False)",
+ "modes": {
+  "required": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "units": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        },
+        "flags": {
+         "type": "array",
+         "items": {
+          "type": "integer"
+         }
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "noop",
+      "parameters": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "echo",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "text": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "text"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "anyargs",
+      "parameters": {
+       "type": "object"
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "noparams"
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "loose",
+      "strict": false,
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "q"
+       ]
+      }
+     }
+    }
+   ],
+   "tool_choice": "required",
+   "cases": [
+    {
+     "name": "city only",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "city and days",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "all four in order",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>units</arg_key><arg_value>c</arg_value><arg_key>flags</arg_key><arg_value>[1, 2]</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "optional skipped in the middle",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>flags</arg_key><arg_value>[]</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "out of order",
+     "text": "<tool_call>get_weather<arg_key>days</arg_key><arg_value>3</arg_value><arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "required missing",
+     "text": "<tool_call>get_weather<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "enum value outside",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>units</arg_key><arg_value>k</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "integer as text",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>days</arg_key><arg_value>three</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "array item of wrong type",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>flags</arg_key><arg_value>[1, \"a\"]</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "unknown key",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>zone</arg_key><arg_value>x</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "whitespace between parts",
+     "text": "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value> Taipei </arg_value>\n</tool_call>",
+     "accept": true
+    },
+    {
+     "name": "string with markup inside",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a<b>c</arg_valu</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "string holding the close tag",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a</arg_value>b</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "string ending in a partial close tag",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a</arg_v</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "non-ASCII string",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>臺北市</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "empty string value",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value></arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "noop",
+     "text": "<tool_call>noop</tool_call>",
+     "accept": true
+    },
+    {
+     "name": "noop with an argument",
+     "text": "<tool_call>noop<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "echo with JSON-looking text",
+     "text": "<tool_call>echo<arg_key>text</arg_key><arg_value>{\"k\": 1}</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "anyargs with free keys",
+     "text": "<tool_call>anyargs<arg_key>a</arg_key><arg_value>x</arg_value><arg_key>b_2</arg_key><arg_value>[1]</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "anyargs with nothing",
+     "text": "<tool_call>anyargs</tool_call>",
+     "accept": true
+    },
+    {
+     "name": "noparams with free keys",
+     "text": "<tool_call>noparams<arg_key>a</arg_key><arg_value>x y</arg_value><arg_key>_b2</arg_key><arg_value>{\"k\": [1]}</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "noparams with a bad key name",
+     "text": "<tool_call>noparams<arg_key>1a</arg_key><arg_value>x</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "noparams with nothing",
+     "text": "<tool_call>noparams</tool_call>",
+     "accept": true
+    },
+    {
+     "name": "loose ignores its schema",
+     "text": "<tool_call>loose<arg_key>z</arg_key><arg_value>text</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "unknown tool",
+     "text": "<tool_call>other<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "two calls",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call><tool_call>noop</tool_call>",
+     "accept": true
+    },
+    {
+     "name": "text before the call",
+     "text": "ok <tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "text after the call",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call> done",
+     "accept": false
+    },
+    {
+     "name": "unterminated",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value>",
+     "accept": false
+    },
+    {
+     "name": "plain text",
+     "text": "It is sunny in Taipei.",
+     "accept": false
+    },
+    {
+     "name": "empty",
+     "text": "",
+     "accept": false
+    }
+   ]
+  },
+  "named": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "units": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        },
+        "flags": {
+         "type": "array",
+         "items": {
+          "type": "integer"
+         }
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "noop",
+      "parameters": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "echo",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "text": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "text"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "anyargs",
+      "parameters": {
+       "type": "object"
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "noparams"
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "loose",
+      "strict": false,
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "q"
+       ]
+      }
+     }
+    }
+   ],
+   "tool_choice": {
+    "type": "function",
+    "function": {
+     "name": "get_weather"
+    }
+   },
+   "cases": [
+    {
+     "name": "city only",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "city and days",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "all four in order",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>units</arg_key><arg_value>c</arg_value><arg_key>flags</arg_key><arg_value>[1, 2]</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "optional skipped in the middle",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>flags</arg_key><arg_value>[]</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "out of order",
+     "text": "<tool_call>get_weather<arg_key>days</arg_key><arg_value>3</arg_value><arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "required missing",
+     "text": "<tool_call>get_weather<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "enum value outside",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>units</arg_key><arg_value>k</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "integer as text",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>days</arg_key><arg_value>three</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "array item of wrong type",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>flags</arg_key><arg_value>[1, \"a\"]</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "unknown key",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>zone</arg_key><arg_value>x</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "whitespace between parts",
+     "text": "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value> Taipei </arg_value>\n</tool_call>",
+     "accept": true
+    },
+    {
+     "name": "string with markup inside",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a<b>c</arg_valu</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "string holding the close tag",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a</arg_value>b</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "string ending in a partial close tag",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a</arg_v</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "non-ASCII string",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>臺北市</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "empty string value",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value></arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "noop",
+     "text": "<tool_call>noop</tool_call>",
+     "accept": false
+    },
+    {
+     "name": "noop with an argument",
+     "text": "<tool_call>noop<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "echo with JSON-looking text",
+     "text": "<tool_call>echo<arg_key>text</arg_key><arg_value>{\"k\": 1}</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "anyargs with free keys",
+     "text": "<tool_call>anyargs<arg_key>a</arg_key><arg_value>x</arg_value><arg_key>b_2</arg_key><arg_value>[1]</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "anyargs with nothing",
+     "text": "<tool_call>anyargs</tool_call>",
+     "accept": false
+    },
+    {
+     "name": "noparams with free keys",
+     "text": "<tool_call>noparams<arg_key>a</arg_key><arg_value>x y</arg_value><arg_key>_b2</arg_key><arg_value>{\"k\": [1]}</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "noparams with a bad key name",
+     "text": "<tool_call>noparams<arg_key>1a</arg_key><arg_value>x</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "noparams with nothing",
+     "text": "<tool_call>noparams</tool_call>",
+     "accept": false
+    },
+    {
+     "name": "loose ignores its schema",
+     "text": "<tool_call>loose<arg_key>z</arg_key><arg_value>text</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "unknown tool",
+     "text": "<tool_call>other<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "two calls",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call><tool_call>noop</tool_call>",
+     "accept": false
+    },
+    {
+     "name": "text before the call",
+     "text": "ok <tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "text after the call",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call> done",
+     "accept": false
+    },
+    {
+     "name": "unterminated",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value>",
+     "accept": false
+    },
+    {
+     "name": "plain text",
+     "text": "It is sunny in Taipei.",
+     "accept": false
+    },
+    {
+     "name": "empty",
+     "text": "",
+     "accept": false
+    }
+   ]
+  },
+  "auto": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "units": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        },
+        "flags": {
+         "type": "array",
+         "items": {
+          "type": "integer"
+         }
+        }
+       },
+       "required": [
+        "city"
+       ]
+      },
+      "strict": true
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "noop",
+      "parameters": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "echo",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "text": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "text"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "anyargs",
+      "parameters": {
+       "type": "object"
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "noparams"
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "loose",
+      "strict": false,
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "q"
+       ]
+      }
+     }
+    }
+   ],
+   "tool_choice": "auto",
+   "cases": [
+    {
+     "name": "city only",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "city and days",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "all four in order",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>units</arg_key><arg_value>c</arg_value><arg_key>flags</arg_key><arg_value>[1, 2]</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "optional skipped in the middle",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>flags</arg_key><arg_value>[]</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "out of order",
+     "text": "<tool_call>get_weather<arg_key>days</arg_key><arg_value>3</arg_value><arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "required missing",
+     "text": "<tool_call>get_weather<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "enum value outside",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>units</arg_key><arg_value>k</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "integer as text",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>days</arg_key><arg_value>three</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "array item of wrong type",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>flags</arg_key><arg_value>[1, \"a\"]</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "unknown key",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>zone</arg_key><arg_value>x</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "whitespace between parts",
+     "text": "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value> Taipei </arg_value>\n</tool_call>",
+     "accept": true
+    },
+    {
+     "name": "string with markup inside",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a<b>c</arg_valu</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "string holding the close tag",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a</arg_value>b</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "string ending in a partial close tag",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a</arg_v</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "non-ASCII string",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>臺北市</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "empty string value",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value></arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "noop",
+     "text": "<tool_call>noop</tool_call>",
+     "accept": true
+    },
+    {
+     "name": "noop with an argument",
+     "text": "<tool_call>noop<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "echo with JSON-looking text",
+     "text": "<tool_call>echo<arg_key>text</arg_key><arg_value>{\"k\": 1}</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "anyargs with free keys",
+     "text": "<tool_call>anyargs<arg_key>a</arg_key><arg_value>x</arg_value><arg_key>b_2</arg_key><arg_value>[1]</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "anyargs with nothing",
+     "text": "<tool_call>anyargs</tool_call>",
+     "accept": true
+    },
+    {
+     "name": "noparams with free keys",
+     "text": "<tool_call>noparams<arg_key>a</arg_key><arg_value>x y</arg_value><arg_key>_b2</arg_key><arg_value>{\"k\": [1]}</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "noparams with a bad key name",
+     "text": "<tool_call>noparams<arg_key>1a</arg_key><arg_value>x</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "noparams with nothing",
+     "text": "<tool_call>noparams</tool_call>",
+     "accept": true
+    },
+    {
+     "name": "loose ignores its schema",
+     "text": "<tool_call>loose<arg_key>z</arg_key><arg_value>text</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "unknown tool",
+     "text": "<tool_call>other<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call>",
+     "accept": false
+    },
+    {
+     "name": "two calls",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call><tool_call>noop</tool_call>",
+     "accept": true
+    },
+    {
+     "name": "text before the call",
+     "text": "ok <tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call>",
+     "accept": true
+    },
+    {
+     "name": "text after the call",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value></tool_call> done",
+     "accept": true
+    },
+    {
+     "name": "unterminated",
+     "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value>",
+     "accept": false
+    },
+    {
+     "name": "plain text",
+     "text": "It is sunny in Taipei.",
+     "accept": true
+    },
+    {
+     "name": "empty",
+     "text": "",
+     "accept": true
+    }
+   ]
+  }
+ }
+}

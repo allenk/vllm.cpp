@@ -9,6 +9,7 @@
 //      typed arrays, enum / const alternations) generated recursively.
 #include "vllm/v1/structured_output/json_schema_to_gbnf.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -67,6 +68,8 @@ std::string JsonValueToGbnfLiteral(const nlohmann::json& value) {
   return out;
 }
 
+std::string RawStringToGbnfLiteral(const std::string& raw);
+
 // The recursive converter. Accumulates schema-specific rules in rules_ (name,
 // body) and returns, for any schema node, a GBNF *element* string (a rule-ref
 // name, a primitive name, a quoted literal, or a parenthesized group) that the
@@ -103,7 +106,177 @@ class Converter {
     return rules_;
   }
 
+  // The glm_xml argument surface for a tool's arguments schema (see
+  // StructuralTagBody in json_schema_to_gbnf.h); the rules mirror the EBNF
+  // xgrammar 0.2.3 builds for its glm_4_7 structural tag.
+  std::string LowerGlmXmlArguments(const nlohmann::json& schema,
+                                   const std::vector<std::string>& order) {
+    if (schema.is_boolean() && !schema.get<bool>()) {
+      throw std::runtime_error(
+          "JsonSchemaToGbnf: a `false` arguments schema matches nothing");
+    }
+    if (!schema.is_object() || schema.empty()) return GlmAnyArguments();
+    if (!schema.contains("properties")) return GlmWs();  // closed, no keys
+    const nlohmann::json& props = schema["properties"];
+    if (!props.is_object()) {
+      throw std::runtime_error(
+          "JsonSchemaToGbnf: `properties` must be an object");
+    }
+    std::vector<std::string> required;
+    if (schema.contains("required") && schema["required"].is_array()) {
+      for (const auto& r : schema["required"]) {
+        if (r.is_string()) required.push_back(r.get<std::string>());
+      }
+    }
+    for (const std::string& r : required) {
+      if (!props.contains(r)) {
+        throw std::runtime_error(
+            "json schema -> gbnf: required key '" + r +
+            "' is not declared in 'properties' (unsupported — would not be "
+            "enforced)");
+      }
+    }
+    std::vector<std::string> names;
+    for (const std::string& n : order) {
+      if (props.contains(n) &&
+          std::find(names.begin(), names.end(), n) == names.end()) {
+        names.push_back(n);
+      }
+    }
+    for (auto it = props.begin(); it != props.end(); ++it) {
+      if (std::find(names.begin(), names.end(), it.key()) == names.end()) {
+        names.push_back(it.key());
+      }
+    }
+    const std::string ws = GlmWs();
+    std::string body;
+    for (const std::string& n : names) {
+      const std::string item =
+          ws + " " + RawStringToGbnfLiteral("<arg_key>" + n + "</arg_key>") +
+          " " + ws + " \"<arg_value>\" " + ws + " " + GlmXmlValue(props[n]) +
+          " " + ws + " \"</arg_value>\"";
+      const bool req =
+          std::find(required.begin(), required.end(), n) != required.end();
+      body += req ? item : "(" + item + ")?";
+      body += " ";
+    }
+    body += ws;
+    return NewRule(body);
+  }
+
  private:
+  // xgrammar's glm_xml whitespace: [ \n\t]* (the JSON `ws` also takes \r).
+  std::string GlmWs() {
+    if (glm_ws_.empty()) glm_ws_ = NewRule("[ \\n\\t]*");
+    return glm_ws_;
+  }
+
+  // Raw text that never contains "</arg_value>" (xgrammar's xml_string, a
+  // TagDispatch excluding it). The rules are the states of a matcher for that
+  // word: state k has just read its first k bytes. `<` occurs in it only at
+  // the start, so a mismatch always falls back to state 0, or to state 1 on a
+  // `<`. Every state may end the value.
+  std::string GlmXmlString() {
+    if (!glm_xs_.empty()) return glm_xs_;
+    static const std::string kClose = "</arg_value>";
+    const std::size_t n = kClose.size();
+    std::vector<std::string> state(n);
+    for (std::size_t k = 0; k < n; ++k) {
+      state[k] = prefix_ + "xs" + std::to_string(k);
+    }
+    for (std::size_t k = 0; k < n; ++k) {
+      std::string b = "\"\"";
+      if (k == 0) {
+        b += " | [^<] " + state[0];
+      } else {
+        const char next = kClose[k];
+        if (k + 1 < n) {
+          b += " | " + RawStringToGbnfLiteral(std::string(1, next)) + " " +
+               state[k + 1];
+        }
+        b += std::string(" | [^<") + next + "] " + state[0];
+      }
+      b += " | \"<\" " + state[1];
+      rules_.emplace_back(state[k], std::move(b));
+    }
+    glm_xs_ = state[0];
+    return glm_xs_;
+  }
+
+  // xgrammar's xml_any (an untyped value): raw text, or a JSON array / object.
+  std::string GlmXmlAny() {
+    return "(" + GlmXmlString() + " | array | object)";
+  }
+
+  // `true` arguments: any number of [a-zA-Z_][a-zA-Z0-9_]* keys, each with an
+  // untyped value (xgrammar's xml_object).
+  std::string GlmAnyArguments() {
+    const std::string ws = GlmWs();
+    return NewRule("(" + ws + " \"<arg_key>\" [a-zA-Z_] [a-zA-Z0-9_]* " +
+                   "\"</arg_key>\" " + ws + " \"<arg_value>\" " + ws + " " +
+                   GlmXmlAny() + " " + ws + " \"</arg_value>\")* " + ws);
+  }
+
+  // One property's VALUE: string-typed values are raw text, the rest JSON.
+  std::string GlmXmlValue(const nlohmann::json& schema) {
+    if (!schema.is_object()) {
+      if (schema.is_boolean() && !schema.get<bool>()) {
+        throw std::runtime_error(
+            "JsonSchemaToGbnf: a `false` schema (matches nothing) is unsupported");
+      }
+      return GlmXmlAny();
+    }
+    for (const char* key : {"anyOf", "oneOf"}) {
+      if (schema.contains(key) && schema[key].is_array() &&
+          !schema[key].empty()) {
+        std::string body;
+        for (const auto& sub : schema[key]) {
+          if (!body.empty()) body += " | ";
+          body += GlmXmlValue(sub);
+        }
+        return "(" + body + ")";
+      }
+    }
+    const auto literal = [](const nlohmann::json& v) {
+      return v.is_string() ? RawStringToGbnfLiteral(v.get<std::string>())
+                           : JsonValueToGbnfLiteral(v);
+    };
+    if (schema.contains("const")) return literal(schema["const"]);
+    if (schema.contains("enum") && schema["enum"].is_array() &&
+        !schema["enum"].empty()) {
+      std::string body;
+      for (const auto& v : schema["enum"]) {
+        if (!body.empty()) body += " | ";
+        body += literal(v);
+      }
+      return "(" + body + ")";
+    }
+    if (schema.contains("type")) {
+      const nlohmann::json& t = schema["type"];
+      if (t.is_string()) {
+        return t.get<std::string>() == "string" ? GlmXmlString() : Visit(schema);
+      }
+      if (t.is_array() && !t.empty()) {
+        std::string body;
+        for (const auto& tv : t) {
+          if (!tv.is_string()) {
+            throw std::runtime_error(
+                "JsonSchemaToGbnf: `type` array entries must be strings");
+          }
+          if (!body.empty()) body += " | ";
+          body += tv.get<std::string>() == "string"
+                      ? GlmXmlString()
+                      : VisitType(tv.get<std::string>(), schema);
+        }
+        return "(" + body + ")";
+      }
+    }
+    if (schema.contains("properties") || schema.contains("items")) {
+      return Visit(schema);
+    }
+    return GlmXmlAny();
+  }
+
   // Register a fresh named rule with the given body; return its name. Names are
   // "<prefix>r<N>" — disjoint from every primitive rule name (none of which start
   // "r" followed by a digit) and from "root".
@@ -341,6 +514,8 @@ class Converter {
   std::vector<std::pair<std::string, std::string>> rules_;
   int counter_ = 0;
   std::string prefix_;
+  std::string glm_ws_;  // the glm_xml rules, built once per converter
+  std::string glm_xs_;
 };
 
 // Escape a RAW byte string into a GBNF double-quoted string literal matching
@@ -430,7 +605,14 @@ std::string StructuralTagToGbnf(const std::vector<StructuralTagBody>& tags,
     // schema lowered to an element (its rules carried under the "t<i>_" prefix).
     std::string body_expr;
     std::vector<std::pair<std::string, std::string>> body_rules;
-    if (t.content_schema.is_boolean()) {
+    if (t.content_style == "glm_xml") {
+      Converter conv("t" + std::to_string(i) + "_");
+      body_expr = conv.LowerGlmXmlArguments(t.content_schema, t.property_order);
+      body_rules = conv.rules();
+    } else if (t.content_style != "json") {
+      throw std::runtime_error("StructuralTagToGbnf: unknown content_style '" +
+                               t.content_style + "'");
+    } else if (t.content_schema.is_boolean()) {
       if (!t.content_schema.get<bool>()) {
         throw std::runtime_error(
             "StructuralTagToGbnf: content_schema `false` matches nothing");

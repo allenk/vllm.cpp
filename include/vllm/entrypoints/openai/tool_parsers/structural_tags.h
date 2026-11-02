@@ -46,6 +46,12 @@
 //   kimi_k2              -> full  (section+call markers, args a JSON object;
 //       `functions.NAME:0` id + section wrapper baked - single-call faithful,
 //       multi-call `required` re-wraps per call, same as DeepSeek's deviation)
+//   glm45, glm47         -> required / named, and auto only when a tool is
+//       strict (555967922's get_model_structural_tag). The per-argument
+//       <arg_key>K</arg_key><arg_value>V</arg_value> surface is not a JSON
+//       object, so the tags carry content_style "glm_xml", a lowering of the
+//       grammar xgrammar's `glm_4_7` builtin builds; test_glm47_structural_tag
+//       checks it against xgrammar 0.2.3's own accept/reject decisions.
 // Families that return NULLOPT for every mode (documented at their site):
 //   deepseek_v32, deepseek_v4 -> the DSML per-parameter XML surface
 //       (<｜DSML｜parameter name=..>..) is NOT a JSON args object, so a JSON
@@ -60,17 +66,12 @@
 //       a _VLLM_STRUCTURAL_TAG_REGISTRY flat-tag builder, so there is no flat
 //       begin/content/end shape to mirror - nullopt for every mode, exactly the
 //       deepseek_v32 precedent.
-//   glm45, glm47 -> the GLM per-argument XML surface (<arg_key>K</arg_key>
-//       <arg_value>V</arg_value>) is the same per-arg-XML shape as DSML, NOT a JSON
-//       args object. Upstream's structural_tag_model is the `glm_4_7` XGRAMMAR
-//       BUILTIN grammar (not a vLLM-owned tag builder we could mirror); a flat
-//       native structural tag cannot represent per-arg XML. Same precedent as
-//       deepseek_v32.
 //   minimax_m2 -> upstream DOES register a `minimax` tag builder, but its
 //       per-parameter content uses xgrammar's `minimax_xml` style (it renders the
 //       JSON schema AS <parameter name=..>..</parameter> XML, not a JSON args
 //       object). The flat native tag's JSON content_schema cannot express that
-//       per-argument XML, so nullopt - same per-arg-XML precedent as GLM/DSML.
+//       per-argument XML, so nullopt - same per-arg-XML precedent as DSML (a
+//       content_style for it, as glm_xml is for GLM, is not written yet).
 //   pythonic, llama4_pythonic -> Python bracket call grammar (`[fn(a=1)]`), not
 //       a taggable begin/end surface.
 //   xlam                 -> multi-envelope (fenced / [TOOL_CALLS] / bare-list),

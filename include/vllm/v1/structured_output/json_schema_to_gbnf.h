@@ -98,6 +98,22 @@ struct StructuralTagBody {
   std::string begin;
   nlohmann::json content_schema;  // a schema object, or boolean `true`
   std::string end;
+  // How the content carries the arguments. "json" (the default): a JSON value
+  // conforming to content_schema. "glm_xml": the GLM-4.7 per-argument surface,
+  // xgrammar's JSONSchemaFormat style "glm_xml" as its `glm_4_7` builtin
+  // structural tag uses it -- each property as
+  //   ws "<arg_key>NAME</arg_key>" ws "<arg_value>" ws VALUE ws "</arg_value>"
+  // in schema order (required present, the others optional), then ws, where
+  // ws is [ \n\t]*. A string VALUE is raw text without "</arg_value>" (a string
+  // enum or const is its raw text); any other type is JSON per its schema. An
+  // object schema without `properties` takes no arguments; `true` takes any
+  // keys matching [a-zA-Z_][a-zA-Z0-9_]* with string / array / object values.
+  std::string content_style = "json";
+  // glm_xml only: the order the properties appear in. content_schema is a
+  // nlohmann::json, whose objects sort their keys, so the request's own order
+  // travels here. Names absent from `properties` are ignored; properties
+  // absent from this list follow in key order.
+  std::vector<std::string> property_order;
 };
 
 // Build a GBNF grammar whose `root` matches the structural-tag bodies (M3.3b
@@ -105,7 +121,8 @@ struct StructuralTagBody {
 // vLLM but the emitted grammar is backend-private). Each tag lowers to
 //   tagI ::= "<begin>" <content> "<end>"
 // where <content> is the schema lowered via JsonSchemaToGbnf (or the any-JSON
-// `value` rule when content_schema is `true`). MULTIPLE tags combine into an
+// `value` rule when content_schema is `true`), or the glm_xml argument surface
+// when content_style says so (see StructuralTagBody). MULTIPLE tags combine into an
 // alternation. `stop_after_first` (vLLM TagsWithSeparatorFormat.stop_after_first,
 // structural_tag_registry.py:260) => `root ::= (tag0 | tag1 | ...)` (exactly one
 // tag); otherwise (at_least_one) => `root ::= (tag0 | ...)+` (one-or-more). The

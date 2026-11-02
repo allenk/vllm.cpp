@@ -16,11 +16,14 @@
 // structural_tags.h), and the Apply* path routes only structural_tag.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -297,9 +300,9 @@ TEST_CASE("structural tags: DSML + non-taggable families are nullopt") {
       "phi4_mini_json", "internlm",    "jamba",        "step3",
       "step3p5",      "minicpm5",      "hy_v3",        "olmo3",
       "qwen3_coder",  "qwen3_xml",     "mimo",
-      // GLM (glm_4_7 xgrammar builtin) + MiniMax-M2 (minimax_xml content): both
-      // are per-argument XML surfaces a flat JSON content_schema cannot express.
-      "glm45",        "glm47",         "minimax_m2",
+      // MiniMax-M2 (minimax_xml content): a per-argument XML surface with no
+      // content_style yet (GLM's has one, see test_glm47_structural_tag).
+      "minimax_m2",
       // gemma4's native key:value dialect (KEY:<|"|>VALUE<|"|>) and seed_oss's
       // <parameter=..> XML body are NOT JSON args objects a content_schema can
       // express; both parsers set structural_tag_model=None upstream. Same
@@ -364,4 +367,139 @@ TEST_CASE("structural tags: Apply routes only structural_tag with family markers
   const std::string tag = *sp.structured_outputs->structural_tag;
   CHECK(tag.find("<｜tool▁calls▁begin｜>") != std::string::npos);
   CHECK(tag.find("<tool_call>") == std::string::npos);
+}
+
+// ── glm45 / glm47: xgrammar's glm_4_7 builtin, ported as content_style glm_xml ─
+namespace {
+
+// Whether EOS may follow, i.e. the bytes fed so far are a complete match.
+bool EosAllowed(NativeGrammar& g) {
+  TokenBitmask bm;
+  bm.num_seqs = 1;
+  bm.num_words = BitmaskWordsForVocab(VocabSize());
+  bm.data.assign(static_cast<std::size_t>(bm.num_words), 0);
+  g.fill_bitmask(bm, 0);
+  const int32_t word = bm.data[static_cast<std::size_t>(kEos >> 5)];
+  return (word & (1 << (kEos & 31))) != 0;
+}
+
+bool CompleteMatch(NativeStructuredOutputBackend& backend,
+                   const std::string& spec, const std::string& text) {
+  auto g = CompileStructuralTag(backend, spec);
+  return AcceptAll(*g, text) && EosAllowed(*g);
+}
+
+// A request parsed the way the server parses one (from_json, then the tools'
+// key order from the same body as ordered_json).
+ChatCompletionRequest ParseWire(const nlohmann::ordered_json& body) {
+  const std::string wire = body.dump();
+  ChatCompletionRequest req;
+  from_json(json::parse(wire), req);
+  if (req.tools.has_value()) {
+    KeepToolParameterOrder(nlohmann::ordered_json::parse(wire), *req.tools);
+  }
+  return req;
+}
+
+std::string ReadFixture(const std::string& name) {
+  std::ifstream f(std::string(VLLM_TEST_FIXTURES_DIR) + "/" + name,
+                  std::ios::binary);
+  REQUIRE_MESSAGE(f.good(), "cannot open fixture " << name);
+  return std::string(std::istreambuf_iterator<char>(f),
+                     std::istreambuf_iterator<char>());
+}
+
+}  // namespace
+
+TEST_CASE("structural tags: glm47 follows the pin, auto only with a strict tool") {
+  for (const char* parser : {"glm45", "glm47"}) {
+    CAPTURE(parser);
+    // 555967922's get_model_structural_tag: no tag for a non-strict auto.
+    CHECK_FALSE(ToolChoiceStructuralTagSpecFor(
+                    parser, WeatherRequest(ToolChoice{"auto", std::nullopt}))
+                    .has_value());
+
+    ChatCompletionRequest strict_auto =
+        WeatherRequest(ToolChoice{"auto", std::nullopt});
+    (*strict_auto.tools)[0].function.strict = true;
+    const auto lazy = ToolChoiceStructuralTagSpecFor(parser, strict_auto);
+    REQUIRE(lazy.has_value());
+    CHECK(lazy->at("lazy") == true);
+    CHECK(lazy->at("triggers") == json::array({"<tool_call>"}));
+
+    const auto required = ToolChoiceStructuralTagSpecFor(
+        parser, WeatherRequest(ToolChoice{"required", std::nullopt}));
+    REQUIRE(required.has_value());
+    CHECK(required->at("lazy") == false);
+    CHECK(required->at("stop_after_first") == false);
+    const json& tag = required->at("tags")[0];
+    CHECK(tag.at("begin") == "<tool_call>get_weather");
+    CHECK(tag.at("end") == "</tool_call>");
+    CHECK(tag.at("content_style") == "glm_xml");
+
+    const auto named = ToolChoiceStructuralTagSpecFor(
+        parser, WeatherRequest(ToolChoice{"function", std::string("get_weather")}));
+    REQUIRE(named.has_value());
+    CHECK(named->at("stop_after_first") == true);
+  }
+}
+
+TEST_CASE("structural tags: glm47 keeps the request's property order") {
+  // nlohmann::json would sort these to `a, b`; the request wrote `b, a`.
+  nlohmann::ordered_json body = nlohmann::ordered_json::parse(
+      R"({"messages": [{"role": "user", "content": "x"}],
+          "tool_choice": "required",
+          "tools": [{"type": "function", "function": {"name": "f",
+            "parameters": {"type": "object",
+              "properties": {"b": {"type": "string"}, "a": {"type": "integer"}},
+              "required": ["b", "a"]}}}]})");
+  const auto spec = ToolChoiceStructuralTagSpecFor("glm47", ParseWire(body));
+  REQUIRE(spec.has_value());
+  CHECK(spec->at("tags")[0].at("property_order") == json::array({"b", "a"}));
+  auto backend = MakeBackend();
+  CHECK(CompleteMatch(*backend, spec->dump(),
+                      "<tool_call>f<arg_key>b</arg_key><arg_value>x</arg_value>"
+                      "<arg_key>a</arg_key><arg_value>1</arg_value></tool_call>"));
+  CHECK_FALSE(CompleteMatch(*backend, spec->dump(),
+                            "<tool_call>f<arg_key>a</arg_key><arg_value>1</arg_value>"
+                            "<arg_key>b</arg_key><arg_value>x</arg_value></tool_call>"));
+}
+
+// tests/fixtures/glm47_structural_tag_goldens.json: xgrammar 0.2.3's own
+// accept/reject decision for each candidate output under the glm_4_7 tag the
+// pin builds (scripts/gen-glm47-structural-tag-goldens.py). The native grammar
+// must decide the same, except where noted.
+TEST_CASE("structural tags: glm47 accepts exactly what xgrammar's glm_4_7 accepts") {
+  const nlohmann::ordered_json goldens =
+      nlohmann::ordered_json::parse(ReadFixture("glm47_structural_tag_goldens.json"));
+  // The one known difference, and it is the native lazy path every family
+  // shares, not the glm_xml lowering: after a triggered call xgrammar's
+  // TriggeredTagsFormat returns to free text, while the native lazy grammar
+  // allows only another tag or EOS. Asserted inverted so a fix shows up here.
+  const std::vector<std::string> known_differences = {"auto: text after the call"};
+  auto backend = MakeBackend();
+  int compared = 0;
+  for (const auto& [mode, m] : goldens.at("modes").items()) {
+    nlohmann::ordered_json body = {
+        {"messages", nlohmann::ordered_json::array(
+                         {{{"role", "user"}, {"content", "x"}}})},
+        {"tools", m.at("tools")},
+        {"tool_choice", m.at("tool_choice")}};
+    const auto spec = ToolChoiceStructuralTagSpecFor("glm47", ParseWire(body));
+    REQUIRE_MESSAGE(spec.has_value(), mode);
+    for (const auto& c : m.at("cases")) {
+      const std::string name = c.at("name").get<std::string>();
+      const std::string key = mode + ": " + name;
+      const bool known = std::find(known_differences.begin(), known_differences.end(),
+                                   key) != known_differences.end();
+      const bool want = c.at("accept").get<bool>() != known;
+      CHECK_MESSAGE(CompleteMatch(*backend, spec->dump(),
+                                  c.at("text").get<std::string>()) == want,
+                    key << " (xgrammar: "
+                        << (c.at("accept").get<bool>() ? "accept" : "reject")
+                        << (known ? ", a known difference" : "") << ")");
+      ++compared;
+    }
+  }
+  CHECK(compared == 96);
 }

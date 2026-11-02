@@ -1421,6 +1421,8 @@ NativeStructuredOutputBackend::compile_grammar(
       //    "stop_after_first": bool,     // exactly-one vs one-or-more tags
       //    "tags": [{"begin": str,       // TagFormat.begin literal
       //              "content_schema": <schema|true>,  // TagFormat.content
+      //              "content_style": "json"|"glm_xml",  // optional, see
+      //              "property_order": [str],            // StructuralTagBody
       //              "end": str}]}       // TagFormat.end literal
       nlohmann::json spec;
       try {
@@ -1458,6 +1460,13 @@ NativeStructuredOutputBackend::compile_grammar(
         // content_schema defaults to `true` (any JSON) when absent.
         body.content_schema =
             tag.contains("content_schema") ? tag["content_schema"] : nlohmann::json(true);
+        if (tag.contains("content_style")) {
+          body.content_style = tag.at("content_style").get<std::string>();
+        }
+        if (tag.contains("property_order")) {
+          body.property_order =
+              tag.at("property_order").get<std::vector<std::string>>();
+        }
         bodies.push_back(std::move(body));
       }
 

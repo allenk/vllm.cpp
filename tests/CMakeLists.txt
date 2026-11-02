@@ -2441,6 +2441,9 @@ vllm_cpp_add_test(test_tool_choice_grammar
   vllm/entrypoints/openai/tool_parsers/test_tool_choice_grammar.cpp)
 vllm_cpp_add_test(test_structural_tags
   vllm/entrypoints/openai/tool_parsers/test_structural_tags.cpp)
+# glm47_structural_tag_goldens.json (xgrammar's own decisions) lives in tests/fixtures/.
+target_compile_definitions(test_structural_tags PRIVATE
+  VLLM_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 vllm_cpp_add_test(test_tool_parser_mistral
   vllm/entrypoints/openai/tool_parsers/test_mistral.cpp)
 vllm_cpp_add_test(test_reasoning_base_thinking

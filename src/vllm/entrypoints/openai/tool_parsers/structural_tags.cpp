@@ -11,6 +11,7 @@
 
 #include "vllm/entrypoints/openai/serving_chat.h"  // ToolsEnabled
 #include "vllm/entrypoints/openai/tool_parsers/deepseek_v3.h"
+#include "vllm/entrypoints/openai/tool_parsers/glm47.h"
 #include "vllm/entrypoints/openai/tool_parsers/hermes.h"
 #include "vllm/entrypoints/openai/tool_parsers/kimi_k2.h"
 #include "vllm/entrypoints/openai/tool_parsers/longcat.h"
@@ -201,11 +202,56 @@ nlohmann::json KimiK2Tags(const std::vector<ChatCompletionToolsParam>& tools) {
   return tags;
 }
 
+// GLM-4.7 surface (glm47.h / glm47_moe_tool_parser.py), the tags xgrammar's
+// `glm_4_7` builtin builds (builtin_structural_tag.py, xgrammar >= 0.2.1 as
+// the pin requires): `<tool_call>NAME` + the per-argument
+// `<arg_key>K</arg_key><arg_value>V</arg_value>` surface + `</tool_call>`,
+// with no separator between calls. The arguments are not a JSON object, so the
+// tag carries content_style "glm_xml" (json_schema_to_gbnf.h) and the
+// properties' order from the request, which the parsed schema has lost.
+// xgrammar's _get_function_parameters maps a tool with `strict: false` to the
+// `true` schema (any arguments), the same as one without parameters.
+nlohmann::json GlmTags(const std::vector<ChatCompletionToolsParam>& tools) {
+  nlohmann::json tags = nlohmann::json::array();
+  for (const ChatCompletionToolsParam& tool : tools) {
+    const FunctionDefinition& fn = tool.function;
+    nlohmann::json tag = nlohmann::json::object();
+    tag["begin"] = std::string(Glm47ToolParser::kToolCallStart) + fn.name;
+    const bool loose = fn.strict.has_value() && !*fn.strict;
+    tag["content_schema"] = loose ? nlohmann::json(true) : ToolArgumentsSchema(fn);
+    tag["content_style"] = "glm_xml";
+    nlohmann::json order = nlohmann::json::array();
+    if (fn.parameters_in_order.has_value() &&
+        fn.parameters_in_order->contains("properties") &&
+        (*fn.parameters_in_order)["properties"].is_object()) {
+      for (const auto& p : (*fn.parameters_in_order)["properties"].items()) {
+        order.push_back(p.key());
+      }
+    }
+    tag["property_order"] = std::move(order);
+    tag["end"] = Glm47ToolParser::kToolCallEnd;
+    tags.push_back(std::move(tag));
+  }
+  return tags;
+}
+
+// _any_tool_strict (structural_tag_registry.py:87-95 @ 555967922).
+bool AnyToolStrict(const std::vector<ChatCompletionToolsParam>& tools) {
+  for (const ChatCompletionToolsParam& tool : tools) {
+    if (tool.function.strict.value_or(false)) return true;
+  }
+  return false;
+}
+
 // ── The registry: parser name -> (auto trigger marker, tag builder) ──────────
 
 struct FamilySpec {
   std::string trigger;   // the LAZY (auto) trigger - the family's begin marker.
   TagBuilder build_tags;
+  // get_model_structural_tag at 555967922 returns no tag for `auto` unless a
+  // tool is strict. The families ported from e24d1b24 always build the lazy
+  // tag; the ones ported from the later pin say so here.
+  bool auto_needs_strict = false;
 };
 
 const std::unordered_map<std::string, FamilySpec>& Registry() {
@@ -242,6 +288,13 @@ const std::unordered_map<std::string, FamilySpec>& Registry() {
     r.emplace("kimi_k2",
               FamilySpec{KimiK2ToolParser::kToolCallsSectionBeginToken,
                          KimiK2Tags});
+    // GLM-4.5 / 4.7 (both names select Glm47MoeModelToolParser upstream,
+    // tool_parsers/__init__.py) - trigger on `<tool_call>`, as xgrammar's
+    // glm_4_7 TriggeredTagsFormat does.
+    for (const char* name : {"glm45", "glm47"}) {
+      r.emplace(name, FamilySpec{Glm47ToolParser::kToolCallStart, GlmTags,
+                                 /*auto_needs_strict=*/true});
+    }
     return r;
   }();
   return registry;
@@ -300,6 +353,7 @@ std::optional<nlohmann::json> ToolChoiceStructuralTagSpecFor(
   // (structural_tag_registry.py:248-254 - TriggeredTagsFormat, inert until the
   // family's begin marker). Plain text is free; a call is constrained only after
   // the model chooses to start one. NOT forced.
+  if (family.auto_needs_strict && !AnyToolStrict(tools)) return std::nullopt;
   spec["lazy"] = true;
   spec["triggers"] = nlohmann::json::array({family.trigger});
   spec["stop_after_first"] = false;
