@@ -507,10 +507,13 @@ struct ChatCompletionRequest {
   // absent both stay nullopt (backward compat). The serving-layer default
   // (tool_choice="auto" when tools present, else "none") is applied downstream
   // (chat_completion/protocol.py:828-831), not here.
-  // DEFERRED (parsed-and-ignored): parallel_tool_calls (protocol.py:240) and the
-  // legacy `functions` / `function_call` fields.
+  // DEFERRED (parsed-and-ignored): the legacy `functions` / `function_call` fields.
   std::optional<std::vector<ChatCompletionToolsParam>> tools;
   std::optional<ToolChoice> tool_choice;
+  // parallel_tool_calls (protocol.py:240, default None). Only `false` acts: the
+  // tool-call grammar then stops after its first call, as vLLM's
+  // limit_to_single_tool_call does since #50502 (2026-09-29, after the pin).
+  std::optional<bool> parallel_tool_calls;
 
   // chat_template_kwargs (chat_completion/protocol.py:341, default None):
   // "additional keyword args to pass to the template renderer", accessible by

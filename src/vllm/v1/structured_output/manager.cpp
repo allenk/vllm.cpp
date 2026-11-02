@@ -44,7 +44,11 @@ std::unique_ptr<StructuredOutputGrammar> StructuredOutputManager::create_grammar
   const StructuredOutputKey key =
       request.structured_output_request->structured_output_key();
   assert(backend_ != nullptr);
-  return backend_->compile_grammar(key.first, key.second);
+  // The request's stop tokens reach the grammar, as vLLM does since #49227
+  // (structured_output/__init__.py _create_grammar, after the pin).
+  const std::vector<int32_t> stops(request.sampling_params.all_stop_token_ids.begin(),
+                                   request.sampling_params.all_stop_token_ids.end());
+  return backend_->compile_grammar(key.first, key.second, stops);
 }
 
 void StructuredOutputManager::fill_bitmask_row(StructuredOutputGrammar& grammar,

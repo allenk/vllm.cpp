@@ -67,9 +67,13 @@ struct LazyGrammarConfig {
 // byte-trie perf counter.
 class NativeGrammar : public StructuredOutputGrammar {
  public:
+  // `request_stop_token_ids` join the backend's stop tokens for this grammar:
+  // never matched as text, allowed only at an accepting state (see
+  // StructuredOutputBackend::compile_grammar with stop tokens).
   NativeGrammar(std::shared_ptr<const NativeBackendShared> shared,
                 std::shared_ptr<const NativeCompiledGrammar> grammar,
-                LazyGrammarConfig lazy_config = {});
+                LazyGrammarConfig lazy_config = {},
+                const std::vector<int32_t>& request_stop_token_ids = {});
   ~NativeGrammar() override;
 
   bool accept_tokens(const std::string& request_id,
@@ -114,6 +118,10 @@ class NativeGrammar : public StructuredOutputGrammar {
   bool lazy_ = false;
   std::vector<std::string> trigger_words_;
   std::vector<int32_t> trigger_tokens_;
+  // The backend's stop tokens plus the request's; the request-only ones are
+  // still in the byte trie, so fill_bitmask and forced_token mask them out.
+  std::vector<int32_t> stop_token_ids_;
+  std::vector<int32_t> request_only_stop_ids_;
 };
 
 // The engine-level native backend. Constructed with the tokenizer + vocab size;
@@ -127,8 +135,8 @@ class NativeStructuredOutputBackend : public StructuredOutputBackend {
   ~NativeStructuredOutputBackend() override;
 
   std::unique_ptr<StructuredOutputGrammar> compile_grammar(
-      StructuredOutputOptions request_type,
-      const std::string& grammar_spec) override;
+      StructuredOutputOptions request_type, const std::string& grammar_spec,
+      const std::vector<int32_t>& stop_token_ids = {}) override;
 
   // Compile a LAZY (awaiting-trigger) grammar from a GBNF string plus its
   // triggers (M3.3b). The grammar stays inert (all tokens allowed) until a
@@ -138,7 +146,8 @@ class NativeStructuredOutputBackend : public StructuredOutputBackend {
   // and `trigger_tokens` must not both be empty (that would never activate).
   std::unique_ptr<StructuredOutputGrammar> compile_lazy_grammar(
       const std::string& gbnf, std::vector<std::string> trigger_words,
-      std::vector<int32_t> trigger_tokens = {});
+      std::vector<int32_t> trigger_tokens = {},
+      const std::vector<int32_t>& request_stop_token_ids = {});
 
   TokenBitmask allocate_token_bitmask(int max_num_seqs) override;
   void destroy() override;

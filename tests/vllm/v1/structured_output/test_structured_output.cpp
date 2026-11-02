@@ -89,7 +89,8 @@ class MockBackend : public StructuredOutputBackend {
  public:
   explicit MockBackend(int vocab_size) : vocab_size_(vocab_size) {}
   std::unique_ptr<StructuredOutputGrammar> compile_grammar(
-      StructuredOutputOptions, const std::string&) override {
+      StructuredOutputOptions, const std::string&,
+      const std::vector<int32_t>& = {}) override {
     ++compiled;
     return std::make_unique<MockGrammar>();
   }

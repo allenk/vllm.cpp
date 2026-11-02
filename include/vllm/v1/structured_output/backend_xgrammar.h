@@ -58,9 +58,10 @@ class XgrammarStructuredOutputBackend : public StructuredOutputBackend {
   // compile_grammar (backend_xgrammar.py:78-126). JSON/JSON_OBJECT go through the
   // xgrammar-faithful schema->EBNF converter; the rest delegate to the native
   // compile paths (same EBNF/GBNF dialect).
+  // The request's stop tokens pass through to the native grammar.
   std::unique_ptr<StructuredOutputGrammar> compile_grammar(
-      StructuredOutputOptions request_type,
-      const std::string& grammar_spec) override;
+      StructuredOutputOptions request_type, const std::string& grammar_spec,
+      const std::vector<int32_t>& stop_token_ids = {}) override;
 
   TokenBitmask allocate_token_bitmask(int max_num_seqs) override;
   void destroy() override;

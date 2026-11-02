@@ -465,6 +465,82 @@ TEST_CASE("structural tags: glm47 keeps the request's property order") {
                             "<arg_key>b</arg_key><arg_value>x</arg_value></tool_call>"));
 }
 
+TEST_CASE("structural tags: parallel_tool_calls=false stops after one call") {
+  // vLLM's limit_to_single_tool_call (#50502, after the pin): every family.
+  nlohmann::ordered_json body = nlohmann::ordered_json::parse(
+      R"({"messages": [{"role": "user", "content": "x"}],
+          "tool_choice": "required", "parallel_tool_calls": false,
+          "tools": [{"type": "function", "function": {"name": "get_weather",
+            "parameters": {"type": "object",
+              "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]})");
+  const ChatCompletionRequest single = ParseWire(body);
+  REQUIRE(single.parallel_tool_calls == false);
+  for (const char* parser : {"hermes", "glm47"}) {
+    CAPTURE(parser);
+    const auto spec = ToolChoiceStructuralTagSpecFor(parser, single);
+    REQUIRE(spec.has_value());
+    CHECK(spec->at("stop_after_first") == true);
+  }
+  const std::string call =
+      "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call>";
+  auto backend = MakeBackend();
+  const auto glm = ToolChoiceStructuralTagSpecFor("glm47", single);
+  CHECK(CompleteMatch(*backend, glm->dump(), call));
+  CHECK_FALSE(CompleteMatch(*backend, glm->dump(), call + call));
+
+  body["parallel_tool_calls"] = true;
+  const auto many = ToolChoiceStructuralTagSpecFor("glm47", ParseWire(body));
+  CHECK(many->at("stop_after_first") == false);
+  CHECK(CompleteMatch(*backend, many->dump(), call + call));
+}
+
+TEST_CASE("structural tags: a request's stop token ends a grammar, never matches as text") {
+  // vLLM #49227 (after the pin): the request's stop tokens reach the grammar.
+  // '|' (byte token 124) plays a model's own end-of-turn token: inside a raw
+  // GLM string value its byte would be text, so only the stop rule keeps it out.
+  const int32_t kTurnEnd = '|';
+  const auto spec = ToolChoiceStructuralTagSpecFor(
+      "glm47", WeatherRequest(ToolChoice{"required", std::nullopt}));
+  REQUIRE(spec.has_value());
+  auto backend = MakeBackend();
+  auto allowed = [&](NativeGrammar& g, int32_t t) {
+    TokenBitmask bm;
+    bm.num_seqs = 1;
+    bm.num_words = BitmaskWordsForVocab(VocabSize());
+    bm.data.assign(static_cast<std::size_t>(bm.num_words), 0);
+    g.fill_bitmask(bm, 0);
+    return (bm.data[static_cast<std::size_t>(t >> 5)] & (1 << (t & 31))) != 0;
+  };
+  auto compile = [&](const std::vector<int32_t>& stops) {
+    std::unique_ptr<StructuredOutputGrammar> g = backend->compile_grammar(
+        StructuredOutputOptions::kStructuralTag, spec->dump(), stops);
+    return std::unique_ptr<NativeGrammar>(static_cast<NativeGrammar*>(g.release()));
+  };
+  const std::string head = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Ro";
+  const std::string tail = "me</arg_value></tool_call>";
+
+  // Without it, '|' is ordinary text in the value and cannot end the call.
+  {
+    auto g = compile({});
+    REQUIRE(AcceptAll(*g, head));
+    CHECK(allowed(*g, kTurnEnd));
+    REQUIRE(AcceptAll(*g, tail));
+    CHECK_FALSE(allowed(*g, kTurnEnd));
+    CHECK(allowed(*g, kEos));
+  }
+  // With it: masked mid-call, allowed once the call is complete, and it ends it.
+  {
+    auto g = compile({kEos, kTurnEnd});
+    REQUIRE(AcceptAll(*g, head));
+    CHECK_FALSE(allowed(*g, kTurnEnd));
+    CHECK_FALSE(g->accept_tokens("r", {kTurnEnd}));
+    REQUIRE(AcceptAll(*g, tail));
+    CHECK(allowed(*g, kTurnEnd));
+    CHECK(g->accept_tokens("r", {kTurnEnd}));
+    CHECK(g->is_terminated());
+  }
+}
+
 // tests/fixtures/glm47_structural_tag_goldens.json: xgrammar 0.2.3's own
 // accept/reject decision for each candidate output under the glm_4_7 tag the
 // pin builds (scripts/gen-glm47-structural-tag-goldens.py). The native grammar

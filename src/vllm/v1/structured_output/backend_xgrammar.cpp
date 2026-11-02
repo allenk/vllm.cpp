@@ -26,7 +26,8 @@ XgrammarStructuredOutputBackend::~XgrammarStructuredOutputBackend() = default;
 
 std::unique_ptr<StructuredOutputGrammar>
 XgrammarStructuredOutputBackend::compile_grammar(
-    StructuredOutputOptions request_type, const std::string& grammar_spec) {
+    StructuredOutputOptions request_type, const std::string& grammar_spec,
+    const std::vector<int32_t>& stop_token_ids) {
   // backend_xgrammar.py:78-126. any_whitespace = not disable_any_whitespace
   // (backend_xgrammar.py:83).
   const bool any_whitespace = !disable_any_whitespace_;
@@ -37,12 +38,14 @@ XgrammarStructuredOutputBackend::compile_grammar(
       // basic_* + ws), then the native matcher over the emitted EBNF.
       const std::string ebnf =
           XgrammarJsonSchemaToEbnf(grammar_spec, any_whitespace);
-      return inner_->compile_grammar(StructuredOutputOptions::kGrammar, ebnf);
+      return inner_->compile_grammar(StructuredOutputOptions::kGrammar, ebnf,
+                                     stop_token_ids);
     }
     case StructuredOutputOptions::kJsonObject: {
       // compile_json_schema('{"type": "object"}', ...) (py:85-88).
       const std::string ebnf = XgrammarJsonObjectEbnf(any_whitespace);
-      return inner_->compile_grammar(StructuredOutputOptions::kGrammar, ebnf);
+      return inner_->compile_grammar(StructuredOutputOptions::kGrammar, ebnf,
+                                     stop_token_ids);
     }
     case StructuredOutputOptions::kGrammar:
     case StructuredOutputOptions::kRegex:
@@ -52,7 +55,7 @@ XgrammarStructuredOutputBackend::compile_grammar(
       // accepts the same EBNF/GBNF dialect + regex + structural-tag surface our
       // native paths already implement — delegate. (JSON is the W1
       // xgrammar-distinct brick; these stay on the proven native lowering.)
-      return inner_->compile_grammar(request_type, grammar_spec);
+      return inner_->compile_grammar(request_type, grammar_spec, stop_token_ids);
   }
   throw std::runtime_error("xgrammar backend: unsupported request type");
 }

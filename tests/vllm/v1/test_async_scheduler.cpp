@@ -406,7 +406,8 @@ class RejectingBackend : public StructuredOutputBackend {
  public:
   explicit RejectingBackend(int vocab) : vocab_(vocab) {}
   std::unique_ptr<StructuredOutputGrammar> compile_grammar(
-      vllm::v1::StructuredOutputOptions, const std::string&) override {
+      vllm::v1::StructuredOutputOptions, const std::string&,
+      const std::vector<int32_t>& = {}) override {
     return std::make_unique<RejectingGrammar>();
   }
   TokenBitmask allocate_token_bitmask(int max_num_seqs) override {

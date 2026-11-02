@@ -138,9 +138,16 @@ class StructuredOutputBackend {
 
   // compile_grammar (backend_types.py:106-120): compile a spec of the given
   // request_type into a per-request grammar.
+  //
+  // `stop_token_ids` are the request's (sampling_params.all_stop_token_ids).
+  // vLLM after the pin (#49227, 2026-08-10, "Mask request stop tokens in
+  // xgrammar until grammar terminates") hands them to the grammar, which masks
+  // them until it can terminate and then allows them. At the pin only the
+  // tokenizer's EOS could end a grammar, so a model whose turn ends on another
+  // stop token (GLM's <|observation|> after a call) had to keep generating.
   virtual std::unique_ptr<StructuredOutputGrammar> compile_grammar(
-      StructuredOutputOptions request_type,
-      const std::string& grammar_spec) = 0;
+      StructuredOutputOptions request_type, const std::string& grammar_spec,
+      const std::vector<int32_t>& stop_token_ids = {}) = 0;
 
   // allocate_token_bitmask (backend_types.py:122-130): allocate a zeroed
   // [max_num_seqs, ceil(vocab_size/32)] int32 bitmask (vocab_size owned by the

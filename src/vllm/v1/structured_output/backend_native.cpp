@@ -1008,12 +1008,22 @@ struct NativeGrammar::Snapshot {
 
 NativeGrammar::NativeGrammar(std::shared_ptr<const NativeBackendShared> shared,
                              std::shared_ptr<const NativeCompiledGrammar> grammar,
-                             LazyGrammarConfig lazy_config)
+                             LazyGrammarConfig lazy_config,
+                             const std::vector<int32_t>& request_stop_token_ids)
     : shared_(std::move(shared)),
       grammar_(std::move(grammar)),
       lazy_(lazy_config.lazy),
       trigger_words_(std::move(lazy_config.trigger_words)),
-      trigger_tokens_(std::move(lazy_config.trigger_tokens)) {
+      trigger_tokens_(std::move(lazy_config.trigger_tokens)),
+      stop_token_ids_(shared_->stop_token_ids) {
+  for (const int32_t id : request_stop_token_ids) {
+    if (std::find(stop_token_ids_.begin(), stop_token_ids_.end(), id) !=
+        stop_token_ids_.end()) {
+      continue;
+    }
+    stop_token_ids_.push_back(id);
+    request_only_stop_ids_.push_back(id);
+  }
   // awaiting is initialized to true for lazy grammars ONLY (llama-grammar.h:143).
   Snapshot init;
   init.state = InitState(*grammar_);
@@ -1037,7 +1047,7 @@ bool NativeGrammar::advance_snapshot(Snapshot& snap, int32_t token) const {
     auto it = shared_->token_bytes.find(t);
     return it == shared_->token_bytes.end() ? nullptr : &it->second;
   };
-  const auto& stops = shared_->stop_token_ids;
+  const auto& stops = stop_token_ids_;
   const bool is_stop =
       std::find(stops.begin(), stops.end(), token) != stops.end();
 
@@ -1255,9 +1265,17 @@ void NativeGrammar::fill_bitmask(TokenBitmask& bitmask, int batch_index) {
     }
   }
 
+  // A request's own stop tokens are in the trie and may have matched as text
+  // above; a stop token is never text (accept_tokens treats it as a stop first).
+  for (const int32_t sid : request_only_stop_ids_) {
+    if (sid < 0 || sid >= shared_->vocab_size) continue;
+    const std::size_t word = base + static_cast<std::size_t>(sid >> 5);
+    bitmask.data[word] &=
+        ~static_cast<int32_t>(1u << (static_cast<uint32_t>(sid) & 31u));
+  }
   // EOS/stop tokens are allowed iff the grammar is at an accepting state.
   if (IsAccepting(cur.state)) {
-    for (const int32_t sid : shared_->stop_token_ids) set_bit(sid);
+    for (const int32_t sid : stop_token_ids_) set_bit(sid);
   }
 }
 
@@ -1291,6 +1309,10 @@ std::optional<int32_t> NativeGrammar::forced_token() {
     const TrieNode& node = trie.nodes[static_cast<size_t>(frame.node)];
     for (const int32_t tid : node.token_ids) {
       if (tid < 0 || tid >= shared_->vocab_size) continue;
+      if (std::find(request_only_stop_ids_.begin(), request_only_stop_ids_.end(),
+                    tid) != request_only_stop_ids_.end()) {
+        continue;  // a stop token, never text (see fill_bitmask)
+      }
       if (found.has_value()) return std::nullopt;  // >= 2 valid tokens.
       found = tid;
     }
@@ -1379,7 +1401,8 @@ int NativeStructuredOutputBackend::vocab_size() const {
 
 std::unique_ptr<StructuredOutputGrammar>
 NativeStructuredOutputBackend::compile_grammar(
-    StructuredOutputOptions request_type, const std::string& grammar_spec) {
+    StructuredOutputOptions request_type, const std::string& grammar_spec,
+    const std::vector<int32_t>& stop_token_ids) {
   std::string gbnf;
   switch (request_type) {
     case StructuredOutputOptions::kGrammar:
@@ -1486,7 +1509,8 @@ NativeStructuredOutputBackend::compile_grammar(
             triggers.push_back(tr.get<std::string>());
           }
         }
-        return compile_lazy_grammar(st_gbnf, std::move(triggers), {});
+        return compile_lazy_grammar(st_gbnf, std::move(triggers), {},
+                                    stop_token_ids);
       }
       // A non-lazy (required / named) structural tag is FORCED from token 0:
       // compile it like a normal GBNF grammar (fall through).
@@ -1496,13 +1520,15 @@ NativeStructuredOutputBackend::compile_grammar(
   }
   auto compiled = std::make_shared<NativeCompiledGrammar>(
       GbnfParser(gbnf).Parse());
-  return std::make_unique<NativeGrammar>(shared_, std::move(compiled));
+  return std::make_unique<NativeGrammar>(shared_, std::move(compiled),
+                                         LazyGrammarConfig{}, stop_token_ids);
 }
 
 std::unique_ptr<StructuredOutputGrammar>
 NativeStructuredOutputBackend::compile_lazy_grammar(
     const std::string& gbnf, std::vector<std::string> trigger_words,
-    std::vector<int32_t> trigger_tokens) {
+    std::vector<int32_t> trigger_tokens,
+    const std::vector<int32_t>& request_stop_token_ids) {
   if (trigger_words.empty() && trigger_tokens.empty()) {
     throw std::runtime_error(
         "native backend: a lazy grammar needs at least one trigger word or "
@@ -1515,7 +1541,7 @@ NativeStructuredOutputBackend::compile_lazy_grammar(
   cfg.trigger_words = std::move(trigger_words);
   cfg.trigger_tokens = std::move(trigger_tokens);
   return std::make_unique<NativeGrammar>(shared_, std::move(compiled),
-                                         std::move(cfg));
+                                         std::move(cfg), request_stop_token_ids);
 }
 
 TokenBitmask NativeStructuredOutputBackend::allocate_token_bitmask(

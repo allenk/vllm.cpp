@@ -340,11 +340,18 @@ std::optional<nlohmann::json> ToolChoiceStructuralTagSpecFor(
     return spec;
   }
 
+  // parallel_tool_calls=false: one call and no more. vLLM's
+  // limit_to_single_tool_call sets stop_after_first on every tool-call list of
+  // the tag (#50502, after the pin); without it a `required` grammar keeps
+  // offering another call.
+  const bool single_call =
+      request.parallel_tool_calls.has_value() && !*request.parallel_tool_calls;
+
   // required: any listed tool, at_least_one, forced from token 0
   // (structural_tag_registry.py:262-267 - one-or-more, no stop_after_first).
   if (mode == "required") {
     spec["lazy"] = false;
-    spec["stop_after_first"] = false;
+    spec["stop_after_first"] = single_call;
     spec["tags"] = family.build_tags(tools);
     return spec;
   }
@@ -356,7 +363,7 @@ std::optional<nlohmann::json> ToolChoiceStructuralTagSpecFor(
   if (family.auto_needs_strict && !AnyToolStrict(tools)) return std::nullopt;
   spec["lazy"] = true;
   spec["triggers"] = nlohmann::json::array({family.trigger});
-  spec["stop_after_first"] = false;
+  spec["stop_after_first"] = single_call;
   spec["tags"] = family.build_tags(tools);
   return spec;
 }

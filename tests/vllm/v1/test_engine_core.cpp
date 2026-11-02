@@ -198,7 +198,8 @@ class MockGrammar : public StructuredOutputGrammar {
 class MockBackend : public StructuredOutputBackend {
  public:
   std::unique_ptr<StructuredOutputGrammar> compile_grammar(
-      StructuredOutputOptions, const std::string&) override {
+      StructuredOutputOptions, const std::string&,
+      const std::vector<int32_t>& = {}) override {
     return std::make_unique<MockGrammar>();
   }
   TokenBitmask allocate_token_bitmask(int max_num_seqs) override {

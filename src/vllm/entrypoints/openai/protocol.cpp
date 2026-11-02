@@ -607,8 +607,9 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
   ParseToolChoice(j, r.tool_choice);
   // include_reasoning (chat_completion/protocol.py:242, default True).
   GetOr(j, "include_reasoning", r.include_reasoning);
-  // DEFERRED: parallel_tool_calls, legacy functions / function_call — parsed and
-  // ignored (nlohmann skips unknown keys; no field mapped here at T0).
+  GetOpt(j, "parallel_tool_calls", r.parallel_tool_calls);
+  // DEFERRED: legacy functions / function_call — parsed and ignored (nlohmann
+  // skips unknown keys; no field mapped here at T0).
 }
 
 // ---------------------------------------------------------------------------
