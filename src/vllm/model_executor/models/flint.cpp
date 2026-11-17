@@ -31,6 +31,7 @@
 
 #include "vllm/model_executor/models/flint.h"
 #include "vllm/model_executor/models/flint_gguf_weights.h"  // the GGUF arm
+#include "vt/unaligned.h"
 
 #include <algorithm>
 #include <cmath>
@@ -254,6 +255,10 @@ uint16_t ToBf16(float f) {
   return static_cast<uint16_t>(u >> 16);
 }
 
+// The pointer can sit at an odd address: a borrowed view (a GGUF mmap span,
+// or the bf16 expansion a tied lm_head shares with token_embd) carries no
+// 2-byte alignment guarantee. Every element read through it goes through
+// vt::LoadUnaligned<uint16_t>, never a direct uint16_t dereference.
 const uint16_t* Bf16Data(const OwnedTensor& t) {
   return reinterpret_cast<const uint16_t*>(t.bytes.data());
 }
@@ -271,7 +276,8 @@ void MatmulBf16(const float* x, const OwnedTensor& w, int64_t t, float* y) {
       if (xv == 0.0f) continue;
       const uint16_t* wrow = wd + k * n_dim;
       for (int64_t n = 0; n < n_dim; ++n)
-        y[i * n_dim + n] += xv * Bf16(wrow[n]);
+        y[i * n_dim + n] +=
+            xv * Bf16(vt::LoadUnaligned<uint16_t>(wrow + n));
     }
   }
   for (int64_t i = 0; i < t * n_dim; ++i) y[i] = Bf16(ToBf16(y[i]));
@@ -288,7 +294,9 @@ void RmsNormBf16(const float* x, const OwnedTensor& w, int64_t rows,
     const float inv = static_cast<float>(
         1.0 / std::sqrt(ss / double(dim) + eps));
     for (int64_t d = 0; d < dim; ++d)
-      y[i * dim + d] = Bf16(ToBf16(x[i * dim + d] * inv * Bf16(wd[d])));
+      y[i * dim + d] =
+          Bf16(ToBf16(x[i * dim + d] * inv *
+                      Bf16(vt::LoadUnaligned<uint16_t>(wd + d))));
   }
 }
 
@@ -357,8 +365,10 @@ std::vector<float> FlintModel::Forward(const std::vector<int32_t>& token_ids,
       // CONVERT, do not memcpy: the source is bf16 bits and the destination
       // is f32. A raw copy drops each bf16 into the low half of a zero-high
       // float — a ~1e-42 denormal (ISSUE-LOCAL-01M5QBGBM3Z7NT3D9TA0K1HT7T).
+      // LoadUnaligned: the borrowed block payload need not be 2-byte aligned.
       for (int64_t d = 0; d < h; ++d)
-        x[static_cast<size_t>(i) * h + d] = Bf16(emb[tok * h + d]);
+        x[static_cast<size_t>(i) * h + d] = Bf16(vt::LoadUnaligned<uint16_t>(
+            emb + static_cast<size_t>(tok) * h + d));
     }
   }
 
@@ -391,7 +401,8 @@ std::vector<float> FlintModel::Forward(const std::vector<int32_t>& token_ids,
           for (int64_t d = 0; d < dh; ++d) ss += double(head[d]) * head[d];
           const float inv =
               static_cast<float>(1.0 / std::sqrt(ss / double(dh) + p.rms_norm_eps));
-          for (int64_t d = 0; d < dh; ++d) head[d] *= inv * Bf16(nw[d]);
+          for (int64_t d = 0; d < dh; ++d)
+            head[d] *= inv * Bf16(vt::LoadUnaligned<uint16_t>(nw + d));
         }
       };
       head_norm(q.data(), t * hq, qw);
@@ -433,7 +444,7 @@ std::vector<float> FlintModel::Forward(const std::vector<int32_t>& token_ids,
             s[static_cast<size_t>(j - first)] = dot * scale;
             m = std::max(m, s[static_cast<size_t>(j - first)]);
           }
-          const float sink = Bf16(sinks[hh]);
+          const float sink = Bf16(vt::LoadUnaligned<uint16_t>(sinks + hh));
           double denom = std::exp(static_cast<double>(sink - m));
           for (float sv : s) denom += std::exp(static_cast<double>(sv - m));
           float* out = &attn_out[(i * hq + hh) * dh];
@@ -490,7 +501,8 @@ std::vector<float> FlintModel::Forward(const std::vector<int32_t>& token_ids,
             const float xv = normed[static_cast<size_t>(i) * h + kk];
             const uint16_t* rrow = rd + kk * e;
             for (int64_t n = 0; n < e; ++n)
-              logits[static_cast<size_t>(i) * e + n] += xv * Bf16(rrow[n]);
+              logits[static_cast<size_t>(i) * e + n] +=
+                  xv * Bf16(vt::LoadUnaligned<uint16_t>(rrow + n));
           }
         }
       }
@@ -502,9 +514,16 @@ std::vector<float> FlintModel::Forward(const std::vector<int32_t>& token_ids,
           score[static_cast<size_t>(n)] = {
               1.0f / (1.0f + std::exp(-lg)), n};
         }
+        // Score descending, and on an exact f32 tie the lower expert index
+        // first. With a score-only comparator partial_sort leaves equal
+        // elements in an unspecified order, so on a tie the selected expert
+        // set depended on the standard library. The CUDA router
+        // (SigmoidTopKKernel in cuda_flint.cu) already keeps the lower index
+        // on a tie; this gives the reference the same tie rule.
         std::partial_sort(score.begin(), score.begin() + top_k, score.end(),
                           [](const auto& a, const auto& b) {
-                            return a.first > b.first;
+                            return a.first != b.first ? a.first > b.first
+                                                      : a.second < b.second;
                           });
         double sum = 0.0;
         for (int64_t kk = 0; kk < top_k; ++kk) sum += score[static_cast<size_t>(kk)].first;
@@ -563,7 +582,8 @@ std::vector<float> FlintModel::Forward(const std::vector<int32_t>& token_ids,
         const float xv = normed[static_cast<size_t>(i) * h + kk];
         const uint16_t* lrow = ld + kk * vocab;
         for (int64_t n = 0; n < vocab; ++n)
-          logits[static_cast<size_t>(i) * vocab + n] += xv * Bf16(lrow[n]);
+          logits[static_cast<size_t>(i) * vocab + n] +=
+              xv * Bf16(vt::LoadUnaligned<uint16_t>(lrow + n));
       }
     }
   }

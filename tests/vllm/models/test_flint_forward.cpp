@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -616,4 +617,149 @@ TEST_CASE("flint: the embedding lookup widens bf16 bits, it does not memcpy "
       expect += normed[k] * widen(lm[k * p.vocab_size + n]);
     CHECK(got[static_cast<size_t>(n)] == expect);
   }
+}
+
+namespace {
+
+// Moves a tensor's bytes into a borrowed view that starts at an ODD byte
+// offset of its backing buffer: the alignment a GGUF mmap span, or a bf16
+// expansion shared by a tied lm_head, is allowed to have.
+void BorrowAtOddOffset(OwnedTensor& t) {
+  const size_t n = t.bytes.size();
+  if (n == 0) return;
+  auto backing = std::make_shared<std::vector<uint8_t>>(n + 1u, uint8_t{0});
+  std::memcpy(backing->data() + 1, t.bytes.data(), n);
+  t.bytes = vllm::OwnedBytes::Borrow(backing->data() + 1, n, backing);
+}
+
+void BorrowAtOddOffset(vllm::FlintMlpWeights& m) {
+  BorrowAtOddOffset(m.gate_proj.w);
+  BorrowAtOddOffset(m.up_proj.w);
+  BorrowAtOddOffset(m.down_proj.w);
+}
+
+uint16_t Bf16Bits(float v) {
+  uint32_t u;
+  std::memcpy(&u, &v, 4);
+  u += 0x7fff + ((u >> 16) & 1);
+  return static_cast<uint16_t>(u >> 16);
+}
+
+}  // namespace
+
+TEST_CASE("flint: borrowed bf16 weights at odd addresses give the same "
+          "logits") {
+  // Every bf16 tensor the forward reads (embedding, norms, sinks, router,
+  // every projection, lm_head) is moved to an odd address. The forward must
+  // read them without a misaligned uint16_t load (a sanitizer build reports
+  // one at the first such site) and produce the aligned run's logits bit for
+  // bit.
+  const FlintParams p = TinyParams();
+  const FlintWeights aligned = TinyWeights(p);
+  FlintWeights odd = TinyWeights(p);
+  BorrowAtOddOffset(odd.embed_tokens);
+  BorrowAtOddOffset(odd.final_norm);
+  BorrowAtOddOffset(odd.lm_head);
+  for (vllm::FlintLayerWeights& l : odd.layers) {
+    BorrowAtOddOffset(l.input_layernorm);
+    BorrowAtOddOffset(l.post_attention_layernorm);
+    BorrowAtOddOffset(l.attn.q_proj.w);
+    BorrowAtOddOffset(l.attn.k_proj.w);
+    BorrowAtOddOffset(l.attn.v_proj.w);
+    BorrowAtOddOffset(l.attn.o_proj.w);
+    BorrowAtOddOffset(l.attn.q_norm);
+    BorrowAtOddOffset(l.attn.k_norm);
+    BorrowAtOddOffset(l.attn.sinks);
+    BorrowAtOddOffset(l.dense_mlp);
+    BorrowAtOddOffset(l.moe.router_gate);
+    for (vllm::FlintExpertWeights& x : l.moe.experts) {
+      BorrowAtOddOffset(x.gate_proj.w);
+      BorrowAtOddOffset(x.up_proj.w);
+      BorrowAtOddOffset(x.down_proj.w);
+    }
+    BorrowAtOddOffset(l.moe.shared_expert);
+  }
+  REQUIRE(reinterpret_cast<uintptr_t>(odd.lm_head.bytes.data()) % 2 == 1);
+
+  const HfConfig c = TinyConfig();
+  const std::vector<int32_t> tokens{3, 1, 4, 1, 5};
+  const std::vector<int32_t> positions{0, 1, 2, 3, 4};
+  const std::vector<float> want =
+      vllm::FlintModel::Forward(tokens, positions, aligned, c);
+  const std::vector<float> got =
+      vllm::FlintModel::Forward(tokens, positions, odd, c);
+  REQUIRE(got.size() == want.size());
+  for (size_t i = 0; i < got.size(); ++i) CHECK(got[i] == want[i]);
+}
+
+TEST_CASE("flint: an exact router tie goes to the lower expert index") {
+  // One MoE layer whose attention adds nothing (o_proj = 0), so the router
+  // input is the RMS-normed embedding: 1.0 in every lane. Five experts, top
+  // 3. Router columns 0, 1 and 2 are 0.25 and columns 3 and 4 are 0.5, so
+  // experts 3 and 4 score highest and experts 0, 1, 2 tie exactly below
+  // them. The lower index of the tie must take the third slot: the selection
+  // is {3, 4, 0}, the rule the CUDA router (SigmoidTopKKernel) applies.
+  // A score-only partial_sort keeps expert 1 here with both libstdc++ and
+  // the MSVC STL: its heap holds {0, 1, 2}, and the two later, higher
+  // scores evict expert 2 and then expert 0.
+  FlintParams p = TinyParams();
+  p.num_hidden_layers = 1;
+  p.layer_types = {"sliding_attention"};
+  p.no_rope_layer_indices = {};
+  p.mlp_only_layers = {};
+  p.num_experts = 5;
+  p.num_experts_per_tok = 3;
+
+  auto build = [&](uint32_t seed0, uint32_t seed1, uint32_t seed2,
+                   uint32_t seed3, uint32_t seed4) {
+    FlintWeights w = TinyWeights(p);
+    w.layers.clear();
+    w.embed_tokens = MakeBf16Const({p.vocab_size, p.hidden_size}, 0.5f);
+    vllm::FlintLayerWeights l;
+    l.input_layernorm = MakeBf16Const({p.hidden_size}, 1.0f);
+    l.post_attention_layernorm = MakeBf16Const({p.hidden_size}, 1.0f);
+    l.attn.q_proj = MakeLinear({p.hidden_size, 8}, 11);
+    l.attn.k_proj = MakeLinear({p.hidden_size, 4}, 12);
+    l.attn.v_proj = MakeLinear({p.hidden_size, 4}, 13);
+    l.attn.o_proj.w = Zeros({8, p.hidden_size});
+    l.attn.q_norm = MakeBf16Const({p.head_dim}, 1.0f);
+    l.attn.k_norm = MakeBf16Const({p.head_dim}, 1.0f);
+    l.attn.sinks = MakeBf16Const({p.num_attention_heads}, 0.0f);
+    l.moe.router_gate = Zeros({p.hidden_size, p.num_experts});
+    {
+      auto* r = reinterpret_cast<uint16_t*>(l.moe.router_gate.bytes.data());
+      for (int64_t k = 0; k < p.hidden_size; ++k)
+        for (int64_t e = 0; e < p.num_experts; ++e)
+          r[k * p.num_experts + e] = Bf16Bits(e >= 3 ? 0.5f : 0.25f);
+    }
+    // Large expert weights, so the routed output dominates the 0.5 residual:
+    // at the default 0.2 scale an expert's share is ~0.01 and the bf16
+    // rounding of x + ff can swallow which expert produced it.
+    for (const uint32_t s : {seed0, seed1, seed2, seed3, seed4}) {
+      vllm::FlintExpertWeights x;
+      x.gate_proj.w = MakeBf16({p.hidden_size, p.moe_intermediate_size}, s, 2.0f);
+      x.up_proj.w = MakeBf16({p.hidden_size, p.moe_intermediate_size}, s + 1, 2.0f);
+      x.down_proj.w = MakeBf16({p.moe_intermediate_size, p.hidden_size}, s + 2, 2.0f);
+      l.moe.experts.push_back(std::move(x));
+    }
+    l.moe.shared_expert.gate_proj.w = Zeros({p.hidden_size, 8});
+    l.moe.shared_expert.up_proj.w = Zeros({p.hidden_size, 8});
+    l.moe.shared_expert.down_proj.w = Zeros({8, p.hidden_size});
+    w.layers.push_back(std::move(l));
+    w.params = p;
+    return w;
+  };
+
+  const HfConfig c = TinyConfig();
+  auto run = [&](const FlintWeights& w) {
+    return vllm::FlintModel::Forward({1}, {0}, w, c);
+  };
+  const std::vector<float> base = run(build(100, 200, 300, 400, 500));
+  // Experts 1 and 2 lose the tie: replacing them changes nothing.
+  CHECK(run(build(100, 210, 310, 400, 500)) == base);
+  // Experts 0, 3 and 4 are the selection: replacing any of them moves the
+  // logits.
+  CHECK(run(build(110, 200, 300, 400, 500)) != base);
+  CHECK(run(build(100, 200, 300, 410, 500)) != base);
+  CHECK(run(build(100, 200, 300, 400, 510)) != base);
 }
