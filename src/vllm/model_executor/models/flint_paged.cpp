@@ -279,6 +279,9 @@ DBuf Attention(Dev d, const FlintPagedLayer& lw, const FlintParams& p, const HfC
                                         DType::kBF16);
 }
 
+// The shared expert and its aux stream serve only the Marlin MoE block below; a
+// build without Marlin refuses the MoE and would leave them unused.
+#ifdef VT_MARLIN_NVFP4
 // The ungated shared expert (vLLM's merged gate_up_proj, then down_proj).
 DBuf SharedExpert(Dev d, const FlintPagedMoe& m, const Tensor& x) {
   DBuf act = GateUpAct(d, x, m.shared_gate, m.shared_up);
@@ -318,6 +321,7 @@ FlintAuxStream* SharedExpertAuxStream(Dev d, int64_t T) {
   }
   return &it->second;
 }
+#endif  // VT_MARLIN_NVFP4
 
 // One MoE block: bf16 router logits -> sigmoid top-6 renormalised in f32 (the
 // kFlint kernel, or the grouped router with a single group, which is plain
