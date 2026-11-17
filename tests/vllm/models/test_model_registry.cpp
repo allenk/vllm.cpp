@@ -78,7 +78,9 @@ TEST_CASE("registry_imports: every registered architecture has a complete factor
   // model (is_pooling_model=true) like `LlamaModel`, not a text-generation arch.
   // 46 -> 47 on MODEL-CUA-S1-FORMS: `CuaS1Forms`, a byte-level TinyTransformer
   // scorer ported from the `trycua/cua` reference. Also a POOLING model.
-  REQUIRE(registrations.size() == 47);
+  // 47 -> 48 on the Flint port: `FlintForCausalLM`, registered from its own
+  // additive TU (flint.cpp) with no shared-array edit.
+  REQUIRE(registrations.size() == 48);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -183,7 +185,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // with the kExampleConfigArchitectures ledger; adding a model appends its two
   // entries here.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 47);
+  REQUIRE(supported.size() == 48);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
   // The full byte-order sequence. Note "MiniCPM3" < "MiniCPMF" and "Phi3" <
   // "PhiF" ('3' 0x33 < 'F' 0x46); "OPT" < "Olmo" ('P' 0x50 < 'l' 0x6C); and among
@@ -205,6 +207,8 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
       "DeepseekV41ForCausalLM",
       "DeepseekV4ForCausalLM",
       "Dots3NoteForCausalLM",
+      // 'F' 0x46 < 'G' 0x47: FlintForCausalLM sorts before the Gemmas.
+      "FlintForCausalLM",
       "Gemma2ForCausalLM",
       "Gemma3ForCausalLM",
       "Gemma4ForConditionalGeneration",
@@ -709,7 +713,7 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 47> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 48> kExampleConfigArchitectures{
       "BoundaryExtractor",
       "CohereForCausalLM",
       "CuaS1Forms",
@@ -720,6 +724,8 @@ TEST_CASE("hf_registry_coverage: every registration has an example config fixtur
       "DeepseekV41ForCausalLM",
       "DeepseekV4ForCausalLM",
       "Dots3NoteForCausalLM",
+      // 'F' 0x46 < 'G' 0x47: FlintForCausalLM sorts before the Gemmas.
+      "FlintForCausalLM",
       "Gemma2ForCausalLM",
       "Gemma3ForCausalLM",
       "Gemma4ForConditionalGeneration",
@@ -832,7 +838,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "Supported architectures: "
       "dict_keys(['BoundaryExtractor', 'CohereForCausalLM', 'CuaS1Forms', 'DeepseekV2ForCausalLM', "
       "'DeepseekV41ForCausalLM', "
-      "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
+      "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'FlintForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', "
       "'Glm5NextForConditionalGeneration', 'GlmMoeDsaForCausalLM', 'GraniteForCausalLM', "
@@ -858,7 +864,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "Supported architectures: "
       "dict_keys(['BoundaryExtractor', 'CohereForCausalLM', 'CuaS1Forms', 'DeepseekV2ForCausalLM', "
       "'DeepseekV41ForCausalLM', "
-      "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
+      "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'FlintForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', "
       "'Glm5NextForConditionalGeneration', 'GlmMoeDsaForCausalLM', 'GraniteForCausalLM', "
