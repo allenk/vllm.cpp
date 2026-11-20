@@ -31,7 +31,7 @@ bool HasFlintKernels() {
   } catch (const std::runtime_error&) {
     return false;
   }
-  return vllm::flint::FlintDeviceKernelsAvailable();
+  return vllm::flint::FlintDeviceKernelsAvailable(DeviceType::kCUDA);
 }
 
 float Bf16ToF32(uint16_t b) {
@@ -123,7 +123,7 @@ TEST_CASE("flint qk_norm_rope_kv_cache matches the host model of vLLM's kernel")
           dslots(b, q, slots.data(), slots.size() * 8), dcache(b, q, cache.data(), cache.size() * 2),
           dq(b, q, nullptr, static_cast<size_t>(T * Hq * D) * 2);
       auto* kc = static_cast<uint16_t*>(dcache.p);
-      vllm::flint::FlintDevice()->qk_norm_rope_kv_cache(
+      vllm::flint::FlintDevice(vt::DeviceType::kCUDA)->qk_norm_rope_kv_cache(
           q, dq.p, dqkv.p, rows * D, dqw.p, dkw.p, rope ? static_cast<const float*>(dcs.p) : nullptr,
           kc, kc + within, sb, ss, sh, block_size, static_cast<const int64_t*>(dslots.p), T, Hq, Hkv,
           D, eps);
@@ -219,7 +219,7 @@ TEST_CASE("flint sigmoid_topk picks the top-k sigmoid scores and renormalises th
     {
       Buf dl(b, q, logits.data(), logits.size() * 2), dw(b, q, nullptr, static_cast<size_t>(T * K) * 4),
           di(b, q, nullptr, static_cast<size_t>(T * K) * 4);
-      vllm::flint::FlintDevice()->sigmoid_topk(q, static_cast<float*>(dw.p), static_cast<int32_t*>(di.p),
+      vllm::flint::FlintDevice(vt::DeviceType::kCUDA)->sigmoid_topk(q, static_cast<float*>(dw.p), static_cast<int32_t*>(di.p),
                                                dl.p, T, E, K);
       std::vector<float> w(static_cast<size_t>(T * K));
       std::vector<int32_t> ids(static_cast<size_t>(T * K));
@@ -284,7 +284,7 @@ TEST_CASE("flint add_rms_norm matches the host model of vLLM's fused add + RMSNo
             Buf dx(b, q, x.data(), n * 2), dr(b, q, res.data(), n * 2), dw(b, q, w.data(), w.size() * 2),
                 dout(b, q, nullptr, n * 2);
             void* out = in_place ? dx.p : dout.p;
-            vllm::flint::FlintDevice()->add_rms_norm(q, out, dx.p, with_res ? dr.p : nullptr, dw.p, R, H,
+            vllm::flint::FlintDevice(vt::DeviceType::kCUDA)->add_rms_norm(q, out, dx.p, with_res ? dr.p : nullptr, dw.p, R, H,
                                                      eps);
             std::vector<uint16_t> got(n), got_res(n);
             b.Copy(q, got.data(), out, n * 2);
@@ -354,9 +354,9 @@ TEST_CASE("flint rms_norm_store_residual is add_rms_norm over a zeroed residual"
     Buf dx(b, q, x.data(), n * 2), dw(b, q, w.data(), w.size() * 2);
     Buf dres_store(b, q, junk.data(), n * 2), dres_add(b, q, zeros.data(), n * 2);
     Buf dout_store(b, q, nullptr, n * 2), dout_add(b, q, nullptr, n * 2);
-    vllm::flint::FlintDevice()->rms_norm_store_residual(q, dout_store.p, dx.p, dres_store.p, dw.p,
+    vllm::flint::FlintDevice(vt::DeviceType::kCUDA)->rms_norm_store_residual(q, dout_store.p, dx.p, dres_store.p, dw.p,
                                                         R, H, eps);
-    vllm::flint::FlintDevice()->add_rms_norm(q, dout_add.p, dx.p, dres_add.p, dw.p, R, H, eps);
+    vllm::flint::FlintDevice(vt::DeviceType::kCUDA)->add_rms_norm(q, dout_add.p, dx.p, dres_add.p, dw.p, R, H, eps);
     std::vector<uint16_t> out_store(n), out_add(n), res_store(n);
     b.Copy(q, out_store.data(), dout_store.p, n * 2);
     b.Copy(q, out_add.data(), dout_add.p, n * 2);
@@ -384,7 +384,7 @@ TEST_CASE("flint routed_silu_and_mul rounds the SiLU to bf16 before the product"
   vt::Queue q = b.CreateQueue();
   {
     Buf dgu(b, q, gu.data(), gu.size() * 2), dout(b, q, nullptr, static_cast<size_t>(rows * d) * 2);
-    vllm::flint::FlintDevice()->routed_silu_and_mul(q, dout.p, dgu.p, rows, d);
+    vllm::flint::FlintDevice(vt::DeviceType::kCUDA)->routed_silu_and_mul(q, dout.p, dgu.p, rows, d);
     std::vector<uint16_t> got(static_cast<size_t>(rows * d));
     b.Copy(q, got.data(), dout.p, got.size() * 2);
     b.Synchronize(q);
@@ -448,7 +448,7 @@ TEST_CASE("flint decode_prologue copies the step block and gathers the embedding
   vt::Queue q = b.CreateQueue();
   const FlintStepLayout l = vllm::flint::MakeFlintStepLayout(rows, cols);
   void* block = b.AllocPinned(l.bytes);
-  void* block_dev = vllm::flint::FlintDevice()->device_alias(block);
+  void* block_dev = vllm::flint::FlintDevice(vt::DeviceType::kCUDA)->device_alias(block);
   REQUIRE(block_dev != nullptr);
   {
     auto* base = static_cast<char*>(block);
@@ -465,7 +465,7 @@ TEST_CASE("flint decode_prologue copies the step block and gathers the embedding
     Buf dbt(b, q, nullptr, bt.size() * 4), dhid(b, q, nullptr, static_cast<size_t>(rows * hidden) * 2);
     auto* hdr = static_cast<FlintStepHeader*>(block);
     const auto run = [&] {
-      vllm::flint::FlintDevice()->decode_prologue(
+      vllm::flint::FlintDevice(vt::DeviceType::kCUDA)->decode_prologue(
           q, block_dev, static_cast<int32_t*>(dpos.p), static_cast<int64_t*>(dslots.p),
           static_cast<int32_t*>(dbt.p), static_cast<int32_t*>(dseq.p),
           static_cast<int32_t*>(dqsl.p), dhid.p, dembed.p, rows, cols, hidden, vocab);

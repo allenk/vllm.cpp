@@ -940,7 +940,7 @@ enum class OpId : uint8_t {
   kTopKTopPSample,
   // Flint (RecursiveSI) CUDA glue table: the small fused kernels vLLM runs for
   // this model on SM120 (vllm/models/flint/ops), registered by cuda_flint.cu and
-  // resolved through flint::FlintDevice() (flint_device.h), the kLaguna pattern.
+  // resolved through flint::FlintDevice(device) (flint_device.h), the kLaguna pattern.
   // Appended before kCount so no existing op's id shifts.
   kFlint,
   kCount

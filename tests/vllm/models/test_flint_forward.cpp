@@ -486,8 +486,9 @@ TEST_CASE("flint: the sigmoid router renormalises the top-k weights") {
 
 TEST_CASE("flint: attn_out is sized for the head layout, not the hidden "
           "stream") {
-  // Regression for ISSUE-LOCAL-01M5Q1PS772CPTMYJ02AMVZ3Y0. The wave-1
-  // synthetic config had hq*dh < h, so sizing attn_out t*h went unnoticed.
+  // Regression for attn_out sized t*h, which overflowed the heap on the
+  // published container (hq*dh = 4096 > h = 2048). The wave-1 synthetic
+  // config had hq*dh < h, so it went unnoticed.
   // Here hq*dh = 16 > h = 4: every token writes 16 head values, and a t*h
   // buffer (8 floats for t=2) cannot hold them — token 0's heads 1..3 land
   // past their slots and the o_proj read consumes heap garbage.
@@ -530,7 +531,7 @@ TEST_CASE("flint: attn_out is sized for the head layout, not the hidden "
 
 TEST_CASE("flint: the embedding lookup widens bf16 bits, it does not memcpy "
           "them") {
-  // Regression for ISSUE-LOCAL-01M5QBGBM3Z7NT3D9TA0K1HT7T. The embedding
+  // Regression for the embedding lookup that memcpy'd. The embedding
   // row is bf16 bits; reading them as raw u16 into the f32 stream drops
   // each value into the LOW half of the word (~1e-41 denormals). The
   // epsilon-dominated RMSNorm then rescales the wrong pattern instead of

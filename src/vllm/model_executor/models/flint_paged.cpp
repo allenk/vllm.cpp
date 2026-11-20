@@ -43,6 +43,7 @@
 #include "vt/breakable_graph.h"
 #include "vt/ops.h"
 #include "vt/persistent_step_input.h"
+// DSR-ALLOW(MODEL-TEXT-FLINT): TYPES, not behaviour -- vt/cuda/marlin_repack.h is built only under VT_MARLIN_NVFP4, so this include cannot be resolved by a runtime query (the nemotron_h_device.cpp A2-Q2a shape).
 #ifdef VT_MARLIN_NVFP4
 #include "vt/cuda/marlin_repack.h"
 #endif
@@ -80,6 +81,7 @@ R& ResidentIn(const ResidentSlot& slot) {
   return *static_cast<R*>(slot.state.get());
 }
 
+// DSR-ALLOW(MODEL-TEXT-FLINT): the Marlin repack of the routed experts calls marlin_repack.h primitives, built only under VT_MARLIN_NVFP4; the runtime question, OpRegistered(kMoeGroupedGemmNvfp4Marlin, device), is asked in PrepareFlintPaged.
 #ifdef VT_MARLIN_NVFP4
 // Repacks every routed expert of one layer from its HOST bytes through one
 // reused staging pair, then releases those host bytes: after this the arena is
@@ -183,6 +185,7 @@ void BuildFlintMoeMarlin(Dev d, const FlintPagedMoe& m, int64_t hidden, int64_t 
 // silu(x @ gate^T) * (x @ up^T): one fused Marlin gate|up GEMM when the pair can
 // share an operand (vLLM's merged gate_up_proj), else two W4A16 GEMMs.
 DBuf GateUpAct(Dev d, const Tensor& x, const Nvfp4Weight& gate, const Nvfp4Weight& up) {
+  // DSR-ALLOW(MODEL-TEXT-FLINT): dense_nvfp4::GateUpFusedMarlinD is declared only under VT_MARLIN_NVFP4 (dense_nvfp4_gemm.h); MarlinW4A16Selects is the runtime question inside.
 #ifdef VT_MARLIN_NVFP4
   if (dense_nvfp4::MarlinW4A16Selects(d, x.dtype) && dense_nvfp4::GateUpFusedEligible(gate, up))
     return dense_nvfp4::GateUpFusedMarlinD(d, x, gate, up);
@@ -207,9 +210,8 @@ const flint::FlintDeviceKernels* FusedKernels(Dev d) {
     const char* e = std::getenv("VT_FLINT_FUSED");
     return !(e != nullptr && e[0] == '0');
   }();
-  if (!on || d.q.device.type != vt::DeviceType::kCUDA || !flint::FlintDeviceKernelsAvailable())
-    return nullptr;
-  return flint::FlintDevice();
+  if (!on || !flint::FlintDeviceKernelsAvailable(d.q.device.type)) return nullptr;
+  return flint::FlintDevice(d.q.device.type);
 }
 
 // The decode graph's prologue (flint_device.h decode_prologue), or nullptr. It
@@ -220,9 +222,8 @@ const flint::FlintDeviceKernels* PrologueKernels(Dev d) {
     const char* e = std::getenv("VT_FLINT_GRAPH_PROLOGUE");
     return !(e != nullptr && e[0] == '0');
   }();
-  if (!on || d.q.device.type != vt::DeviceType::kCUDA || !flint::FlintDeviceKernelsAvailable())
-    return nullptr;
-  return flint::FlintDevice();
+  if (!on || !flint::FlintDeviceKernelsAvailable(d.q.device.type)) return nullptr;
+  return flint::FlintDevice(d.q.device.type);
 }
 
 // One attention block. With the glue kernels it is vLLM's FlintAttention on SM120:
@@ -281,6 +282,7 @@ DBuf Attention(Dev d, const FlintPagedLayer& lw, const FlintParams& p, const HfC
 
 // The shared expert and its aux stream serve only the Marlin MoE block below; a
 // build without Marlin refuses the MoE and would leave them unused.
+// DSR-ALLOW(MODEL-TEXT-FLINT): the shared expert and its aux stream serve only the Marlin MoE block below and would be unused functions without it.
 #ifdef VT_MARLIN_NVFP4
 // The ungated shared expert (vLLM's merged gate_up_proj, then down_proj).
 DBuf SharedExpert(Dev d, const FlintPagedMoe& m, const Tensor& x) {
@@ -335,6 +337,7 @@ FlintAuxStream* SharedExpertAuxStream(Dev d, int64_t T) {
 // on an out_dtype Flint does not set, so it falls to F.linear in the model dtype.
 DBuf MoeBlock(Dev d, const FlintPagedMoe& m, const FlintParams& p, const Tensor& x, int64_t T,
               const flint::FlintDeviceKernels* fk) {
+  // DSR-ALLOW(MODEL-TEXT-FLINT): the Marlin MoE forward reads the FlintMoeMarlin arena built above under the same gate; a build without Marlin refuses the MoE by name.
 #ifdef VT_MARLIN_NVFP4
   const int64_t H = p.hidden_size, E = p.num_experts, Kk = p.num_experts_per_tok;
   const int64_t I = p.moe_intermediate_size, P = T * Kk;
@@ -618,7 +621,7 @@ ForwardLogits ViewDeviceLogits(void* base, vt::Device device, int64_t rows, int6
 // are sampled. VT_ASYNC_EXECUTOR_NO_DBUF=1 is the same test-only escape hatch.
 bool DecodeGraphDoubleBufferEnabled(vt::DeviceType device) {
   if (!v1::AsyncExecutorFlagIsOn(std::getenv("VT_ASYNC_EXECUTOR"),
-                                 device == vt::DeviceType::kCUDA))
+                                 platforms::GetPlatform(device).async_executor_default_on()))
     return false;
   const char* nod = std::getenv("VT_ASYNC_EXECUTOR_NO_DBUF");
   return !(nod != nullptr && nod[0] == '1' && nod[1] == '\0');
@@ -672,6 +675,7 @@ void BuildPaddedDecode(int64_t S, const std::vector<int32_t>& tok,
 }  // namespace
 
 void PrepareFlintPaged(const FlintPagedWeights& weights, vt::Queue& queue) {
+  // DSR-ALLOW(MODEL-TEXT-FLINT): the load-time Marlin build; its first line asks the runtime question, OpRegistered(kMoeGroupedGemmNvfp4Marlin, device).
 #ifdef VT_MARLIN_NVFP4
   if (!vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, queue.device.type)) return;
   Dev d{vt::GetBackend(queue.device.type), queue};

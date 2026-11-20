@@ -205,9 +205,8 @@ TEST_CASE("a glm-dsa GGUF reaches ITS OWN builder through the dispatch") {
 }
 
 TEST_CASE("a flint GGUF reaches ITS OWN builder through the dispatch") {
-  // MODEL-TEXT-FLINT, the GGUF arm (.agents/specs/flint-gguf-arm.md, issue
-  // ISSUE-LOCAL-01M5PRSC2E4VR54HBSWFPMN37E): the published RecursiveSI flint
-  // containers and the unsloth/APEX quants all carry
+  // MODEL-TEXT-FLINT, the GGUF arm (.agents/specs/flint-gguf-arm.md): the
+  // published RecursiveSI flint containers and the unsloth/APEX quants all carry
   // `general.architecture = flint`, and until this row existed every one of
   // them was refused as merely unrecognized — a capability the published
   // files name and no production entry point reached. Proven by the MESSAGE,

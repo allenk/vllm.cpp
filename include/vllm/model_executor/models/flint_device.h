@@ -1,8 +1,9 @@
 // Flint CUDA glue table (OpId::kFlint), the laguna_device.h pattern: the small
 // fused kernels vLLM runs for Flint on SM120, registered by
-// src/vt/cuda/cuda_flint.cu on kCUDA and resolved here. No CUDA code; on a build
-// without the kernels FlintDeviceKernelsAvailable() is false and the paged arm
-// composes the shared ops instead.
+// src/vt/cuda/cuda_flint.cu on kCUDA and resolved here by the caller's device. No
+// CUDA code; on a build or device without the kernels
+// FlintDeviceKernelsAvailable(device) is false and the paged arm composes the
+// shared ops instead.
 #pragma once
 
 #include <cstddef>
@@ -104,8 +105,9 @@ struct FlintDeviceKernels {
                           int64_t hidden, int64_t vocab);
 };
 
-// The kCUDA table, or throws when nothing registered it.
-const FlintDeviceKernels* FlintDevice();
-bool FlintDeviceKernelsAvailable();
+// The table registered for `device`, or throws when nothing registered it
+// there. Only cuda_flint.cu registers one, so a CPU or Vulkan queue finds none.
+const FlintDeviceKernels* FlintDevice(vt::DeviceType device);
+bool FlintDeviceKernelsAvailable(vt::DeviceType device);
 
 }  // namespace vllm::flint

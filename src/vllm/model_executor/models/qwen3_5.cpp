@@ -11312,8 +11312,9 @@ void BuildPaddedDecode(int64_t S, const std::vector<int32_t>& tok,
 // ring OFF while the runner still skips the drain, so the gate SEES the logits/input
 // hazard in a RED arm. Production never sets it.
 static bool DecodeGraphDoubleBufferEnabled(vt::DeviceType device) {
-  if (!v1::AsyncExecutorFlagIsOn(std::getenv("VT_ASYNC_EXECUTOR"),
-                                 device == vt::DeviceType::kCUDA))
+  if (!v1::AsyncExecutorFlagIsOn(
+          std::getenv("VT_ASYNC_EXECUTOR"),
+          vllm::platforms::GetPlatform(device).async_executor_default_on()))
     return false;
   const char* nod = std::getenv("VT_ASYNC_EXECUTOR_NO_DBUF");
   if (nod != nullptr && nod[0] == '1' && nod[1] == '\0') return false;

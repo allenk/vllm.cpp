@@ -1,5 +1,5 @@
 // vllm.cpp ORIGINAL — the `flint` GGUF arm. See
-// .agents/specs/flint-gguf-arm.md and ISSUE-LOCAL-01M5PRSC2E4VR54HBSWFPMN37E.
+// .agents/specs/flint-gguf-arm.md (MODEL-TEXT-FLINT wave 2).
 //
 // The published RecursiveSI flint containers ARE llama.cpp-conformant
 // (expert_gating_func = 2 = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID at the

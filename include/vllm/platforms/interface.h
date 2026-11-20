@@ -344,6 +344,15 @@ class Platform {
   // platform POLICY gate, mirroring upstream.
   virtual bool support_static_graph_mode() const { return false; }
 
+  // vllm.cpp original: the VT_ASYNC_EXECUTOR default when the variable is unset
+  // (AsyncExecutorFlagIsOn, v1/worker/gpu/async_runner_flag.h), the decode-graph
+  // overlap in which the runner skips its pre-forward drain after a graphed step.
+  // CUDA: true, where the overlap is measured and the async gates pass. Else
+  // false, where the runner never skips the drain and a second graph slot would
+  // only cost memory. Not support_static_graph_mode(): ROCm and Tenstorrent
+  // capture too, and the overlap has no gate evidence there.
+  virtual bool async_executor_default_on() const { return false; }
+
   // Model-specific admission can be narrower than the platform-wide default.
   virtual bool support_static_graph_for_model(const std::vector<std::string>& /*architectures*/,
                                               int /*device_index*/) const {

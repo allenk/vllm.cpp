@@ -76,6 +76,9 @@ class CudaPlatform final : public Platform {
   // cuda.py:662 support_static_graph_mode -> True (CUDA graph capture mode).
   bool support_static_graph_mode() const override { return true; }
 
+  // VT_ASYNC_EXECUTOR is on when unset (interface.h async_executor_default_on).
+  bool async_executor_default_on() const override { return true; }
+
   // S7 residency POLICY -> True: the CUDA path stages host tensors into distinct
   // device-resident buffers (ResidentWeight, device-resident GDN state I/O, the
   // merged/packed device-resident projections, direct-device-load), regardless of

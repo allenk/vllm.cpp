@@ -48,12 +48,13 @@ inline bool AsyncRunnerFlagIsOn(const char* env_value) {
 // the drain over a driver holding one slot is the hazard VT_ASYNC_EXECUTOR_NO_DBUF
 // exists to show, so both sides parse through this one function.
 //
-// Unset follows `cuda`: ON for a CUDA device, where the overlap is measured
+// Unset follows `default_on`, the device platform's async_executor_default_on()
+// (platforms/interface.h): ON for a CUDA device, where the overlap is measured
 // (35B NVFP4 +1-2 %, Flint even) and the async gates pass; OFF elsewhere, where
 // the runner never skips the drain and a second slot would only cost memory. A
 // '0'-leading value is OFF and any other value is ON, the house convention above.
-inline bool AsyncExecutorFlagIsOn(const char* env_value, bool cuda) {
-  if (env_value == nullptr) return cuda;
+inline bool AsyncExecutorFlagIsOn(const char* env_value, bool default_on) {
+  if (env_value == nullptr) return default_on;
   return env_value[0] != '0';
 }
 

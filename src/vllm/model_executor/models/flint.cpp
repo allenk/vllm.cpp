@@ -43,6 +43,7 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/models/flint_device.h"  // FlintDeviceKernelsAvailable
 #include "vllm/model_executor/models/flint_paged.h"  // the paged CUDA arm
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits
@@ -364,7 +365,7 @@ std::vector<float> FlintModel::Forward(const std::vector<int32_t>& token_ids,
       FLINT_CHECK(tok >= 0 && tok < p.vocab_size, "forward: token id out of range");
       // CONVERT, do not memcpy: the source is bf16 bits and the destination
       // is f32. A raw copy drops each bf16 into the low half of a zero-high
-      // float — a ~1e-42 denormal (ISSUE-LOCAL-01M5QBGBM3Z7NT3D9TA0K1HT7T).
+      // float — a ~1e-42 denormal, and the whole forward is noise.
       // LoadUnaligned: the borrowed block payload need not be 2-byte aligned.
       for (int64_t d = 0; d < h; ++d)
         x[static_cast<size_t>(i) * h + d] = Bf16(vt::LoadUnaligned<uint16_t>(
@@ -420,8 +421,8 @@ std::vector<float> FlintModel::Forward(const std::vector<int32_t>& token_ids,
     // softmax denominator. Output rounded to bf16.
     // The buffer is the HEAD layout [t, hq, dh] — what o_proj ([q, h])
     // consumes. Sizing it t*h overflows whenever hq*head_dim > hidden_size
-    // (ISSUE-LOCAL-01M5Q1PS772CPTMYJ02AMVZ3Y0; the W1 synthetic config had
-    // hq*dh < h and masked the defect).
+    // (the published container has hq*dh = 32*128 = 4096 > h = 2048; the W1
+    // synthetic config had hq*dh < h and masked the defect).
     std::vector<float> attn_out(static_cast<size_t>(t) * hq * dh);
     {
       const uint16_t* sinks = Bf16Data(lw.attn.sinks);
@@ -623,21 +624,21 @@ class FlintLoadedModel final : public LoadedModel {
   std::unique_ptr<FlintPagedDecodeGraph> decode_graph_;
 };
 
-// The paged arm serves a GGUF on a CUDA engine. VT_FLINT_PAGED=0 keeps the
-// bf16 reference there (for the oracle comparisons); it expands the 40B to
-// bf16 on the host, about 80 GB.
+// The paged arm serves a GGUF on a CUDA engine: the device that registered the
+// kFlint glue table (cuda_flint.cu, built into every CUDA build). VT_FLINT_PAGED=0
+// keeps the bf16 reference there (for the oracle comparisons); it expands the
+// 40B to bf16 on the host, about 80 GB.
 bool UsePagedArm(const ModelSource& source) {
   const char* e = std::getenv("VT_FLINT_PAGED");
-  return source.kind == ModelSource::Kind::kGguf && source.device == vt::DeviceType::kCUDA &&
-         !(e != nullptr && e[0] == '0');
+  return source.kind == ModelSource::Kind::kGguf &&
+         flint::FlintDeviceKernelsAvailable(source.device) && !(e != nullptr && e[0] == '0');
 }
 
 std::unique_ptr<LoadedModel> LoadFlintForCausalLM(
     const ModelRegistration& registration, const HfConfig& config,
     const ModelSource& source) {
-  // The flint GGUF arm (.agents/specs/flint-gguf-arm.md, issue
-  // ISSUE-LOCAL-01M5PRSC2E4VR54HBSWFPMN37E): the published containers load
-  // into the same bf16-owned FlintWeights, forward unchanged.
+  // The flint GGUF arm (.agents/specs/flint-gguf-arm.md): the published
+  // containers load into the same bf16-owned FlintWeights, forward unchanged.
   if (source.kind == ModelSource::Kind::kGguf) {
     if (source.gguf == nullptr) {
       throw std::runtime_error(

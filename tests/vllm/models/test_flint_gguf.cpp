@@ -1,6 +1,5 @@
 // vllm.cpp ORIGINAL — the flint GGUF arm's gate.
-// (.agents/specs/flint-gguf-arm.md, row MODEL-TEXT-FLINT wave 2, issue
-// ISSUE-LOCAL-01M5PRSC2E4VR54HBSWFPMN37E.)
+// (.agents/specs/flint-gguf-arm.md, row MODEL-TEXT-FLINT wave 2.)
 //
 // RED FIRST: at the base of this branch the published container was refused
 // by the top-level GGUF dispatch as "not supported by this build" and the

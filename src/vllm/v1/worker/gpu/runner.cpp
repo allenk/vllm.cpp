@@ -5422,8 +5422,9 @@ bool GPUModelRunner::async_executor() const {
   if (async_executor_cached_ >= 0) return async_executor_cached_ != 0;
   bool on = false;
 #ifdef VLLM_CPP_CUDA
-  on = AsyncExecutorFlagIsOn(std::getenv("VT_ASYNC_EXECUTOR"),
-                             queue_.device.type == vt::DeviceType::kCUDA) &&
+  on = AsyncExecutorFlagIsOn(
+           std::getenv("VT_ASYNC_EXECUTOR"),
+           vllm::platforms::GetPlatform(queue_.device.type).async_executor_default_on()) &&
        async_device_mirror();
 #endif
   async_executor_cached_ = on ? 1 : 0;
