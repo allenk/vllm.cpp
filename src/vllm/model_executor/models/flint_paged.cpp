@@ -444,7 +444,9 @@ bool FusedNorm(const flint::FlintDeviceKernels* fk, const Tensor& x, const Tenso
 
 // res := bf16(x + res); out = RMSNorm(x + res) * w. With the glue kernels this is
 // vLLM's Flint fused_add_rms_norm (the norm taken from the unrounded f32 sum, one
-// launch); without them the shared vt::RmsNorm, which normalises the rounded res.
+// launch); without them the shared fusion catalog's kFusedAddRmsNormStd, which
+// normalises the rounded res and is byte-identical to the standalone vt::RmsNorm
+// it falls back to under VT_FUSED_CHAIN_ADOPT=0.
 // `first`: the residual stream starts at this norm. The fused kernel then stores x
 // as the residual (vLLM's `residual = hidden_states`); the composed fallback adds
 // into the residual ForwardLayers zeroed for it.
@@ -455,7 +457,11 @@ void AddRmsNorm(Dev d, DBuf& out, const Tensor& x, DBuf& res, const Tensor& w, f
         d.q, out.ptr(), x.data, res.ptr(), w.data, x.shape[0], x.shape[1], eps);
     return;
   }
-  vt::RmsNorm(d.q, out.t(), x, w, vt::RmsNormArgs{eps, false}, &res.t());
+  if (FusedChainAdoptEnabled()) {
+    vt::FusedChain(d.q, out.t(), x, w, &res.t(), vt::kFusedAddRmsNormStd, eps);
+  } else {
+    vt::RmsNorm(d.q, out.t(), x, w, vt::RmsNormArgs{eps, false}, &res.t());
+  }
 }
 
 // One decoder layer (vLLM FlintDecoderLayer): fused add + input RMSNorm ->
